@@ -1,0 +1,2512 @@
+"""
+Manage Tab
+
+Tab for managing existing liquidity positions.
+Enhanced with persistence, auto-loading, PnL tracking, and price progress bars.
+"""
+
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
+    QLabel, QLineEdit, QPushButton, QTableWidget,
+    QTableWidgetItem, QHeaderView, QMessageBox,
+    QTextEdit, QProgressBar, QSpinBox, QFrame,
+    QStyledItemDelegate, QCheckBox, QComboBox, QDoubleSpinBox,
+    QScrollArea
+)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
+from PyQt6.QtGui import QFont, QColor, QPainter, QBrush
+
+import sys
+import os
+import json
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from web3 import Web3
+from src.math.ticks import tick_to_price
+
+
+class PriceProgressDelegate(QStyledItemDelegate):
+    """Custom delegate to draw price range progress bar."""
+
+    def _format_price(self, price: float) -> str:
+        """Format price for display, handling extreme values."""
+        if price is None or price == float('inf') or price != price:  # NaN check
+            return "N/A"
+        if price < 0:
+            return "N/A"
+        if price > 1e12:  # Trillion - probably wrong
+            return "???"
+        if price < 0.0000001:
+            return f"${price:.10f}"
+        if price < 0.001:
+            return f"${price:.8f}"
+        if price < 1:
+            # Most meme tokens - show 6 decimals
+            return f"${price:.6f}"
+        if price < 100:
+            return f"${price:.4f}"
+        if price < 1000:
+            return f"${price:.2f}"
+        if price < 1000000:
+            return f"${price:,.0f}"
+        return f"${price:.2e}"
+
+    def paint(self, painter, option, index):
+        # Get data from index
+        data = index.data(Qt.ItemDataRole.UserRole)
+        if data is None:
+            super().paint(painter, option, index)
+            return
+
+        painter.save()
+
+        # Background
+        painter.fillRect(option.rect, option.palette.base())
+
+        # Extract values with safety checks
+        price_lower = data.get('price_lower', 0)
+        price_upper = data.get('price_upper', 1)
+        current_price = data.get('current_price', price_lower)
+        in_range = data.get('in_range', False)
+
+        # Validate prices - check for extreme/invalid values
+        is_valid = True
+        if price_lower is None or price_upper is None or current_price is None:
+            is_valid = False
+        elif price_lower < 0 or price_upper < 0 or current_price < 0:
+            is_valid = False
+        elif price_upper == float('inf') or price_lower == float('inf'):
+            is_valid = False
+        elif price_upper > 1e15 or price_lower > 1e15:  # Probably wrong tick extraction
+            is_valid = False
+
+        # Calculate progress
+        if is_valid and price_upper > price_lower:
+            try:
+                progress = (current_price - price_lower) / (price_upper - price_lower)
+                progress = max(0.0, min(1.0, progress))
+            except (ZeroDivisionError, OverflowError):
+                progress = 0.5
+        else:
+            progress = 0.5
+
+        # Draw progress bar background
+        rect = option.rect.adjusted(4, 4, -4, -4)
+
+        # Background bar
+        painter.setBrush(QBrush(QColor(60, 60, 60)))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(rect, 3, 3)
+
+        # Progress fill
+        if in_range:
+            color = QColor(76, 175, 80)  # Green for in range
+        elif not is_valid:
+            color = QColor(128, 128, 128)  # Gray for invalid
+        else:
+            color = QColor(255, 152, 0)  # Orange for out of range
+
+        progress_width = int(rect.width() * progress)
+        progress_rect = rect.adjusted(0, 0, -(rect.width() - progress_width), 0)
+        painter.setBrush(QBrush(color))
+        painter.drawRoundedRect(progress_rect, 3, 3)
+
+        # Draw current price indicator
+        indicator_x = rect.left() + progress_width
+        painter.setBrush(QBrush(QColor(255, 255, 255)))
+        painter.drawEllipse(indicator_x - 4, rect.center().y() - 4, 8, 8)
+
+        # Draw text with proper formatting
+        painter.setPen(QColor(255, 255, 255))
+        if is_valid:
+            text = f"{self._format_price(price_lower)} | {self._format_price(current_price)} | {self._format_price(price_upper)}"
+        else:
+            text = "Invalid price data"
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+
+        painter.restore()
+
+
+class LoadPositionWorker(QThread):
+    """Worker thread for loading a single position."""
+
+    position_loaded = pyqtSignal(int, dict)  # token_id, position_data
+    error = pyqtSignal(int, str)  # token_id, error message
+    not_owned = pyqtSignal(int, str)  # token_id, actual owner (position exists but not owned by wallet)
+
+    def __init__(self, provider, token_id, pool_factory=None, check_ownership=True, protocol="v3"):
+        super().__init__()
+        self.provider = provider
+        self.token_id = token_id
+        self.pool_factory = pool_factory
+        self.check_ownership = check_ownership
+        self.protocol = protocol  # "v3" or "v4"
+
+    def run(self):
+        try:
+            # Check if V4 protocol selected
+            is_v4_protocol = self.protocol in ("v4", "v4_pancake")
+
+            if is_v4_protocol:
+                # Use V4 position manager
+                self._load_v4_position()
+                return
+
+            # V3 position loading
+            # Check if we need to use a different position manager for Uniswap V3
+            position_manager = self.provider.position_manager
+
+            if self.protocol == "v3_uniswap":
+                # Use Uniswap V3 position manager
+                try:
+                    from config import V3_DEXES
+                    chain_id = getattr(self.provider, 'chain_id', 56)
+                    if chain_id in V3_DEXES and "uniswap" in V3_DEXES[chain_id]:
+                        uniswap_config = V3_DEXES[chain_id]["uniswap"]
+                        from src.contracts.position_manager import PositionManager
+                        position_manager = PositionManager(
+                            self.provider.w3,
+                            uniswap_config.position_manager,
+                            self.provider.account
+                        )
+                        print(f"[V3 Load] Using Uniswap V3 Position Manager: {uniswap_config.position_manager}")
+                except Exception as pm_err:
+                    print(f"[V3 Load] Error creating Uniswap V3 position manager: {pm_err}")
+                    # Fall back to provider's position manager
+
+            # First check if position exists and is owned by current wallet
+            if self.check_ownership:
+                owner = position_manager.get_owner_of(self.token_id)
+                if owner is None:
+                    # Position doesn't exist (NFT was burned)
+                    self.error.emit(self.token_id, "Position does not exist (NFT burned)")
+                    return
+
+                if owner.lower() != self.provider.account.address.lower():
+                    # Position exists but belongs to someone else
+                    self.not_owned.emit(self.token_id, owner)
+                    return
+
+            position = position_manager.get_position(self.token_id)
+
+            # Get current pool price if pool_factory is available
+            current_price = None
+            if self.pool_factory and position['liquidity'] > 0:
+                try:
+                    from src.contracts.pool_factory import PoolFactory
+
+                    # Get pool address for this position
+                    pool_addr = self.pool_factory.get_pool_address(
+                        position['token0'],
+                        position['token1'],
+                        position['fee']
+                    )
+                    if pool_addr:
+                        pool_info = self.pool_factory.get_pool_info(pool_addr)
+                        # Get token decimals
+                        token0_info = self.pool_factory.get_token_info(position['token0'])
+                        token1_info = self.pool_factory.get_token_info(position['token1'])
+
+                        current_price = self.pool_factory.sqrt_price_x96_to_price(
+                            pool_info.sqrt_price_x96,
+                            token0_info.decimals,
+                            token1_info.decimals
+                        )
+                        position['current_price'] = current_price
+                        position['current_tick'] = pool_info.tick
+                        position['token0_symbol'] = token0_info.symbol
+                        position['token1_symbol'] = token1_info.symbol
+                        position['token0_decimals'] = token0_info.decimals
+                        position['token1_decimals'] = token1_info.decimals
+                except Exception as e:
+                    print(f"Error fetching pool info: {e}")
+
+            self.position_loaded.emit(self.token_id, position)
+
+        except Exception as e:
+            self.error.emit(self.token_id, str(e))
+
+    def _load_v4_position(self):
+        """Load a V4 position."""
+        try:
+            print(f"[V4 Load] Loading position {self.token_id} with protocol={self.protocol}")
+
+            # Validate provider
+            if not self.provider:
+                self.error.emit(self.token_id, "No provider available")
+                return
+
+            if not hasattr(self.provider, 'w3') or self.provider.w3 is None:
+                self.error.emit(self.token_id, "Provider has no Web3 connection")
+                return
+
+            from src.contracts.v4 import V4PositionManager, V4Protocol
+
+            # Determine which V4 protocol to use based on self.protocol
+            if self.protocol == "v4_pancake":
+                target_protocol = V4Protocol.PANCAKESWAP
+                print(f"[V4 Load] Target protocol: PancakeSwap V4")
+            else:
+                target_protocol = V4Protocol.UNISWAP
+                print(f"[V4 Load] Target protocol: Uniswap V4")
+
+            # Check if provider's position_manager matches the target protocol
+            provider_protocol = getattr(self.provider, 'protocol', None)
+            print(f"[V4 Load] Provider protocol: {provider_protocol}")
+
+            if (hasattr(self.provider, 'position_manager') and
+                hasattr(self.provider.position_manager, 'get_position') and
+                provider_protocol == target_protocol):
+                v4_pm = self.provider.position_manager
+                print(f"[V4 Load] Using provider's existing position_manager")
+            else:
+                # Create V4PositionManager for the correct protocol
+                chain_id = getattr(self.provider, 'chain_id', 56)
+                print(f"[V4 Load] Creating new V4PositionManager for chain {chain_id}")
+
+                v4_pm = V4PositionManager(
+                    self.provider.w3,
+                    account=self.provider.account,
+                    protocol=target_protocol,
+                    chain_id=chain_id
+                )
+
+            # Log which Position Manager we're using
+            pm_addr = getattr(v4_pm, 'position_manager_address', 'unknown')
+            print(f"[V4 Load] Using Position Manager: {pm_addr}")
+            print(f"[V4 Load] Protocol: {target_protocol}")
+
+            # Check ownership
+            if self.check_ownership:
+                print(f"[V4 Load] Checking ownership for token {self.token_id}")
+                try:
+                    owner = v4_pm.get_owner_of(self.token_id)
+                except Exception as owner_err:
+                    print(f"[V4 Load] get_owner_of failed: {owner_err}")
+                    self.error.emit(self.token_id, f"Failed to check ownership: {str(owner_err)}")
+                    return
+
+                if owner is None:
+                    self.error.emit(self.token_id, "V4 Position does not exist (NFT burned)")
+                    return
+
+                wallet_addr = self.provider.account.address if self.provider.account else None
+                if not wallet_addr:
+                    self.error.emit(self.token_id, "No wallet connected")
+                    return
+
+                if owner.lower() != wallet_addr.lower():
+                    self.not_owned.emit(self.token_id, owner)
+                    return
+
+            # Get position info
+            print(f"[V4 Load] Getting position info for token {self.token_id}")
+            try:
+                v4_pos = v4_pm.get_position(self.token_id)
+            except Exception as pos_err:
+                print(f"[V4 Load] get_position failed: {pos_err}")
+                import traceback
+                traceback.print_exc()
+                self.error.emit(self.token_id, f"Failed to get position info: {str(pos_err)}")
+                return
+
+            print(f"[V4 Load] Position loaded: {v4_pos.pool_key.currency0[:10]}.../{v4_pos.pool_key.currency1[:10]}...")
+
+            # Convert to dict format
+            position = {
+                'token_id': self.token_id,
+                'token0': v4_pos.pool_key.currency0,
+                'token1': v4_pos.pool_key.currency1,
+                'fee': v4_pos.pool_key.fee,
+                'tick_spacing': v4_pos.pool_key.tick_spacing,
+                'tick_lower': v4_pos.tick_lower,
+                'tick_upper': v4_pos.tick_upper,
+                'liquidity': v4_pos.liquidity,
+                'tokens_owed0': 0,
+                'tokens_owed1': 0,
+                'protocol': self.protocol  # v4 or v4_pancake
+            }
+
+            print(f"[V4 Load] Emitting position_loaded signal")
+            self.position_loaded.emit(self.token_id, position)
+            print(f"[V4 Load] Done loading position {self.token_id}")
+
+        except Exception as e:
+            import traceback
+            print(f"[V4 Load] EXCEPTION: {e}")
+            traceback.print_exc()
+            self.error.emit(self.token_id, f"V4 Error: {str(e)}")
+
+
+class ScanWalletWorker(QThread):
+    """Worker thread for scanning wallet for all positions."""
+
+    progress = pyqtSignal(str)  # progress message
+    position_found = pyqtSignal(int, dict)  # token_id, position_data
+    finished = pyqtSignal(int, list, str)  # total found, list of token_ids, protocol
+
+    def __init__(self, provider, pool_factory=None, protocol="v3"):
+        super().__init__()
+        self.provider = provider
+        self.pool_factory = pool_factory
+        self.protocol = protocol  # "v3", "v4_uniswap", or "v4_pancake"
+
+    def run(self):
+        try:
+            from src.contracts.v4 import V4PositionManager, V4Protocol
+
+            # Determine protocol type
+            is_v4 = self.protocol in ("v4", "v4_pancake")
+
+            if self.protocol == "v4_pancake":
+                protocol_name = "PancakeSwap V4"
+                target_protocol = V4Protocol.PANCAKESWAP
+            elif self.protocol == "v4":
+                protocol_name = "Uniswap V4"
+                target_protocol = V4Protocol.UNISWAP
+            else:
+                protocol_name = "PancakeSwap V3"
+                target_protocol = None
+
+            self.progress.emit(f"Scanning wallet for {protocol_name} positions...")
+            address = self.provider.account.address
+
+            if is_v4:
+                # Check if provider's position_manager matches target protocol
+                provider_protocol = getattr(self.provider, 'protocol', None)
+                if (hasattr(self.provider, 'position_manager') and
+                    hasattr(self.provider.position_manager, 'get_position_token_ids') and
+                    provider_protocol == target_protocol):
+                    v4_pm = self.provider.position_manager
+                    self.progress.emit(f"Using provider's V4 Position Manager")
+                else:
+                    # Create V4PositionManager for the correct protocol
+                    chain_id = getattr(self.provider, 'chain_id', 56)
+
+                    v4_pm = V4PositionManager(
+                        self.provider.w3,
+                        account=self.provider.account,
+                        protocol=target_protocol,
+                        chain_id=chain_id
+                    )
+
+                # Log Position Manager address for debugging
+                pm_addr = getattr(v4_pm, 'position_manager_address', 'unknown')
+                self.progress.emit(f"V4 Position Manager: {pm_addr}")
+                self.progress.emit(f"Wallet address: {address}")
+                self.progress.emit(f"Scanning for {protocol_name} positions...")
+
+                # Check balance first
+                try:
+                    balance = v4_pm.contract.functions.balanceOf(
+                        Web3.to_checksum_address(address)
+                    ).call()
+                    self.progress.emit(f"balanceOf() returned: {balance} NFTs")
+                except Exception as bal_err:
+                    self.progress.emit(f"balanceOf() FAILED: {bal_err}")
+
+                token_ids = v4_pm.get_position_token_ids(address)
+                self.progress.emit(f"Found {len(token_ids)} V4 positions")
+
+                for i, token_id in enumerate(token_ids):
+                    self.progress.emit(f"Loading V4 position {i+1}/{len(token_ids)} (ID: {token_id})...")
+                    try:
+                        v4_pos = v4_pm.get_position(token_id)
+
+                        # Try to get token symbols from ERC20 contracts
+                        token0_symbol = v4_pos.pool_key.currency0[:6]
+                        token1_symbol = v4_pos.pool_key.currency1[:6]
+
+                        if v4_pos.pool_key.currency0 != "0x0000000000000000000000000000000000000000":
+                            try:
+                                from src.contracts.abis import ERC20_ABI
+                                token0_contract = self.provider.w3.eth.contract(
+                                    address=Web3.to_checksum_address(v4_pos.pool_key.currency0),
+                                    abi=ERC20_ABI + [{"inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}], "stateMutability": "view", "type": "function"}]
+                                )
+                                token0_symbol = token0_contract.functions.symbol().call()
+                            except:
+                                pass
+                            try:
+                                token1_contract = self.provider.w3.eth.contract(
+                                    address=Web3.to_checksum_address(v4_pos.pool_key.currency1),
+                                    abi=ERC20_ABI + [{"inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}], "stateMutability": "view", "type": "function"}]
+                                )
+                                token1_symbol = token1_contract.functions.symbol().call()
+                            except:
+                                pass
+
+                        # Convert V4Position to dict format compatible with table
+                        position = {
+                            'token_id': token_id,
+                            'token0': v4_pos.pool_key.currency0,
+                            'token1': v4_pos.pool_key.currency1,
+                            'token0_symbol': token0_symbol,
+                            'token1_symbol': token1_symbol,
+                            'fee': v4_pos.pool_key.fee,
+                            'tick_spacing': v4_pos.pool_key.tick_spacing,
+                            'tick_lower': v4_pos.tick_lower,
+                            'tick_upper': v4_pos.tick_upper,
+                            'liquidity': v4_pos.liquidity,
+                            'tokens_owed0': 0,
+                            'tokens_owed1': 0,
+                            'protocol': self.protocol  # v4_uniswap or v4_pancake
+                        }
+                        self.position_found.emit(token_id, position)
+                    except Exception as e:
+                        self.progress.emit(f"Error loading V4 position {token_id}: {e}")
+
+                self.finished.emit(len(token_ids), token_ids, self.protocol)
+
+            else:
+                # Use V3 position manager
+                # Check if we need a different position manager for Uniswap V3
+                if self.protocol == "v3_uniswap":
+                    try:
+                        from config import V3_DEXES
+                        from src.contracts.position_manager import UniswapV3PositionManager
+                        chain_id = getattr(self.provider, 'chain_id', 56)
+                        if chain_id in V3_DEXES and "uniswap" in V3_DEXES[chain_id]:
+                            uniswap_config = V3_DEXES[chain_id]["uniswap"]
+                            position_manager = UniswapV3PositionManager(
+                                self.provider.w3,
+                                uniswap_config.position_manager,
+                                self.provider.account
+                            )
+                            self.progress.emit(f"Using Uniswap V3 Position Manager: {uniswap_config.position_manager[:20]}...")
+                        else:
+                            position_manager = self.provider.position_manager
+                            self.progress.emit("Warning: Uniswap V3 not configured for this chain, using default")
+                    except Exception as e:
+                        self.progress.emit(f"Error setting up Uniswap V3: {e}, using default")
+                        position_manager = self.provider.position_manager
+                    protocol_name = "Uniswap V3"
+                else:
+                    position_manager = self.provider.position_manager
+                    protocol_name = "PancakeSwap V3"
+
+                token_ids = position_manager.get_position_token_ids(address)
+                self.progress.emit(f"Found {len(token_ids)} {protocol_name} positions")
+
+                for i, token_id in enumerate(token_ids):
+                    self.progress.emit(f"Loading {protocol_name} position {i+1}/{len(token_ids)} (ID: {token_id})...")
+                    try:
+                        position = position_manager.get_position(token_id)
+                        position['protocol'] = self.protocol  # v3 or v3_uniswap
+
+                        # Get pool info if available
+                        if self.pool_factory and position['liquidity'] > 0:
+                            try:
+                                pool_addr = self.pool_factory.get_pool_address(
+                                    position['token0'],
+                                    position['token1'],
+                                    position['fee']
+                                )
+                                if pool_addr:
+                                    pool_info = self.pool_factory.get_pool_info(pool_addr)
+                                    token0_info = self.pool_factory.get_token_info(position['token0'])
+                                    token1_info = self.pool_factory.get_token_info(position['token1'])
+
+                                    position['current_price'] = self.pool_factory.sqrt_price_x96_to_price(
+                                        pool_info.sqrt_price_x96,
+                                        token0_info.decimals,
+                                        token1_info.decimals
+                                    )
+                                    position['current_tick'] = pool_info.tick
+                                    position['token0_symbol'] = token0_info.symbol
+                                    position['token1_symbol'] = token1_info.symbol
+                                    position['token0_decimals'] = token0_info.decimals
+                                    position['token1_decimals'] = token1_info.decimals
+                            except Exception as e:
+                                print(f"Error fetching pool info for {token_id}: {e}")
+
+                        self.position_found.emit(token_id, position)
+
+                    except Exception as e:
+                        self.progress.emit(f"Error loading position {token_id}: {e}")
+
+                self.finished.emit(len(token_ids), token_ids, self.protocol)
+
+        except Exception as e:
+            self.progress.emit(f"Scan failed: {e}")
+            self.finished.emit(0, [], self.protocol)
+
+
+class ClosePositionsWorker(QThread):
+    """Worker thread for closing positions with optional auto-sell."""
+
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(bool, str, dict)
+
+    def __init__(self, provider, token_ids, positions_data=None, auto_sell=False,
+                 private_key=None, swap_slippage=3.0, chain_id=56, initial_investment=0):
+        super().__init__()
+        self.provider = provider
+        self.token_ids = token_ids
+        self.positions_data = positions_data or {}
+        self.auto_sell = auto_sell
+        self.private_key = private_key
+        self.swap_slippage = swap_slippage
+        self.chain_id = chain_id
+        self.initial_investment = initial_investment
+
+    def run(self):
+        try:
+            # Separate V3, V3 Uniswap, and V4 positions
+            v3_pancake_ids = []
+            v3_uniswap_ids = []
+            v4_ids = []
+
+            for tid in self.token_ids:
+                pos = self.positions_data.get(tid, {})
+                protocol = pos.get('protocol', '') if pos else ''
+                if protocol.startswith('v4'):
+                    v4_ids.append(tid)
+                elif protocol == 'v3_uniswap':
+                    v3_uniswap_ids.append(tid)
+                else:
+                    v3_pancake_ids.append(tid)
+
+            results = []
+
+            # Close PancakeSwap V3 positions
+            if v3_pancake_ids:
+                self.progress.emit(f"Closing {len(v3_pancake_ids)} PancakeSwap V3 positions...")
+                try:
+                    tx_hash, success, gas_used = self.provider.close_positions(
+                        v3_pancake_ids,
+                        timeout=300
+                    )
+                    results.append(('PancakeSwap V3', tx_hash, success, gas_used))
+                except Exception as e:
+                    self.progress.emit(f"PancakeSwap V3 close failed: {e}")
+                    results.append(('PancakeSwap V3', None, False, 0))
+
+            # Close Uniswap V3 positions
+            if v3_uniswap_ids:
+                self.progress.emit(f"Closing {len(v3_uniswap_ids)} Uniswap V3 positions...")
+                try:
+                    from config import V3_DEXES
+                    from src.liquidity_provider import LiquidityProvider
+
+                    chain_id = getattr(self.provider, 'chain_id', 56)
+                    if chain_id in V3_DEXES and "uniswap" in V3_DEXES[chain_id]:
+                        uniswap_config = V3_DEXES[chain_id]["uniswap"]
+                        self.progress.emit(f"Using Uniswap V3 PM: {uniswap_config.position_manager[:20]}...")
+
+                        # Create provider with Uniswap V3 position manager
+                        uniswap_provider = LiquidityProvider(
+                            rpc_url=self.provider.w3.provider.endpoint_uri,
+                            private_key=self.provider.account.key.hex() if hasattr(self.provider.account, 'key') else None,
+                            position_manager_address=uniswap_config.position_manager,
+                            chain_id=chain_id
+                        )
+
+                        tx_hash, success, gas_used = uniswap_provider.close_positions(
+                            v3_uniswap_ids,
+                            timeout=300
+                        )
+                        results.append(('Uniswap V3', tx_hash, success, gas_used))
+                    else:
+                        self.progress.emit("Uniswap V3 not configured for this chain")
+                        results.append(('Uniswap V3', None, False, 0))
+                except Exception as e:
+                    self.progress.emit(f"Uniswap V3 close failed: {e}")
+                    results.append(('Uniswap V3', None, False, 0))
+
+            # Close V4 positions
+            if v4_ids:
+                self.progress.emit(f"Closing {len(v4_ids)} V4 positions...")
+                try:
+                    from src.contracts.v4 import V4PositionManager, V4Protocol
+                    from src.contracts.v4.constants import UNISWAP_V4_ADDRESSES
+
+                    chain_id = getattr(self.provider, 'chain_id', 56)
+                    v4_addresses = UNISWAP_V4_ADDRESSES.get(chain_id, UNISWAP_V4_ADDRESSES[56])
+                    v4_pm = V4PositionManager(
+                        self.provider.w3,
+                        account=self.provider.account,
+                        protocol=V4Protocol.UNISWAP,
+                        chain_id=chain_id,
+                        position_manager_address=v4_addresses.position_manager
+                    )
+
+                    # Close each V4 position
+                    for tid in v4_ids:
+                        self.progress.emit(f"Closing V4 position {tid}...")
+                        try:
+                            # Get stored position data
+                            pos_data = self.positions_data.get(tid, {})
+                            token0 = pos_data.get('token0', '')
+                            token1 = pos_data.get('token1', '')
+                            liquidity = pos_data.get('liquidity', 0)
+
+                            null_addr = "0x0000000000000000000000000000000000000000"
+
+                            # Use stored tokens if available and valid
+                            if token0 and token1 and token0 != null_addr and token1 != null_addr:
+                                self.progress.emit(f"  Using stored token addresses: {token0[:10]}.../{token1[:10]}...")
+                                tx_hash, _, _ = v4_pm.close_position_with_tokens(
+                                    tid,
+                                    currency0=token0,
+                                    currency1=token1,
+                                    liquidity=liquidity,
+                                    recipient=self.provider.account.address,
+                                    timeout=300
+                                )
+                            else:
+                                # Fall back to automatic lookup
+                                tx_hash, _, _ = v4_pm.close_position(
+                                    tid,
+                                    recipient=self.provider.account.address,
+                                    timeout=300
+                                )
+                            results.append(('V4', tx_hash, True, 0))
+                        except Exception as e:
+                            self.progress.emit(f"V4 position {tid} close failed: {e}")
+                            results.append(('V4', None, False, 0))
+
+                except Exception as e:
+                    self.progress.emit(f"V4 close failed: {e}")
+                    results.append(('V4', None, False, 0))
+
+            # Check overall success
+            all_success = all(r[2] for r in results) if results else False
+            tx_hashes = [r[1] for r in results if r[1]]
+
+            # Auto-sell received tokens if enabled
+            sell_results = None
+            if all_success and self.auto_sell and self.private_key:
+                # Wait for tokens to arrive
+                import time
+                self.progress.emit("Waiting for tokens to settle (5 sec)...")
+                time.sleep(5)
+                self.progress.emit("Auto-selling received tokens...")
+                sell_results = self._auto_sell_tokens()
+
+            # Build result data
+            result_data = {
+                'tx_hash': ', '.join(tx_hashes) if tx_hashes else 'N/A',
+                'gas_used': 0,
+                'initial_investment': self.initial_investment
+            }
+
+            if sell_results:
+                result_data['sell_results'] = sell_results
+                result_data['total_usd'] = sell_results.get('total_usd', 0)
+                result_data['swaps'] = len(sell_results.get('swaps', []))
+                result_data['skipped'] = len(sell_results.get('skipped', []))
+                # Calculate PnL
+                if self.initial_investment > 0:
+                    pnl = result_data['total_usd'] - self.initial_investment
+                    pnl_percent = (pnl / self.initial_investment) * 100
+                    result_data['pnl'] = pnl
+                    result_data['pnl_percent'] = pnl_percent
+
+            if all_success:
+                self.finished.emit(True, "Positions closed successfully", result_data)
+            else:
+                self.finished.emit(False, "Some positions failed to close", result_data)
+
+        except Exception as e:
+            self.finished.emit(False, str(e), {})
+
+    def _auto_sell_tokens(self) -> dict:
+        """Sell received tokens via DEX (Uniswap/PancakeSwap)."""
+        try:
+            from src.dex_swap import DexSwap, STABLE_TOKENS
+
+            self.progress.emit(f"DEBUG: positions_data keys = {list(self.positions_data.keys())}")
+            self.progress.emit(f"DEBUG: token_ids = {self.token_ids}")
+
+            # Get wallet balance of tokens from closed positions
+            tokens_to_sell = []
+            for tid in self.token_ids:
+                pos = self.positions_data.get(tid, {})
+                self.progress.emit(f"DEBUG: Position {tid} data: token0={pos.get('token0', 'N/A')}, token1={pos.get('token1', 'N/A')}")
+                if not pos:
+                    self.progress.emit(f"DEBUG: Position {tid} has no data!")
+                    continue
+
+                token0 = pos.get('token0', '')
+                token1 = pos.get('token1', '')
+                dec0 = pos.get('token0_decimals', 18)
+                dec1 = pos.get('token1_decimals', 18)
+                sym0 = pos.get('token0_symbol', 'TOKEN0')
+                sym1 = pos.get('token1_symbol', 'TOKEN1')
+
+                self.progress.emit(f"DEBUG: Checking token0={sym0} ({token0[:20] if token0 else 'empty'}...)")
+                self.progress.emit(f"DEBUG: Checking token1={sym1} ({token1[:20] if token1 else 'empty'}...)")
+
+                # Check if token0 is NOT stable
+                token0_is_stable = token0 and token0.lower() in [t.lower() for t in STABLE_TOKENS]
+                token1_is_stable = token1 and token1.lower() in [t.lower() for t in STABLE_TOKENS]
+
+                self.progress.emit(f"DEBUG: token0_is_stable={token0_is_stable}, token1_is_stable={token1_is_stable}")
+
+                if token0 and not token0_is_stable:
+                    tokens_to_sell.append({
+                        'address': token0,
+                        'decimals': dec0,
+                        'symbol': sym0
+                    })
+                if token1 and not token1_is_stable:
+                    tokens_to_sell.append({
+                        'address': token1,
+                        'decimals': dec1,
+                        'symbol': sym1
+                    })
+
+            self.progress.emit(f"DEBUG: tokens_to_sell count = {len(tokens_to_sell)}")
+
+            if not tokens_to_sell:
+                self.progress.emit("No tokens to sell (all are stablecoins)")
+                return {'total_usd': 0, 'swaps': [], 'skipped': []}
+
+            # Remove duplicates
+            seen = set()
+            unique_tokens = []
+            for t in tokens_to_sell:
+                if t['address'].lower() not in seen:
+                    seen.add(t['address'].lower())
+                    unique_tokens.append(t)
+
+            # Get current balances
+            w3 = self.provider.w3
+            wallet = self.provider.account.address
+
+            # Initialize DEX swapper
+            swapper = DexSwap(w3, self.chain_id)
+            self.progress.emit(f"Using {swapper.dex_name} for swaps")
+
+            erc20_abi = [
+                {"constant": True, "inputs": [{"name": "account", "type": "address"}],
+                 "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "type": "function"}
+            ]
+
+            for token in unique_tokens:
+                try:
+                    contract = w3.eth.contract(
+                        address=Web3.to_checksum_address(token['address']),
+                        abi=erc20_abi
+                    )
+                    balance = contract.functions.balanceOf(Web3.to_checksum_address(wallet)).call()
+                    token['amount'] = balance
+                    self.progress.emit(f"  {token['symbol']}: balance = {balance / (10**token['decimals']):.6f}")
+                except Exception as e:
+                    self.progress.emit(f"  Failed to get balance for {token['symbol']}: {e}")
+                    token['amount'] = 0
+
+            # Filter tokens with balance > 0
+            tokens_with_balance = [t for t in unique_tokens if t.get('amount', 0) > 0]
+
+            if not tokens_with_balance:
+                self.progress.emit("No tokens with balance to sell")
+                return {'total_usd': 0, 'swaps': [], 'skipped': []}
+
+            output_token = swapper.get_output_token()
+            slippage = self.swap_slippage
+
+            results = {
+                'total_usd': 0.0,
+                'swaps': [],
+                'skipped': []
+            }
+
+            for token in tokens_with_balance:
+                # Skip if it's a stable token
+                if swapper.is_stable_token(token['address']):
+                    self.progress.emit(f"  Skipping {token['symbol']} (stablecoin)")
+                    results['skipped'].append(token['address'])
+                    # Add to total as 1:1
+                    results['total_usd'] += token['amount'] / (10 ** token['decimals'])
+                    continue
+
+                self.progress.emit(f"  Selling {token['symbol']} via {swapper.dex_name}...")
+
+                result = swapper.swap(
+                    from_token=token['address'],
+                    to_token=output_token,
+                    amount_in=token['amount'],
+                    wallet_address=wallet,
+                    private_key=self.private_key,
+                    slippage=slippage
+                )
+
+                if result.success:
+                    self.progress.emit(f"  ✅ Sold {token['symbol']}: ${result.to_amount_usd:.2f}")
+                    results['total_usd'] += result.to_amount_usd
+                else:
+                    self.progress.emit(f"  ❌ Failed to sell {token['symbol']}: {result.error}")
+
+                results['swaps'].append({
+                    'token': token['symbol'],
+                    'success': result.success,
+                    'usd': result.to_amount_usd,
+                    'tx_hash': result.tx_hash,
+                    'error': result.error
+                })
+
+            self.progress.emit(f"Auto-sell complete. Total: ${results['total_usd']:.2f}")
+            return results
+
+        except Exception as e:
+            self.progress.emit(f"Auto-sell error: {e}")
+            return {'total_usd': 0, 'swaps': [], 'skipped': [], 'error': str(e)}
+
+
+class BatchCloseWorker(QThread):
+    """Worker thread for batch closing ALL V4 positions in ONE transaction."""
+
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(bool, str, dict)
+
+    def __init__(self, provider, positions: list, auto_sell=False, private_key=None,
+                 swap_slippage=3.0, initial_investment=0):
+        super().__init__()
+        self.provider = provider
+        self.positions = positions  # List of position dicts
+        self.auto_sell = auto_sell
+        self.private_key = private_key
+        self.swap_slippage = swap_slippage
+        self.initial_investment = initial_investment
+        self.chain_id = getattr(provider, 'chain_id', 56)
+
+    def run(self):
+        try:
+            from src.contracts.v4 import V4PositionManager, V4Protocol
+            from src.contracts.v4.constants import UNISWAP_V4_ADDRESSES
+
+            self.progress.emit(f"Preparing batch close for {len(self.positions)} positions...")
+
+            w3 = self.provider.w3
+            wallet = self.provider.account.address
+
+            # Record balances BEFORE close (to sell only the difference)
+            balances_before = {}
+            if self.auto_sell:
+                self.progress.emit("Recording balances before close...")
+                balances_before = self._get_token_balances()
+
+            v4_addresses = UNISWAP_V4_ADDRESSES.get(self.chain_id, UNISWAP_V4_ADDRESSES[56])
+            v4_pm = V4PositionManager(
+                w3,
+                account=self.provider.account,
+                protocol=V4Protocol.UNISWAP,
+                chain_id=self.chain_id,
+                position_manager_address=v4_addresses.position_manager
+            )
+
+            self.progress.emit("Building batch transaction...")
+
+            # Call batch close
+            tx_hash, success, gas_used = v4_pm.close_positions_batch(
+                self.positions,
+                recipient=wallet,
+                timeout=300
+            )
+
+            result_data = {
+                'tx_hash': tx_hash,
+                'gas_used': gas_used,
+                'initial_investment': self.initial_investment
+            }
+
+            if success:
+                # Auto-sell if enabled
+                if self.auto_sell and self.private_key:
+                    import time
+                    self.progress.emit("Waiting for tokens to settle (5 sec)...")
+                    time.sleep(5)
+                    self.progress.emit("Auto-selling received tokens...")
+                    sell_results = self._auto_sell_tokens(balances_before)
+
+                    if sell_results:
+                        result_data['sell_results'] = sell_results
+                        result_data['total_usd'] = sell_results.get('total_usd', 0)
+                        # Calculate PnL
+                        if self.initial_investment > 0:
+                            pnl = result_data['total_usd'] - self.initial_investment
+                            pnl_percent = (pnl / self.initial_investment) * 100
+                            result_data['pnl'] = pnl
+                            result_data['pnl_percent'] = pnl_percent
+
+                self.finished.emit(True, f"Closed {len(self.positions)} positions", result_data)
+            else:
+                self.finished.emit(False, f"Transaction reverted. TX: {tx_hash}", result_data)
+
+        except Exception as e:
+            self.progress.emit(f"Batch close failed: {e}")
+            self.finished.emit(False, str(e), {})
+
+    def _get_token_balances(self) -> dict:
+        """Get current balances of tokens from positions."""
+        w3 = self.provider.w3
+        wallet = self.provider.account.address
+
+        erc20_abi = [
+            {"constant": True, "inputs": [{"name": "account", "type": "address"}],
+             "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "type": "function"}
+        ]
+
+        balances = {}
+        seen = set()
+
+        for pos in self.positions:
+            for token_key in ['token0', 'token1']:
+                addr = pos.get(token_key, '')
+                if not addr or addr.lower() in seen:
+                    continue
+                seen.add(addr.lower())
+
+                try:
+                    contract = w3.eth.contract(address=Web3.to_checksum_address(addr), abi=erc20_abi)
+                    balance = contract.functions.balanceOf(Web3.to_checksum_address(wallet)).call()
+                    balances[addr.lower()] = balance
+                    self.progress.emit(f"  {addr[:10]}... balance before: {balance}")
+                except Exception as e:
+                    self.progress.emit(f"  Failed to get balance for {addr[:10]}...: {e}")
+                    balances[addr.lower()] = 0
+
+        return balances
+
+    def _auto_sell_tokens(self, balances_before: dict) -> dict:
+        """Sell only RECEIVED tokens via DEX (difference between before and after)."""
+        try:
+            from src.dex_swap import DexSwap, STABLE_TOKENS
+
+            w3 = self.provider.w3
+            wallet = self.provider.account.address
+
+            # Initialize DEX swapper
+            swapper = DexSwap(w3, self.chain_id)
+            self.progress.emit(f"Using {swapper.dex_name} for swaps")
+
+            # Collect unique tokens from positions
+            tokens_to_check = []
+            for pos in self.positions:
+                token0 = pos.get('token0', '')
+                token1 = pos.get('token1', '')
+                dec0 = pos.get('token0_decimals', 18)
+                dec1 = pos.get('token1_decimals', 18)
+                sym0 = pos.get('token0_symbol', 'TOKEN0')
+                sym1 = pos.get('token1_symbol', 'TOKEN1')
+
+                if token0:
+                    tokens_to_check.append({'address': token0, 'decimals': dec0, 'symbol': sym0})
+                if token1:
+                    tokens_to_check.append({'address': token1, 'decimals': dec1, 'symbol': sym1})
+
+            # Remove duplicates
+            seen = set()
+            unique_tokens = []
+            for t in tokens_to_check:
+                addr = t['address'].lower()
+                if addr not in seen:
+                    seen.add(addr)
+                    unique_tokens.append(t)
+
+            self.progress.emit(f"Checking {len(unique_tokens)} tokens for received amounts...")
+
+            # Get balances
+            erc20_abi = [
+                {"constant": True, "inputs": [{"name": "account", "type": "address"}],
+                 "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "type": "function"}
+            ]
+
+            results = {'total_usd': 0.0, 'swaps': [], 'skipped': []}
+            output_token = swapper.get_output_token()
+
+            for token in unique_tokens:
+                addr = token['address']
+                addr_lower = addr.lower()
+
+                # Get current balance
+                try:
+                    contract = w3.eth.contract(address=Web3.to_checksum_address(addr), abi=erc20_abi)
+                    balance_after = contract.functions.balanceOf(Web3.to_checksum_address(wallet)).call()
+                except Exception as e:
+                    self.progress.emit(f"  Failed to get balance for {token['symbol']}: {e}")
+                    continue
+
+                # Calculate received amount (difference)
+                balance_before = balances_before.get(addr_lower, 0)
+                received = balance_after - balance_before
+
+                if received <= 0:
+                    self.progress.emit(f"  {token['symbol']}: no new tokens received (before={balance_before}, after={balance_after})")
+                    continue
+
+                self.progress.emit(f"  {token['symbol']}: received {received / (10**token['decimals']):.6f} (was {balance_before / (10**token['decimals']):.6f}, now {balance_after / (10**token['decimals']):.6f})")
+
+                # Skip stablecoins (but add to total)
+                if swapper.is_stable_token(addr):
+                    self.progress.emit(f"  Skipping {token['symbol']} (stablecoin) - adding ${received / (10**token['decimals']):.2f} to total")
+                    results['total_usd'] += received / (10 ** token['decimals'])
+                    results['skipped'].append(addr)
+                    continue
+
+                self.progress.emit(f"  Selling {received / (10**token['decimals']):.6f} {token['symbol']} via {swapper.dex_name}...")
+
+                result = swapper.swap(
+                    from_token=addr,
+                    to_token=output_token,
+                    amount_in=received,  # Only sell received amount!
+                    wallet_address=wallet,
+                    private_key=self.private_key,
+                    slippage=self.swap_slippage
+                )
+
+                if result.success:
+                    self.progress.emit(f"  ✅ Sold {token['symbol']}: ${result.to_amount_usd:.2f}")
+                    results['total_usd'] += result.to_amount_usd
+                else:
+                    self.progress.emit(f"  ❌ Failed: {result.error}")
+
+                results['swaps'].append({
+                    'token': token['symbol'],
+                    'success': result.success,
+                    'usd': result.to_amount_usd,
+                    'tx_hash': result.tx_hash,
+                    'error': result.error
+                })
+
+            self.progress.emit(f"Auto-sell complete. Total: ${results['total_usd']:.2f}")
+            return results
+
+        except Exception as e:
+            self.progress.emit(f"Auto-sell error: {e}")
+            return {'total_usd': 0, 'swaps': [], 'skipped': [], 'error': str(e)}
+
+
+class ManageTab(QWidget):
+    """
+    Tab for managing existing liquidity positions.
+
+    Features:
+    - Load positions by token IDs
+    - Auto-save and load positions
+    - View position details with PnL and fees
+    - Price progress bar showing current price in range
+    - Close positions
+    - Collect fees
+    """
+
+    # Signal to notify when positions are added externally
+    positions_updated = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.provider = None
+        self.pool_factory = None
+        self.positions_data = {}  # token_id -> position data
+        self.worker = None
+        self.load_workers = []
+        self.scan_worker = None
+        self.settings = QSettings("BNBLiquidityLadder", "Positions")
+        self.setup_ui()
+        self._load_saved_positions()
+
+    def setup_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Scroll area for entire tab
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        scroll_widget = QWidget()
+        layout = QVBoxLayout(scroll_widget)
+        layout.setSpacing(10)
+
+        # Top section - Input
+        top_group = QGroupBox("Position Management")
+        top_layout = QVBoxLayout(top_group)
+
+        # Token IDs input
+        ids_layout = QHBoxLayout()
+        ids_layout.addWidget(QLabel("Token IDs (comma-separated):"))
+        self.token_ids_input = QLineEdit()
+        self.token_ids_input.setPlaceholderText("12345, 12346, 12347")
+        ids_layout.addWidget(self.token_ids_input)
+
+        self.load_btn = QPushButton("Load Positions")
+        self.load_btn.clicked.connect(self._load_positions)
+        ids_layout.addWidget(self.load_btn)
+
+        self.refresh_btn = QPushButton("Refresh All")
+        self.refresh_btn.clicked.connect(self._refresh_all_positions)
+        ids_layout.addWidget(self.refresh_btn)
+
+        # Protocol selector for scanning
+        self.scan_protocol_combo = QComboBox()
+        self.scan_protocol_combo.addItem("V4 Uniswap", "v4")
+        self.scan_protocol_combo.addItem("V4 PancakeSwap", "v4_pancake")
+        self.scan_protocol_combo.addItem("V3 Uniswap", "v3_uniswap")
+        self.scan_protocol_combo.addItem("V3 PancakeSwap", "v3")
+        self.scan_protocol_combo.setToolTip("Select which protocol to scan")
+        self.scan_protocol_combo.setMinimumWidth(150)
+        ids_layout.addWidget(self.scan_protocol_combo)
+
+        self.scan_btn = QPushButton("🔍 Scan Wallet")
+        self.scan_btn.setToolTip("Scan blockchain for all positions owned by this wallet")
+        self.scan_btn.clicked.connect(self._scan_wallet)
+        self.scan_btn.setObjectName("primaryButton")
+        ids_layout.addWidget(self.scan_btn)
+
+        top_layout.addLayout(ids_layout)
+
+        # Filter options row
+        filter_layout = QHBoxLayout()
+        self.hide_empty_cb = QCheckBox("Hide empty positions (liquidity = 0)")
+        self.hide_empty_cb.setChecked(True)  # Hide empty by default
+        self.hide_empty_cb.toggled.connect(self._on_filter_changed)
+        filter_layout.addWidget(self.hide_empty_cb)
+        filter_layout.addStretch()
+        top_layout.addLayout(filter_layout)
+
+        # Or single ID input
+        single_layout = QHBoxLayout()
+        single_layout.addWidget(QLabel("Or enter single ID:"))
+        self.single_id_spin = QSpinBox()
+        self.single_id_spin.setRange(0, 999999999)
+        single_layout.addWidget(self.single_id_spin)
+
+        self.add_btn = QPushButton("Add")
+        self.add_btn.clicked.connect(self._add_single_id)
+        single_layout.addWidget(self.add_btn)
+        single_layout.addStretch()
+        top_layout.addLayout(single_layout)
+
+        layout.addWidget(top_group)
+
+        # Positions table
+        table_group = QGroupBox("Loaded Positions")
+        table_layout = QVBoxLayout(table_group)
+
+        self.positions_table = QTableWidget()
+        self.positions_table.setColumnCount(9)
+        self.positions_table.setHorizontalHeaderLabels([
+            "Token ID", "Pair", "Fee",
+            "Price Range", "Liquidity", "Fees Earned",
+            "PnL", "Status", "Range Progress"
+        ])
+
+        header = self.positions_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
+
+        # Set custom delegate for progress bar column
+        self.positions_table.setItemDelegateForColumn(8, PriceProgressDelegate())
+
+        self.positions_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.positions_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.positions_table.setMinimumHeight(550)
+
+        table_layout.addWidget(self.positions_table)
+
+        layout.addWidget(table_group)
+
+        # Actions Group (separate from table to avoid overlapping)
+        actions_group = QGroupBox("Actions")
+        actions_layout = QVBoxLayout(actions_group)
+        actions_layout.setSpacing(8)
+
+        # Row 1: Close settings
+        close_settings_layout = QHBoxLayout()
+        close_settings_layout.addWidget(QLabel("Close Slippage:"))
+        self.close_slippage_spin = QDoubleSpinBox()
+        self.close_slippage_spin.setRange(0.1, 100.0)
+        self.close_slippage_spin.setValue(5.0)
+        self.close_slippage_spin.setSuffix(" %")
+        self.close_slippage_spin.setToolTip("Max slippage when closing positions (0.1% - 100%)")
+        self.close_slippage_spin.setFixedWidth(85)
+        close_settings_layout.addWidget(self.close_slippage_spin)
+
+        self.auto_sell_cb = QCheckBox("Auto-sell tokens")
+        self.auto_sell_cb.setToolTip(
+            "Automatically sell received tokens (except USDT/USDC/BNB/ETH)\n"
+            "via PancakeSwap/Uniswap Router"
+        )
+        self.auto_sell_cb.setChecked(False)
+        close_settings_layout.addWidget(self.auto_sell_cb)
+
+        close_settings_layout.addWidget(QLabel("Swap Slip:"))
+        self.swap_slippage_spin = QDoubleSpinBox()
+        self.swap_slippage_spin.setRange(0.5, 50.0)
+        self.swap_slippage_spin.setValue(3.0)
+        self.swap_slippage_spin.setSuffix(" %")
+        self.swap_slippage_spin.setToolTip("Slippage for auto-sell swaps (0.5% - 50%)")
+        self.swap_slippage_spin.setFixedWidth(75)
+        close_settings_layout.addWidget(self.swap_slippage_spin)
+
+        close_settings_layout.addWidget(QLabel("Initial $:"))
+        self.initial_investment_spin = QDoubleSpinBox()
+        self.initial_investment_spin.setRange(0, 10000000)
+        self.initial_investment_spin.setValue(0)
+        self.initial_investment_spin.setDecimals(2)
+        self.initial_investment_spin.setToolTip(
+            "Enter your initial investment to calculate PnL after closing positions"
+        )
+        self.initial_investment_spin.setFixedWidth(85)
+        close_settings_layout.addWidget(self.initial_investment_spin)
+        close_settings_layout.addStretch()
+        actions_layout.addLayout(close_settings_layout)
+
+        # Row 2: Action buttons
+        action_layout = QHBoxLayout()
+
+        self.close_selected_btn = QPushButton("Close Selected")
+        self.close_selected_btn.setObjectName("dangerButton")
+        self.close_selected_btn.clicked.connect(self._close_selected)
+        self.close_selected_btn.setEnabled(False)
+        action_layout.addWidget(self.close_selected_btn)
+
+        self.close_all_btn = QPushButton("Close All")
+        self.close_all_btn.setObjectName("dangerButton")
+        self.close_all_btn.clicked.connect(self._close_all)
+        self.close_all_btn.setEnabled(False)
+        action_layout.addWidget(self.close_all_btn)
+
+        self.batch_close_btn = QPushButton("🚀 Close All V4 (1 TX)")
+        self.batch_close_btn.setToolTip("Close all V4 positions in a single transaction (gas efficient)")
+        self.batch_close_btn.setObjectName("dangerButton")
+        self.batch_close_btn.clicked.connect(self._batch_close_all)
+        self.batch_close_btn.setEnabled(False)
+        action_layout.addWidget(self.batch_close_btn)
+
+        self.remove_selected_btn = QPushButton("Remove from List")
+        self.remove_selected_btn.clicked.connect(self._remove_selected)
+        action_layout.addWidget(self.remove_selected_btn)
+
+        self.clear_btn = QPushButton("Clear All")
+        self.clear_btn.clicked.connect(self._clear_list)
+        action_layout.addWidget(self.clear_btn)
+
+        action_layout.addStretch()
+        actions_layout.addLayout(action_layout)
+
+        layout.addWidget(actions_group)
+
+        # Progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.hide()
+        layout.addWidget(self.progress_bar)
+
+        # Log
+        log_group = QGroupBox("Activity Log")
+        log_layout = QVBoxLayout(log_group)
+
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumHeight(120)
+        self.log_text.setFont(QFont("Consolas", 10))
+        log_layout.addWidget(self.log_text)
+
+        layout.addWidget(log_group)
+
+        # Status
+        self.status_label = QLabel("Connect wallet in Create tab to manage positions")
+        self.status_label.setObjectName("subtitleLabel")
+        layout.addWidget(self.status_label)
+
+        # Finish scroll area setup
+        scroll_area.setWidget(scroll_widget)
+        main_layout.addWidget(scroll_area)
+
+    def set_provider(self, provider):
+        """Set the liquidity provider instance."""
+        self.provider = provider
+        if provider:
+            # Detect V4 provider and its specific protocol
+            is_v4 = hasattr(provider, 'create_pool_only')
+            if is_v4:
+                from src.contracts.v4 import V4Protocol
+                provider_protocol = getattr(provider, 'protocol', V4Protocol.UNISWAP)
+
+                if provider_protocol == V4Protocol.PANCAKESWAP:
+                    self.status_label.setText("Ready to manage PancakeSwap V4 positions")
+                    self._log("PancakeSwap V4 Provider connected")
+                    idx = self.scan_protocol_combo.findData("v4_pancake")
+                else:
+                    self.status_label.setText("Ready to manage Uniswap V4 positions")
+                    self._log("Uniswap V4 Provider connected")
+                    idx = self.scan_protocol_combo.findData("v4")
+
+                if idx >= 0:
+                    self.scan_protocol_combo.setCurrentIndex(idx)
+            else:
+                # V3 provider - detect if Uniswap V3 or PancakeSwap V3
+                v3_dex_name = "V3"
+                v3_protocol_data = "v3"  # default to PancakeSwap V3
+
+                try:
+                    from config import V3_DEXES
+                    chain_id = getattr(provider, 'chain_id', 56)
+                    pm_address = getattr(provider, 'position_manager_address', None)
+
+                    if pm_address and chain_id in V3_DEXES:
+                        pm_lower = pm_address.lower()
+                        for dex_name, dex_config in V3_DEXES[chain_id].items():
+                            if dex_config.position_manager.lower() == pm_lower:
+                                v3_dex_name = dex_config.name
+                                if "uniswap" in dex_name.lower():
+                                    v3_protocol_data = "v3_uniswap"
+                                break
+                except Exception as detect_err:
+                    print(f"Could not detect V3 DEX: {detect_err}")
+
+                self.status_label.setText(f"Ready to manage {v3_dex_name} positions")
+                self._log(f"{v3_dex_name} Provider connected")
+
+                # Set correct V3 protocol in combo
+                idx = self.scan_protocol_combo.findData(v3_protocol_data)
+                if idx >= 0:
+                    self.scan_protocol_combo.setCurrentIndex(idx)
+
+            # Create pool factory for fetching current prices (V3 only, but harmless for V4)
+            try:
+                from src.contracts.pool_factory import PoolFactory
+                self.pool_factory = PoolFactory(
+                    provider.w3,
+                    provider.account,
+                    chain_id=provider.chain_id
+                )
+            except Exception as e:
+                self._log(f"Note: PoolFactory not initialized (OK for V4): {e}")
+                self.pool_factory = None
+
+            # Auto-load saved positions on connect
+            self._refresh_all_positions()
+        else:
+            self.status_label.setText("Connect wallet in Create tab to manage positions")
+            self.pool_factory = None
+
+    def add_positions(self, token_ids: list):
+        """
+        Add positions to the list (called externally when new positions are created).
+
+        Args:
+            token_ids: List of new token IDs to add
+        """
+        # Add to input field
+        current_text = self.token_ids_input.text().strip()
+        new_ids_str = ", ".join(str(tid) for tid in token_ids)
+
+        if current_text:
+            self.token_ids_input.setText(f"{current_text}, {new_ids_str}")
+        else:
+            self.token_ids_input.setText(new_ids_str)
+
+        # Add to positions data (will be populated when loaded)
+        for token_id in token_ids:
+            if token_id not in self.positions_data:
+                self.positions_data[token_id] = None  # Placeholder
+
+        # Save and reload
+        self._save_positions()
+
+        if self.provider:
+            self._load_positions_by_ids(token_ids)
+
+        self._log(f"Added new positions: {token_ids}")
+        self.positions_updated.emit()
+
+    def _log(self, message: str):
+        """Add message to log."""
+        self.log_text.append(message)
+
+    def _save_positions(self):
+        """Save positions to QSettings including protocol info."""
+        # Save list of token IDs (for backward compatibility)
+        token_ids = list(self.positions_data.keys())
+        self.settings.setValue("token_ids", json.dumps(token_ids))
+
+        # Save position protocols - minimal data to restore protocol on reload
+        positions_protocols = {}
+        for tid, pos in self.positions_data.items():
+            if pos and isinstance(pos, dict):
+                protocol = pos.get('protocol', 'v3')
+                positions_protocols[str(tid)] = protocol
+
+        self.settings.setValue("positions_protocols", json.dumps(positions_protocols))
+        self._log(f"Saved {len(token_ids)} positions to storage")
+
+    def _load_saved_positions(self):
+        """Load saved positions from QSettings."""
+        try:
+            saved_ids = self.settings.value("token_ids", "[]")
+            token_ids = json.loads(saved_ids)
+
+            # Load saved protocols
+            saved_protocols = self.settings.value("positions_protocols", "{}")
+            positions_protocols = json.loads(saved_protocols)
+
+            if token_ids:
+                self.token_ids_input.setText(", ".join(str(tid) for tid in token_ids))
+                for token_id in token_ids:
+                    # Initialize with protocol info if available
+                    protocol = positions_protocols.get(str(token_id), None)
+                    if protocol:
+                        self.positions_data[token_id] = {'protocol': protocol}
+                    else:
+                        self.positions_data[token_id] = None
+                self._log(f"Loaded {len(token_ids)} saved position IDs")
+        except Exception as e:
+            self._log(f"Error loading saved positions: {e}")
+
+    def _add_single_id(self):
+        """Add single token ID to the list."""
+        token_id = self.single_id_spin.value()
+        if token_id > 0:
+            current_text = self.token_ids_input.text().strip()
+            if current_text:
+                self.token_ids_input.setText(f"{current_text}, {token_id}")
+            else:
+                self.token_ids_input.setText(str(token_id))
+            self._log(f"Added token ID: {token_id}")
+
+    def _parse_token_ids(self) -> list:
+        """Parse token IDs from input."""
+        text = self.token_ids_input.text().strip()
+        if not text:
+            return []
+
+        try:
+            ids = [int(x.strip()) for x in text.split(",") if x.strip()]
+            return list(set(ids))  # Remove duplicates
+        except ValueError:
+            return []
+
+    def _load_positions(self):
+        """Load position details from blockchain."""
+        if not self.provider:
+            QMessageBox.warning(
+                self, "Error",
+                "Please connect wallet in the Create tab first."
+            )
+            return
+
+        token_ids = self._parse_token_ids()
+        if not token_ids:
+            QMessageBox.warning(self, "Error", "Please enter valid token IDs.")
+            return
+
+        self._load_positions_by_ids(token_ids)
+
+    def _load_positions_by_ids(self, token_ids: list, protocol: str = None):
+        """Load specific positions by their IDs."""
+        try:
+            self.progress_bar.show()
+
+            # Use selected protocol if not specified
+            if protocol is None:
+                protocol = self.scan_protocol_combo.currentData()
+
+            # Validate protocol
+            if protocol is None:
+                protocol = "v3"  # Default fallback
+
+            if protocol and protocol.startswith("v4"):
+                protocol_name = "V4 PancakeSwap" if protocol == "v4_pancake" else "V4 Uniswap"
+            elif protocol == "v3_uniswap":
+                protocol_name = "V3 Uniswap"
+            else:
+                protocol_name = "V3 PancakeSwap"
+            self._log(f"Loading {len(token_ids)} {protocol_name} positions...")
+
+            for token_id in token_ids:
+                try:
+                    worker = LoadPositionWorker(
+                        self.provider, token_id, self.pool_factory,
+                        check_ownership=True, protocol=protocol
+                    )
+                    worker.position_loaded.connect(self._on_position_loaded)
+                    worker.error.connect(self._on_position_error)
+                    worker.not_owned.connect(self._on_position_not_owned)
+                    worker.finished.connect(lambda w=worker: self._on_worker_finished(w))
+                    self.load_workers.append(worker)
+                    worker.start()
+                except Exception as worker_err:
+                    self._log(f"❌ Failed to start worker for {token_id}: {worker_err}")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self._log(f"❌ Error loading positions: {e}")
+            self.progress_bar.hide()
+
+    def _on_position_loaded(self, token_id: int, position: dict):
+        """Handle position loaded from blockchain."""
+        try:
+            print(f"[UI] _on_position_loaded: token_id={token_id}")
+            self.positions_data[token_id] = position
+            self._update_table_row(token_id, position)
+            # NOTE: Don't save here - causes race condition when multiple workers finish
+            # Save is done in _on_worker_finished when ALL workers complete
+            self._update_buttons()
+            protocol = position.get('protocol', 'unknown')
+            self._log(f"✅ Loaded position #{token_id} ({protocol})")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self._log(f"❌ Error displaying position {token_id}: {e}")
+
+    def _on_position_error(self, token_id: int, error: str):
+        """Handle position load error."""
+        self._log(f"❌ Position {token_id}: {error}")
+        # Remove from positions if it doesn't exist
+        if token_id in self.positions_data:
+            del self.positions_data[token_id]
+        # Update input field to remove invalid IDs
+        self._update_token_ids_input()
+
+    def _on_position_not_owned(self, token_id: int, owner: str):
+        """Handle position that exists but is not owned by current wallet."""
+        # Get selected protocol for context
+        selected_protocol = self.scan_protocol_combo.currentData()
+        if selected_protocol == "v4":
+            protocol_name = "Uniswap V4"
+            alt_protocol = "Try PancakeSwap V4 instead?"
+        elif selected_protocol == "v4_pancake":
+            protocol_name = "PancakeSwap V4"
+            alt_protocol = "Try Uniswap V4 instead?"
+        elif selected_protocol == "v3_uniswap":
+            protocol_name = "Uniswap V3"
+            alt_protocol = "Try PancakeSwap V3 instead?"
+        else:
+            protocol_name = "PancakeSwap V3"
+            alt_protocol = "Try other protocols?"
+
+        self._log(f"⚠️ Position {token_id} not owned by you on {protocol_name}")
+        self._log(f"   Owner: {owner[:8]}...{owner[-6:]}")
+        self._log(f"   Hint: {alt_protocol}")
+
+        # Remove from positions
+        if token_id in self.positions_data:
+            del self.positions_data[token_id]
+        # Update input field
+        self._update_token_ids_input()
+
+    def _update_token_ids_input(self):
+        """Update token IDs input field to reflect current positions."""
+        remaining_ids = list(self.positions_data.keys())
+        self.token_ids_input.setText(", ".join(str(tid) for tid in remaining_ids))
+
+    def _scan_wallet(self):
+        """Scan wallet for all positions."""
+        if not self.provider:
+            QMessageBox.warning(
+                self, "Error",
+                "Please connect wallet in the Create tab first."
+            )
+            return
+
+        # Get selected protocol
+        selected_protocol = self.scan_protocol_combo.currentData()
+        if selected_protocol == "v4_pancake":
+            protocol_name = "PancakeSwap V4"
+        elif selected_protocol == "v4":
+            protocol_name = "Uniswap V4"
+        elif selected_protocol == "v3_uniswap":
+            protocol_name = "Uniswap V3"
+        else:
+            protocol_name = "PancakeSwap V3"
+
+        # Confirm if there are existing positions
+        if self.positions_data:
+            reply = QMessageBox.question(
+                self, "Confirm Scan",
+                f"This will scan for {protocol_name} positions and replace the current list.\n\n"
+                "Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        # Clear existing data
+        self.positions_table.setRowCount(0)
+        self.positions_data = {}
+        self.token_ids_input.clear()
+
+        # Start scan worker with selected protocol
+        self.progress_bar.show()
+        self.scan_btn.setEnabled(False)
+        self.load_btn.setEnabled(False)
+        self.refresh_btn.setEnabled(False)
+
+        self.scan_worker = ScanWalletWorker(self.provider, self.pool_factory, protocol=selected_protocol)
+        self.scan_worker.progress.connect(self._on_scan_progress)
+        self.scan_worker.position_found.connect(self._on_scan_position_found)
+        self.scan_worker.finished.connect(self._on_scan_finished)
+        self.scan_worker.start()
+
+    def _on_scan_progress(self, message: str):
+        """Handle scan progress messages."""
+        self._log(message)
+
+    def _on_scan_position_found(self, token_id: int, position: dict):
+        """Handle position found during scan."""
+        liquidity = position.get('liquidity', 0)
+        self._log(f"  Found #{token_id}: liquidity={liquidity:,}")
+
+        self.positions_data[token_id] = position
+
+        # Only show in table if not filtering or has liquidity
+        if not self.hide_empty_cb.isChecked() or liquidity > 0:
+            self._update_table_row(token_id, position)
+
+    def _on_filter_changed(self, checked: bool):
+        """Handle filter checkbox change - rebuild table."""
+        self._rebuild_table()
+
+    def _rebuild_table(self):
+        """Rebuild table with current filter settings."""
+        self.positions_table.setRowCount(0)
+        hide_empty = self.hide_empty_cb.isChecked()
+
+        shown_count = 0
+        hidden_count = 0
+
+        for token_id, position in self.positions_data.items():
+            if position:
+                liquidity = position.get('liquidity', 0)
+                if hide_empty and liquidity == 0:
+                    hidden_count += 1
+                    continue
+                self._update_table_row(token_id, position)
+                shown_count += 1
+
+        if hidden_count > 0:
+            self._log(f"Showing {shown_count} positions ({hidden_count} empty hidden)")
+
+        self._update_buttons()
+
+    def _on_scan_finished(self, total_found: int, token_ids: list, protocol: str = "v3"):
+        """Handle scan completion."""
+        self.progress_bar.hide()
+        self.scan_btn.setEnabled(True)
+        self.load_btn.setEnabled(True)
+        self.refresh_btn.setEnabled(True)
+
+        # Update input field with found token IDs
+        self.token_ids_input.setText(", ".join(str(tid) for tid in token_ids))
+
+        # Count active vs empty positions
+        active_count = sum(
+            1 for p in self.positions_data.values()
+            if p and p.get('liquidity', 0) > 0
+        )
+        empty_count = total_found - active_count
+
+        # Save positions
+        self._save_positions()
+
+        # Rebuild table with filter
+        self._rebuild_table()
+
+        if protocol == "v4_pancake":
+            protocol_name = "PancakeSwap V4"
+        elif protocol == "v4":
+            protocol_name = "Uniswap V4"
+        elif protocol == "v3_uniswap":
+            protocol_name = "Uniswap V3"
+        else:
+            protocol_name = "PancakeSwap V3"
+
+        if total_found > 0:
+            self._log(f"✅ Scan complete! Found {total_found} {protocol_name} positions: {active_count} active, {empty_count} empty")
+            QMessageBox.information(
+                self, "Scan Complete",
+                f"Found {total_found} {protocol_name} position(s) owned by your wallet.\n\n"
+                f"• Active (with liquidity): {active_count}\n"
+                f"• Empty (liquidity = 0): {empty_count}\n\n"
+                f"Token IDs: {token_ids}\n\n"
+                f"{'Empty positions are hidden. Uncheck filter to see them.' if empty_count > 0 and self.hide_empty_cb.isChecked() else ''}"
+            )
+        else:
+            self._log(f"Scan complete - no {protocol_name} positions found")
+            # Suggest other protocols
+            if protocol.startswith("v4"):
+                other_protocol = "PancakeSwap V3 or other V4 protocol"
+            else:
+                other_protocol = "Uniswap V4 or PancakeSwap V4"
+            QMessageBox.information(
+                self, "Scan Complete",
+                f"No {protocol_name} positions found for this wallet.\n\n"
+                f"Make sure you're connected with the correct wallet.\n\n"
+                f"Try scanning {other_protocol} using the protocol selector."
+            )
+
+    def _on_worker_finished(self, worker):
+        """Handle worker completion."""
+        if worker in self.load_workers:
+            self.load_workers.remove(worker)
+
+        if not self.load_workers:
+            self.progress_bar.hide()
+            # Save all positions ONCE after ALL workers have finished
+            # This prevents race condition when multiple workers complete simultaneously
+            self._save_positions()
+            self._log(f"All positions loaded ({len(self.positions_data)} total)")
+
+    def _update_table_row(self, token_id: int, position: dict):
+        """Update or add a table row for a position."""
+        # Find existing row or create new
+        row = -1
+        for r in range(self.positions_table.rowCount()):
+            item = self.positions_table.item(r, 0)
+            if item:
+                # Extract numeric ID from display text (may have protocol prefix)
+                display_text = item.text()
+                try:
+                    # Handle both "V4:12345" and "12345" formats
+                    if ":" in display_text:
+                        existing_id = int(display_text.split(":")[1])
+                    else:
+                        existing_id = int(display_text)
+                    if existing_id == token_id:
+                        row = r
+                        break
+                except ValueError:
+                    continue
+
+        if row == -1:
+            row = self.positions_table.rowCount()
+            self.positions_table.insertRow(row)
+
+        # Token ID with protocol prefix
+        protocol = position.get('protocol', 'v3')
+        # Check if it's a V4 protocol (either "v4" or "v4_pancake")
+        is_v4 = protocol and protocol.startswith("v4")
+        protocol_prefix = "V4" if is_v4 else "V3"
+        token_id_item = QTableWidgetItem(f"{protocol_prefix}:{token_id}")
+        # Store raw token_id for later use
+        token_id_item.setData(Qt.ItemDataRole.UserRole, token_id)
+        self.positions_table.setItem(row, 0, token_id_item)
+
+        # Detect if token0 is a stablecoin (need to invert prices)
+        token0_addr = position.get('token0', '')
+        token1_addr = position.get('token1', '')
+        token0_sym = position.get('token0_symbol', '')
+        token1_sym = position.get('token1_symbol', '')
+
+        # Known stablecoin addresses on BNB Chain (lowercase for comparison)
+        STABLECOIN_ADDRESSES = {
+            "0x55d398326f99059ff775485246999027b3197955": "USDT",  # BSC-USD (USDT)
+            "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": "USDC",  # USD Coin
+            "0xe9e7cea3dedca5984780bafc599bd69add087d56": "BUSD",  # BUSD
+            "0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3": "DAI",   # DAI
+            "0x14016e85a25aeb13065688cafb43044c2ef86784": "TUSD",  # TrueUSD
+        }
+
+        stablecoins_symbols = ["USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "FRAX"]
+
+        # Check by address first (more reliable for V4)
+        token0_addr_lower = token0_addr.lower() if token0_addr else ''
+        token1_addr_lower = token1_addr.lower() if token1_addr else ''
+
+        if token0_addr_lower in STABLECOIN_ADDRESSES:
+            token0_is_stable = True
+            if not token0_sym:
+                token0_sym = STABLECOIN_ADDRESSES[token0_addr_lower]
+        elif token0_sym and token0_sym.upper() in stablecoins_symbols:
+            token0_is_stable = True
+        else:
+            token0_is_stable = False
+
+        if token1_addr_lower in STABLECOIN_ADDRESSES:
+            token1_is_stable = True
+            if not token1_sym:
+                token1_sym = STABLECOIN_ADDRESSES[token1_addr_lower]
+        elif token1_sym and token1_sym.upper() in stablecoins_symbols:
+            token1_is_stable = True
+        else:
+            token1_is_stable = False
+
+        # Default symbols if not found
+        if not token0_sym:
+            token0_sym = token0_addr[:8] if token0_addr else '???'
+        if not token1_sym:
+            token1_sym = token1_addr[:8] if token1_addr else '???'
+
+        if is_v4:
+            print(f"[UI] V4 Position {token_id}: token0={token0_sym} (stable={token0_is_stable}), token1={token1_sym} (stable={token1_is_stable})")
+
+        # Pair - show as volatile/stablecoin
+        if token0_is_stable and not token1_is_stable:
+            pair_str = f"{token1_sym}/{token0_sym}"
+        else:
+            pair_str = f"{token0_sym}/{token1_sym}"
+        self.positions_table.setItem(row, 1, QTableWidgetItem(pair_str))
+
+        # Fee
+        fee = position.get('fee', 0)
+        fee_pct = fee / 10000 if fee else 0
+        self.positions_table.setItem(row, 2, QTableWidgetItem(f"{fee_pct}%"))
+
+        # Price Range (convert ticks to prices)
+        tick_lower = position.get('tick_lower', 0)
+        tick_upper = position.get('tick_upper', 0)
+
+        # Debug logging for V4 positions
+        if is_v4:
+            print(f"[UI] V4 Position {token_id}: tick_lower={tick_lower}, tick_upper={tick_upper}, liquidity={position.get('liquidity', 0)}")
+
+        # Validate tick values are in valid range
+        MIN_TICK, MAX_TICK = -887272, 887272
+        ticks_valid = (MIN_TICK <= tick_lower <= MAX_TICK and MIN_TICK <= tick_upper <= MAX_TICK)
+
+        if not ticks_valid:
+            print(f"[UI] WARNING: Invalid tick values for position {token_id}: {tick_lower}/{tick_upper}")
+            raw_price_lower = 0
+            raw_price_upper = float('inf')
+        else:
+            # tick_to_price gives token1/token0 (raw, without decimals)
+            # Use try/except because extreme ticks can cause overflow
+            try:
+                raw_price_lower = tick_to_price(tick_lower)
+                raw_price_upper = tick_to_price(tick_upper)
+                if is_v4:
+                    print(f"[UI] V4 Position {token_id}: raw prices = {raw_price_lower:.10f} - {raw_price_upper:.10f}")
+            except (OverflowError, ValueError) as e:
+                # Extreme tick values - display raw ticks instead
+                print(f"[UI] tick_to_price overflow for ticks {tick_lower}/{tick_upper}: {e}")
+                raw_price_lower = 0
+                raw_price_upper = float('inf')
+
+        # Adjust for decimals: human_price = raw_price / 10^(decimals0 - decimals1)
+        dec0 = position.get('token0_decimals', 18)
+        dec1 = position.get('token1_decimals', 18)
+        decimals_diff = dec0 - dec1
+        if decimals_diff != 0:
+            try:
+                adjustment = 10 ** decimals_diff
+                raw_price_lower /= adjustment
+                raw_price_upper /= adjustment
+            except (OverflowError, ZeroDivisionError):
+                pass  # Keep raw prices if adjustment fails
+
+        # If token0 is stablecoin, invert to show TOKEN/USD price (how much USD per token)
+        # tick_to_price gives token1/token0, so if token0=USDT, token1=MEME, we get MEME/USDT
+        # We need to invert to get USDT/MEME = price of MEME in USD
+        if token0_is_stable and not token1_is_stable:
+            # Invert prices (and swap lower/upper since inverting flips the range)
+            if is_v4:
+                print(f"[UI] V4 Position {token_id}: Inverting prices (token0 is stablecoin)")
+            if raw_price_lower > 0 and raw_price_upper > 0 and raw_price_upper != float('inf'):
+                try:
+                    price_lower = 1 / raw_price_upper
+                    price_upper = 1 / raw_price_lower if raw_price_lower > 0 else float('inf')
+                except (OverflowError, ZeroDivisionError):
+                    price_lower = raw_price_lower
+                    price_upper = raw_price_upper
+            else:
+                price_lower = raw_price_lower
+                price_upper = raw_price_upper
+        else:
+            price_lower = raw_price_lower
+            price_upper = raw_price_upper
+
+        if is_v4:
+            print(f"[UI] V4 Position {token_id}: final prices = ${price_lower:.10f} - ${price_upper:.10f}")
+
+        # Format price range (handle infinity and extreme values)
+        # Check for invalid/extreme values that indicate bad tick extraction
+        is_price_valid = (
+            price_upper != float('inf') and
+            price_lower != 0 and
+            price_upper < 1e12 and  # Trillion - anything above is likely wrong
+            price_lower < 1e12 and
+            price_lower > 0 and
+            price_upper > 0
+        )
+
+        if not is_price_valid:
+            # Extreme or invalid prices - show ticks instead
+            price_range_str = f"Tick {tick_lower} - {tick_upper}"
+        elif price_lower < 0.0000001:
+            price_range_str = f"${price_lower:.10f} - ${price_upper:.10f}"
+        elif price_lower < 0.001:
+            price_range_str = f"${price_lower:.8f} - ${price_upper:.8f}"
+        elif price_lower < 1:
+            # Most meme tokens fall here - show 6 decimals
+            price_range_str = f"${price_lower:.6f} - ${price_upper:.6f}"
+        elif price_lower < 100:
+            price_range_str = f"${price_lower:.4f} - ${price_upper:.4f}"
+        elif price_lower < 10000:
+            price_range_str = f"${price_lower:.2f} - ${price_upper:.2f}"
+        else:
+            price_range_str = f"${price_lower:,.0f} - ${price_upper:,.0f}"
+        self.positions_table.setItem(row, 3, QTableWidgetItem(price_range_str))
+
+        # Liquidity (format large numbers more readably)
+        liquidity = position.get('liquidity', 0)
+        if liquidity >= 1e18:
+            liq_str = f"{liquidity/1e18:.2f}e18"
+        elif liquidity >= 1e15:
+            liq_str = f"{liquidity/1e15:.2f}e15"
+        elif liquidity >= 1e12:
+            liq_str = f"{liquidity/1e12:.2f}T"
+        elif liquidity >= 1e9:
+            liq_str = f"{liquidity/1e9:.2f}B"
+        elif liquidity >= 1e6:
+            liq_str = f"{liquidity/1e6:.2f}M"
+        else:
+            liq_str = f"{liquidity:,.0f}"
+        liq_item = QTableWidgetItem(liq_str)
+        self.positions_table.setItem(row, 4, liq_item)
+
+        # Fees Earned (tokens_owed)
+        fees0 = position.get('tokens_owed0', 0)
+        fees1 = position.get('tokens_owed1', 0)
+
+        # Format fees with decimals
+        fees0_formatted = fees0 / (10 ** dec0) if fees0 > 0 else 0
+        fees1_formatted = fees1 / (10 ** dec1) if fees1 > 0 else 0
+
+        # Show fees as volatile / stablecoin
+        if token0_is_stable and not token1_is_stable:
+            fees_str = f"{fees1_formatted:.6f} / {fees0_formatted:.4f}"
+            stable_fees = fees0_formatted
+        else:
+            fees_str = f"{fees0_formatted:.6f} / {fees1_formatted:.4f}"
+            stable_fees = fees1_formatted
+        self.positions_table.setItem(row, 5, QTableWidgetItem(fees_str))
+
+        # PnL (simplified - just stablecoin fees for now)
+        pnl_str = f"+${stable_fees:.4f}" if stable_fees > 0 else "$0.00"
+        pnl_item = QTableWidgetItem(pnl_str)
+        if stable_fees > 0:
+            pnl_item.setForeground(QColor(76, 175, 80))
+        self.positions_table.setItem(row, 6, pnl_item)
+
+        # Status
+        current_tick = position.get('current_tick', 0)
+        in_range = tick_lower <= current_tick <= tick_upper if current_tick else False
+
+        if liquidity == 0:
+            status = "Empty"
+            status_color = QColor(128, 128, 128)
+        elif in_range:
+            status = "In Range"
+            status_color = QColor(76, 175, 80)
+        else:
+            status = "Out of Range"
+            status_color = QColor(255, 152, 0)
+
+        status_item = QTableWidgetItem(status)
+        status_item.setForeground(status_color)
+        self.positions_table.setItem(row, 7, status_item)
+
+        # Range Progress (with custom delegate)
+        # Only set valid data if prices are valid
+        if is_price_valid:
+            # current_price from pool is raw token1/token0, need to process it
+            raw_current_price = position.get('current_price', None)
+            if raw_current_price is not None:
+                # Invert if token0 is stablecoin
+                if token0_is_stable and not token1_is_stable and raw_current_price > 0:
+                    try:
+                        current_price = 1 / raw_current_price
+                    except (OverflowError, ZeroDivisionError):
+                        current_price = price_lower
+                else:
+                    current_price = raw_current_price
+            else:
+                # Fallback to middle of range
+                current_price = (price_lower + price_upper) / 2
+
+            # Ensure prices are valid for progress display
+            display_price_lower = price_lower if price_lower > 0 else 0
+            display_price_upper = price_upper if price_upper > 0 else current_price * 2
+            display_current = current_price if current_price > 0 else display_price_lower
+        else:
+            # Invalid prices - set None values so delegate shows "Invalid price data"
+            display_price_lower = None
+            display_price_upper = None
+            display_current = None
+
+        progress_item = QTableWidgetItem()
+        progress_item.setData(Qt.ItemDataRole.UserRole, {
+            'price_lower': display_price_lower,
+            'price_upper': display_price_upper,
+            'current_price': display_current,
+            'in_range': in_range if is_price_valid else False
+        })
+        self.positions_table.setItem(row, 8, progress_item)
+
+        # Set row height for progress bar
+        self.positions_table.setRowHeight(row, 40)
+
+    def _refresh_all_positions(self):
+        """Refresh all loaded positions."""
+        if not self.provider:
+            return
+
+        token_ids = list(self.positions_data.keys())
+        if not token_ids:
+            # Try to load from input
+            token_ids = self._parse_token_ids()
+            if not token_ids:
+                return
+
+        # Group positions by their stored protocol
+        # This ensures V4 Uniswap, V4 PancakeSwap, V3, etc. are loaded with correct managers
+        positions_by_protocol = {}
+        for token_id in token_ids:
+            pos = self.positions_data.get(token_id)
+            if pos and isinstance(pos, dict):
+                stored_protocol = pos.get('protocol', None)
+            else:
+                stored_protocol = None
+
+            if stored_protocol is None:
+                # No stored protocol - use combo box selection
+                stored_protocol = self.scan_protocol_combo.currentData() or "v3"
+
+            if stored_protocol not in positions_by_protocol:
+                positions_by_protocol[stored_protocol] = []
+            positions_by_protocol[stored_protocol].append(token_id)
+
+        # Load each protocol group separately
+        for protocol, ids in positions_by_protocol.items():
+            if ids:
+                self._log(f"Refreshing {len(ids)} {protocol} positions...")
+                self._load_positions_by_ids(ids, protocol=protocol)
+
+    def _update_buttons(self):
+        """Update button states based on positions."""
+        has_positions = len(self.positions_data) > 0
+        has_active = any(
+            p and p.get('liquidity', 0) > 0
+            for p in self.positions_data.values()
+        )
+
+        # Count V4 positions with liquidity for batch close
+        v4_active_count = sum(
+            1 for p in self.positions_data.values()
+            if p and p.get('protocol', '').startswith('v4') and p.get('liquidity', 0) > 0
+        )
+
+        self.close_selected_btn.setEnabled(has_active)
+        self.close_all_btn.setEnabled(has_active)
+        self.batch_close_btn.setEnabled(v4_active_count > 0)
+        if v4_active_count > 0:
+            self.batch_close_btn.setText(f"🚀 Close All V4 (1 TX) [{v4_active_count}]")
+
+    def _get_selected_token_ids(self) -> list:
+        """Get token IDs of selected rows."""
+        selected_rows = set(item.row() for item in self.positions_table.selectedItems())
+        result = []
+        for row in selected_rows:
+            item = self.positions_table.item(row, 0)
+            if item:
+                # Try to get from UserRole first (raw token_id)
+                token_id = item.data(Qt.ItemDataRole.UserRole)
+                if token_id is None:
+                    # Fallback: parse from text (may have "V3:" or "V4:" prefix)
+                    text = item.text()
+                    if ":" in text:
+                        token_id = int(text.split(":")[1])
+                    else:
+                        token_id = int(text)
+                result.append(token_id)
+        return result
+
+    def _remove_selected(self):
+        """Remove selected positions from the list (doesn't close them)."""
+        token_ids = self._get_selected_token_ids()
+        if not token_ids:
+            QMessageBox.warning(self, "Error", "Please select positions to remove.")
+            return
+
+        for token_id in token_ids:
+            if token_id in self.positions_data:
+                del self.positions_data[token_id]
+
+        # Update input field
+        remaining_ids = list(self.positions_data.keys())
+        self.token_ids_input.setText(", ".join(str(tid) for tid in remaining_ids))
+
+        # Rebuild table
+        self.positions_table.setRowCount(0)
+        for token_id, position in self.positions_data.items():
+            if position:
+                self._update_table_row(token_id, position)
+
+        self._save_positions()
+        self._update_buttons()
+        self._log(f"Removed positions: {token_ids}")
+
+    def _close_selected(self):
+        """Close selected positions."""
+        token_ids = self._get_selected_token_ids()
+        if not token_ids:
+            QMessageBox.warning(self, "Error", "Please select positions to close.")
+            return
+
+        # Filter to only active positions
+        active_ids = [
+            tid for tid in token_ids
+            if tid in self.positions_data
+            and self.positions_data[tid]
+            and self.positions_data[tid].get('liquidity', 0) > 0
+        ]
+
+        if not active_ids:
+            QMessageBox.warning(self, "Error", "No active positions selected.")
+            return
+
+        self._close_positions(active_ids)
+
+    def _close_all(self):
+        """Close all loaded positions."""
+        token_ids = [
+            tid for tid, p in self.positions_data.items()
+            if p and p.get('liquidity', 0) > 0
+        ]
+        if not token_ids:
+            QMessageBox.warning(self, "Error", "No active positions to close.")
+            return
+
+        self._close_positions(token_ids)
+
+    def _batch_close_all(self):
+        """Close ALL V4 positions in ONE transaction (gas efficient)."""
+        if not self.provider:
+            QMessageBox.warning(self, "Error", "Provider not connected.")
+            return
+
+        # Get all V4 positions with liquidity
+        v4_positions = [
+            p for p in self.positions_data.values()
+            if p and p.get('protocol', '').startswith('v4') and p.get('liquidity', 0) > 0
+        ]
+
+        if not v4_positions:
+            QMessageBox.warning(self, "Error", "No active V4 positions to close.")
+            return
+
+        # Check for null addresses
+        null_addr = "0x0000000000000000000000000000000000000000"
+        invalid_positions = [
+            p for p in v4_positions
+            if not p.get('token0') or not p.get('token1')
+            or p.get('token0') == null_addr or p.get('token1') == null_addr
+        ]
+
+        if invalid_positions:
+            QMessageBox.warning(
+                self, "Error",
+                f"{len(invalid_positions)} position(s) have missing token addresses.\n"
+                "Please rescan positions to get the token addresses."
+            )
+            return
+
+        # Check auto-sell settings
+        auto_sell = self.auto_sell_cb.isChecked()
+        swap_slippage = self.swap_slippage_spin.value()
+        initial_investment = self.initial_investment_spin.value()
+
+        # Show confirmation
+        token_ids = [p['token_id'] for p in v4_positions]
+        confirm_msg = (
+            f"Close {len(v4_positions)} V4 position(s) in ONE transaction?\n\n"
+            f"Token IDs: {token_ids}\n\n"
+            "This is more gas-efficient than closing one by one.\n\n"
+            "⚠️ If ANY position fails, the entire transaction will revert."
+        )
+
+        if auto_sell:
+            confirm_msg += f"\n\n✅ Auto-sell: Tokens will be sold via DEX (slippage: {swap_slippage}%)"
+
+        reply = QMessageBox.question(
+            self, "Confirm Batch Close",
+            confirm_msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Get private key for auto-sell
+        private_key = None
+        if auto_sell:
+            try:
+                main_window = self.window()
+                if hasattr(main_window, 'create_tab') and hasattr(main_window.create_tab, 'private_key'):
+                    private_key = main_window.create_tab.private_key
+                elif hasattr(self.provider, 'account') and hasattr(self.provider.account, 'key'):
+                    private_key = self.provider.account.key.hex()
+            except:
+                pass
+
+            if not private_key:
+                QMessageBox.warning(
+                    self, "Auto-sell Error",
+                    "Could not get private key for auto-sell.\n"
+                    "Please ensure wallet is connected in Create tab."
+                )
+                return
+
+        # Start batch close worker
+        self.progress_bar.show()
+        self.close_selected_btn.setEnabled(False)
+        self.close_all_btn.setEnabled(False)
+        self.batch_close_btn.setEnabled(False)
+
+        self._log(f"Starting batch close of {len(v4_positions)} V4 positions...")
+
+        self.worker = BatchCloseWorker(
+            self.provider, v4_positions,
+            auto_sell=auto_sell,
+            private_key=private_key,
+            swap_slippage=swap_slippage,
+            initial_investment=initial_investment
+        )
+        self.worker.progress.connect(self._on_progress)
+        self.worker.finished.connect(self._on_batch_close_finished)
+        self.worker.start()
+
+    def _on_batch_close_finished(self, success: bool, message: str, data: dict):
+        """Handle batch close completion."""
+        self.progress_bar.hide()
+        self.close_selected_btn.setEnabled(True)
+        self.close_all_btn.setEnabled(True)
+        self.batch_close_btn.setEnabled(True)
+
+        if success:
+            self._log(f"SUCCESS: {message}")
+            self._log(f"TX Hash: {data.get('tx_hash', 'N/A')}")
+            self._log(f"Gas Used: {data.get('gas_used', 'N/A')}")
+
+            # Build result message
+            result_msg = (
+                f"All positions closed successfully in 1 transaction!\n\n"
+                f"TX: {data.get('tx_hash', 'N/A')}\n"
+                f"Gas Used: {data.get('gas_used', 'N/A')}"
+            )
+
+            # Add auto-sell results if present
+            sell_results = data.get('sell_results')
+            if sell_results:
+                total_usd = sell_results.get('total_usd', 0)
+                swaps = sell_results.get('swaps', [])
+                skipped = sell_results.get('skipped', [])
+                initial = data.get('initial_investment', 0)
+                pnl = data.get('pnl')
+                pnl_percent = data.get('pnl_percent')
+
+                result_msg += f"\n\n{'='*40}\n"
+                result_msg += f"💰 AUTO-SELL RESULTS\n"
+                result_msg += f"{'='*40}\n"
+                result_msg += f"\nTotal received: ${total_usd:.2f}\n"
+
+                # Show PnL if initial investment was provided
+                if initial > 0 and pnl is not None:
+                    pnl_sign = "+" if pnl >= 0 else ""
+                    pnl_emoji = "📈" if pnl >= 0 else "📉"
+                    result_msg += f"\n{pnl_emoji} PnL SUMMARY:\n"
+                    result_msg += f"  Initial investment: ${initial:.2f}\n"
+                    result_msg += f"  Final amount: ${total_usd:.2f}\n"
+                    result_msg += f"  Profit/Loss: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_percent:.1f}%)\n"
+                    self._log(f"PnL: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_percent:.1f}%)")
+
+                if swaps:
+                    result_msg += f"\nSwaps executed: {len(swaps)}\n"
+                    for swap in swaps:
+                        if swap.get('success'):
+                            result_msg += f"  ✅ {swap.get('token', '?')}: ${swap.get('usd', 0):.2f}\n"
+                        else:
+                            result_msg += f"  ❌ {swap.get('token', '?')}: {swap.get('error', 'Failed')}\n"
+
+                if skipped:
+                    result_msg += f"\nSkipped (stablecoins): {len(skipped)}\n"
+
+                self._log(f"Auto-sell total: ${total_usd:.2f}")
+
+            QMessageBox.information(self, "Batch Close Success", result_msg)
+
+            # Reload positions
+            self._refresh_all_positions()
+        else:
+            self._log(f"FAILED: {message}")
+            QMessageBox.critical(self, "Batch Close Failed", f"Failed:\n{message}")
+
+    def _close_positions(self, token_ids: list):
+        """Close specified positions."""
+        if not self.provider:
+            QMessageBox.warning(self, "Error", "Provider not connected.")
+            return
+
+        # Check auto-sell settings
+        auto_sell = self.auto_sell_cb.isChecked()
+        swap_slippage = self.swap_slippage_spin.value()
+
+        # Build confirmation message
+        confirm_msg = (
+            f"Close {len(token_ids)} position(s)?\n\n"
+            f"Token IDs: {token_ids}\n\n"
+            "This will:\n"
+            "1. Remove all liquidity\n"
+            "2. Collect tokens and fees\n"
+            "3. Burn the position NFTs"
+        )
+
+        if auto_sell:
+            confirm_msg += f"\n\n✅ Auto-sell: Tokens will be sold via DEX (slippage: {swap_slippage}%)"
+
+        reply = QMessageBox.question(
+            self, "Confirm Close",
+            confirm_msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Get private key from parent window's create tab
+        private_key = None
+        if auto_sell:
+            try:
+                main_window = self.window()
+                if hasattr(main_window, 'create_tab') and hasattr(main_window.create_tab, 'private_key'):
+                    private_key = main_window.create_tab.private_key
+                elif hasattr(self.provider, 'account') and hasattr(self.provider.account, 'key'):
+                    private_key = self.provider.account.key.hex()
+            except:
+                pass
+
+            if not private_key:
+                QMessageBox.warning(
+                    self, "Auto-sell Error",
+                    "Could not get private key for auto-sell.\n"
+                    "Please ensure wallet is connected in Create tab."
+                )
+                return
+
+        # Get chain ID
+        chain_id = getattr(self.provider, 'chain_id', 56)
+
+        # Start worker
+        self.progress_bar.show()
+        self.close_selected_btn.setEnabled(False)
+        self.close_all_btn.setEnabled(False)
+        self.batch_close_btn.setEnabled(False)
+
+        # Get initial investment for PnL calculation
+        initial_investment = self.initial_investment_spin.value()
+
+        self.worker = ClosePositionsWorker(
+            self.provider, token_ids, self.positions_data,
+            auto_sell=auto_sell,
+            private_key=private_key,
+            swap_slippage=swap_slippage,
+            chain_id=chain_id,
+            initial_investment=initial_investment
+        )
+        self.worker.progress.connect(self._on_progress)
+        self.worker.finished.connect(self._on_close_finished)
+        self.worker.start()
+
+    def _on_progress(self, message: str):
+        """Handle progress updates."""
+        self._log(message)
+
+    def _on_close_finished(self, success: bool, message: str, data: dict):
+        """Handle close completion."""
+        self.progress_bar.hide()
+        self.close_selected_btn.setEnabled(True)
+        self.close_all_btn.setEnabled(True)
+        self.batch_close_btn.setEnabled(True)
+
+        if success:
+            self._log(f"SUCCESS: {message}")
+            self._log(f"TX Hash: {data.get('tx_hash', 'N/A')}")
+            self._log(f"Gas Used: {data.get('gas_used', 'N/A')}")
+
+            # Build result message
+            result_msg = f"Positions closed successfully!\n\nTX: {data.get('tx_hash', 'N/A')}"
+
+            # Add auto-sell results if present
+            sell_results = data.get('sell_results')
+            if sell_results:
+                total_usd = sell_results.get('total_usd', 0)
+                swaps = sell_results.get('swaps', [])
+                skipped = sell_results.get('skipped', [])
+                initial = data.get('initial_investment', 0)
+                pnl = data.get('pnl')
+                pnl_percent = data.get('pnl_percent')
+
+                result_msg += f"\n\n{'='*40}\n"
+                result_msg += f"💰 AUTO-SELL RESULTS\n"
+                result_msg += f"{'='*40}\n"
+                result_msg += f"\nTotal received: ${total_usd:.2f}\n"
+
+                # Show PnL if initial investment was provided
+                if initial > 0 and pnl is not None:
+                    pnl_sign = "+" if pnl >= 0 else ""
+                    pnl_emoji = "📈" if pnl >= 0 else "📉"
+                    result_msg += f"\n{pnl_emoji} PnL SUMMARY:\n"
+                    result_msg += f"  Initial investment: ${initial:.2f}\n"
+                    result_msg += f"  Final amount: ${total_usd:.2f}\n"
+                    result_msg += f"  Profit/Loss: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_percent:.1f}%)\n"
+                    self._log(f"PnL: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_percent:.1f}%)")
+
+                if swaps:
+                    result_msg += f"\nSwaps executed: {len(swaps)}\n"
+                    for swap in swaps:
+                        if swap.get('success'):
+                            result_msg += f"  ✅ {swap.get('token', '?')}: ${swap.get('usd', 0):.2f}\n"
+                        else:
+                            result_msg += f"  ❌ {swap.get('token', '?')}: {swap.get('error', 'Failed')}\n"
+
+                if skipped:
+                    result_msg += f"\nSkipped (stablecoins): {len(skipped)}\n"
+
+                self._log(f"Auto-sell total: ${total_usd:.2f}")
+
+                # Show PnL summary
+                QMessageBox.information(
+                    self, "Close & Sell Complete",
+                    result_msg
+                )
+            else:
+                QMessageBox.information(self, "Success", result_msg)
+
+            # Reload positions
+            self._refresh_all_positions()
+        else:
+            self._log(f"FAILED: {message}")
+            QMessageBox.critical(self, "Error", f"Failed to close positions:\n{message}")
+
+    def _clear_list(self):
+        """Clear the positions list."""
+        reply = QMessageBox.question(
+            self, "Confirm Clear",
+            "Clear all positions from the list?\n\n"
+            "This will NOT close your positions on-chain, just remove them from tracking.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.positions_table.setRowCount(0)
+        self.positions_data = {}
+        self.token_ids_input.clear()
+        self.close_selected_btn.setEnabled(False)
+        self.close_all_btn.setEnabled(False)
+        self.batch_close_btn.setEnabled(False)
+        self._save_positions()
+        self._log("List cleared")

@@ -1,0 +1,12 @@
+{
+  "data": {
+    "version": 1,
+    "user_id": "client@email.com",
+    "issued_at": "2026-02-05T12:21:10.600496",
+    "expires_at": "2026-03-07T12:21:10.600496",
+    "features": [
+      "full"
+    ]
+  },
+  "signature": "KWTtmlYPauk9bQaC+gJc+PTUXB2jwk9eASC9nhhPQKaY0JIwD7pcgMr8OtemYlQMCYgvb9a56w38yx3jrhO0BQ=="
+}

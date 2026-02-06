@@ -1,0 +1,64 @@
+# Environment files (may contain private keys!)
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Test/Debug files
+debug_*.py
+test_*.py
+!tests/test_*.py
+
+# Temporary files
+*.tmp
+*.temp
+
+# License generator and keys (keep private - don't share!)
+license_generator.py
+licensing/license_generator.py
+licensing/.keys/
+licensing/HOWTO.md
+private_key.pem
+*.pem
