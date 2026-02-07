@@ -110,7 +110,8 @@ def calculate_bid_ask_distribution(
     token1_is_stable: bool = True,
     allow_custom_fee: bool = False,
     tick_spacing: int = None,
-    invert_price: bool = True
+    invert_price: bool = True,
+    decimal_tick_offset: int = 0
 ) -> List[BidAskPosition]:
     """
     Расчёт позиций для bid-ask лесенки.
@@ -222,6 +223,13 @@ def calculate_bid_ask_distribution(
     # Определяем направление: от текущей цены (tick_current) к целевой (tick_limit)
     positions_go_down = tick_current > tick_limit  # True = позиции ниже текущего тика
 
+    # Align decimal tick offset to tick_spacing (computed once, used for all positions)
+    # Raw offset may not be a multiple of tick_spacing (e.g. 276324 % 200 = 124)
+    if decimal_tick_offset != 0:
+        aligned_offset = round(decimal_tick_offset / tick_spacing) * tick_spacing
+    else:
+        aligned_offset = 0
+
     for i in range(n_positions):
         # ВСЕ позиции имеют одинаковую ширину = ticks_per_position
         # Порядок: позиция 0 ближе к текущей цене, позиция N-1 дальше
@@ -235,6 +243,7 @@ def calculate_bid_ask_distribution(
             pos_tick_upper = tick_lower_aligned + (i + 1) * ticks_per_position
 
         # Цены для позиции (инвертируем обратно если нужно, для отображения пользователю)
+        # These are HUMAN-READABLE prices (no decimal adjustment)
         pos_price_lower = tick_to_price(pos_tick_lower, invert=invert_price)
         pos_price_upper = tick_to_price(pos_tick_upper, invert=invert_price)
 
@@ -247,23 +256,49 @@ def calculate_bid_ask_distribution(
         percentage = weight / total_weight
         usd_amount = total_usd * percentage
 
-        # Расчёт liquidity
-        liquidity = calculate_liquidity_from_usd(
-            usd_amount=usd_amount,
-            price_lower=pos_price_lower,
-            price_upper=pos_price_upper,
-            current_price=current_price,
-            token0_decimals=token0_decimals,
-            token1_decimals=token1_decimals,
-            token1_is_stable=token1_is_stable
-        )
+        # Apply aligned decimal tick offset for pool-space ticks
+        pool_tick_lower = pos_tick_lower + aligned_offset
+        pool_tick_upper = pos_tick_upper + aligned_offset
+
+        # For liquidity calculation, use pool-space prices when decimal offset is non-zero
+        if decimal_tick_offset != 0:
+            # Pool-space prices for correct liquidity computation
+            pool_price_lower = tick_to_price(pool_tick_lower, invert=invert_price)
+            pool_price_upper = tick_to_price(pool_tick_upper, invert=invert_price)
+            if invert_price:
+                pool_price_lower, pool_price_upper = pool_price_upper, pool_price_lower
+
+            # Current price also needs adjustment for correct position-side detection
+            pool_current_tick = price_to_tick(current_price, invert=invert_price) + aligned_offset
+            pool_current_price = tick_to_price(pool_current_tick, invert=invert_price)
+
+            liquidity = calculate_liquidity_from_usd(
+                usd_amount=usd_amount,
+                price_lower=pool_price_lower,
+                price_upper=pool_price_upper,
+                current_price=pool_current_price,
+                token0_decimals=token0_decimals,
+                token1_decimals=token1_decimals,
+                token1_is_stable=token1_is_stable
+            )
+        else:
+            # No decimal adjustment needed (same decimals, e.g. BNB chain 18/18)
+            liquidity = calculate_liquidity_from_usd(
+                usd_amount=usd_amount,
+                price_lower=pos_price_lower,
+                price_upper=pos_price_upper,
+                current_price=current_price,
+                token0_decimals=token0_decimals,
+                token1_decimals=token1_decimals,
+                token1_is_stable=token1_is_stable
+            )
 
         positions.append(BidAskPosition(
             index=i,
-            tick_lower=pos_tick_lower,
-            tick_upper=pos_tick_upper,
-            price_lower=pos_price_lower,
-            price_upper=pos_price_upper,
+            tick_lower=pool_tick_lower,    # Pool-space ticks (with decimal offset)
+            tick_upper=pool_tick_upper,    # Pool-space ticks (with decimal offset)
+            price_lower=pos_price_lower,  # Human-readable prices for display
+            price_upper=pos_price_upper,  # Human-readable prices for display
             usd_amount=usd_amount,
             percentage=percentage * 100,
             liquidity=liquidity
@@ -285,7 +320,8 @@ def calculate_two_sided_distribution(
     token1_is_stable: bool = True,
     allow_custom_fee: bool = False,
     tick_spacing: int = None,
-    invert_price: bool = True
+    invert_price: bool = True,
+    decimal_tick_offset: int = 0
 ) -> List[BidAskPosition]:
     """
     Расчёт bid-ask лесенки с правильным двусторонним распределением.
@@ -337,7 +373,8 @@ def calculate_two_sided_distribution(
             token1_is_stable=token1_is_stable,
             allow_custom_fee=allow_custom_fee,
             tick_spacing=tick_spacing,
-            invert_price=invert_price
+            invert_price=invert_price,
+            decimal_tick_offset=decimal_tick_offset
         )
 
     # Двусторонний диапазон - разделяем позиции и ликвидность
@@ -377,7 +414,8 @@ def calculate_two_sided_distribution(
             token1_is_stable=token1_is_stable,
             allow_custom_fee=allow_custom_fee,
             tick_spacing=tick_spacing,
-            invert_price=invert_price
+            invert_price=invert_price,
+            decimal_tick_offset=decimal_tick_offset
         )
         all_positions.extend(positions_lower)
 
@@ -398,7 +436,8 @@ def calculate_two_sided_distribution(
             token1_is_stable=token1_is_stable,
             allow_custom_fee=allow_custom_fee,
             tick_spacing=tick_spacing,
-            invert_price=invert_price
+            invert_price=invert_price,
+            decimal_tick_offset=decimal_tick_offset
         )
 
         # Переназначаем индексы для продолжения нумерации
@@ -427,7 +466,8 @@ def calculate_bid_ask_from_percent(
     token1_is_stable: bool = True,
     allow_custom_fee: bool = False,
     tick_spacing: int = None,
-    invert_price: bool = True
+    invert_price: bool = True,
+    decimal_tick_offset: int = 0
 ) -> List[BidAskPosition]:
     """
     Расчёт bid-ask лесенки через проценты от текущей цены.
@@ -472,7 +512,8 @@ def calculate_bid_ask_from_percent(
         token1_is_stable=token1_is_stable,
         allow_custom_fee=allow_custom_fee,
         tick_spacing=tick_spacing,
-        invert_price=invert_price
+        invert_price=invert_price,
+        decimal_tick_offset=decimal_tick_offset
     )
 
 

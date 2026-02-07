@@ -559,16 +559,22 @@ class V4PositionManager:
     def build_close_action(
         self,
         token_id: int,
-        liquidity: int
+        liquidity: int,
+        burn: bool = False
     ) -> List[bytes]:
         """
-        Build DECREASE_LIQUIDITY + BURN_POSITION actions for ONE position.
+        Build DECREASE_LIQUIDITY (+ optional BURN_POSITION) actions for ONE position.
 
         Does NOT include TAKE_PAIR - use for batching multiple closes.
         Add ONE TAKE_PAIR at the end for each unique token pair.
 
+        Args:
+            token_id: Position NFT ID
+            liquidity: Amount of liquidity to remove
+            burn: If True, burn the NFT after removing liquidity (default: False)
+
         Returns:
-            List of raw action bytes [decrease_action, burn_action]
+            List of raw action bytes
         """
         actions = []
 
@@ -580,12 +586,13 @@ class V4PositionManager:
             amount1_min=0
         ))
 
-        # 2. Burn the NFT
-        actions.append(self.encode_burn_position(
-            token_id=token_id,
-            amount0_min=0,
-            amount1_min=0
-        ))
+        # 2. Optionally burn the NFT
+        if burn:
+            actions.append(self.encode_burn_position(
+                token_id=token_id,
+                amount0_min=0,
+                amount1_min=0
+            ))
 
         return actions
 
@@ -595,14 +602,15 @@ class V4PositionManager:
         liquidity: int,
         recipient: str,
         currency0: str,
-        currency1: str
+        currency1: str,
+        burn: bool = False
     ) -> bytes:
         """
         Build payload for closing a SINGLE position.
 
-        Includes: DECREASE_LIQUIDITY + BURN_POSITION + TAKE_PAIR
+        Includes: DECREASE_LIQUIDITY + (optional BURN_POSITION) + TAKE_PAIR
         """
-        actions = self.build_close_action(token_id, liquidity)
+        actions = self.build_close_action(token_id, liquidity, burn=burn)
 
         # Add TAKE_PAIR to receive tokens
         actions.append(self.encode_take_pair(
@@ -614,7 +622,8 @@ class V4PositionManager:
     def build_batch_close_payload(
         self,
         positions: List[dict],
-        recipient: str
+        recipient: str,
+        burn: bool = False
     ) -> bytes:
         """
         Build payload for closing MULTIPLE positions in ONE transaction.
@@ -622,6 +631,7 @@ class V4PositionManager:
         Args:
             positions: List of dicts with {token_id, liquidity, currency0, currency1}
             recipient: Address to receive all tokens
+            burn: If True, burn NFTs after removing liquidity (default: False)
 
         Returns:
             Encoded payload for modifyLiquidities
@@ -633,7 +643,8 @@ class V4PositionManager:
         for pos in positions:
             close_actions = self.build_close_action(
                 token_id=pos['token_id'],
-                liquidity=pos['liquidity']
+                liquidity=pos['liquidity'],
+                burn=burn
             )
             all_actions.extend(close_actions)
 

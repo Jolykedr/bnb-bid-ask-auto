@@ -38,7 +38,7 @@ from .math.liquidity import (
     calculate_amount0_for_liquidity,
     calculate_amount1_for_liquidity
 )
-from .math.ticks import tick_to_price
+from .math.ticks import tick_to_price, price_to_tick, compute_decimal_tick_offset
 from .contracts.v4 import V4PoolManager, V4PositionManager, V4Protocol
 from .contracts.v4.pool_manager import PoolKey
 from .contracts.v4.constants import (
@@ -283,6 +283,15 @@ class V4LiquidityProvider:
         # Convert fee percent to tick spacing
         tick_spacing = config.tick_spacing or suggest_tick_spacing(config.fee_percent)
 
+        # Compute decimal tick offset for mixed-decimal pairs (e.g. USDC 6 dec / token 18 dec)
+        # For same-decimal pairs (e.g. BNB chain 18/18) this returns 0 → no change
+        dec_offset = compute_decimal_tick_offset(
+            token0_address=config.token0,
+            token0_decimals=config.token0_decimals,
+            token1_address=config.token1,
+            token1_decimals=config.token1_decimals,
+        )
+
         positions = calculate_bid_ask_distribution(
             current_price=config.current_price,
             lower_price=config.lower_price,
@@ -295,7 +304,8 @@ class V4LiquidityProvider:
             token1_is_stable=True,
             allow_custom_fee=True,  # V4 supports custom fees
             tick_spacing=tick_spacing,  # Pass actual tick_spacing for proper alignment
-            invert_price=config.invert_price  # Invert price for TOKEN/USD → pool price conversion
+            invert_price=config.invert_price,  # Invert price for TOKEN/USD → pool price conversion
+            decimal_tick_offset=dec_offset
         )
 
         return positions
@@ -1374,21 +1384,30 @@ class V4LiquidityProvider:
         logger.info(f"Pool's current tick: {pool_current_tick}")
 
         # Calculate expected current tick from user's ACTUAL input price
-        from .math.ticks import price_to_tick, tick_to_price
 
         # Use actual_current_price if provided, otherwise fall back to current_price
         # (current_price in config is actually the upper bound of the range!)
         user_price = config.actual_current_price if config.actual_current_price else config.current_price
         logger.info(f"User's actual input price: {user_price}")
 
+        # Compute decimal tick offset (same as in preview_ladder)
+        dec_offset = compute_decimal_tick_offset(
+            token0_address=config.token0,
+            token0_decimals=config.token0_decimals,
+            token1_address=config.token1,
+            token1_decimals=config.token1_decimals,
+        )
+        if dec_offset != 0:
+            logger.info(f"Decimal tick offset: {dec_offset} (token0_dec={config.token0_decimals}, token1_dec={config.token1_decimals})")
+
         # User's price is TOKEN/USD, need to invert for pool price (USD/TOKEN or TOKEN/USD depending on order)
         # If invert_price=True (default), user enters TOKEN price in USD
         if config.invert_price:
-            expected_current_tick = price_to_tick(user_price, invert=True)
+            expected_current_tick = price_to_tick(user_price, invert=True) + dec_offset
         else:
-            expected_current_tick = price_to_tick(user_price, invert=False)
+            expected_current_tick = price_to_tick(user_price, invert=False) + dec_offset
 
-        logger.info(f"Expected tick from user's price: {expected_current_tick}")
+        logger.info(f"Expected tick from user's price: {expected_current_tick} (includes dec_offset={dec_offset})")
 
         # Calculate pool's price from tick for comparison
         pool_price_from_tick = tick_to_price(pool_current_tick, invert=config.invert_price)
@@ -1719,7 +1738,8 @@ class V4LiquidityProvider:
         currency0: str = None,
         currency1: str = None,
         recipient: str = None,
-        timeout: int = 300
+        timeout: int = 300,
+        burn: bool = False
     ) -> Tuple[str, bool, Optional[int]]:
         """
         Close multiple V4 positions.
@@ -1733,6 +1753,7 @@ class V4LiquidityProvider:
             currency1: Token1 address (higher address) - REQUIRED
             recipient: Recipient of tokens (default: account)
             timeout: Transaction timeout
+            burn: If True, burn NFTs after removing liquidity (default: False)
 
         Returns:
             (tx_hash, success, gas_used)
@@ -1769,7 +1790,8 @@ class V4LiquidityProvider:
                         liquidity=position.liquidity,
                         recipient=recipient,
                         currency0=addr0,
-                        currency1=addr1
+                        currency1=addr1,
+                        burn=burn
                     )
                     payloads.append(payload)
                 else:

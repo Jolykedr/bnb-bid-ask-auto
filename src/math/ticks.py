@@ -219,6 +219,57 @@ def get_tick_spacing(fee: int, allow_custom: bool = False) -> int:
     return max(1, tick_spacing)  # Minimum spacing is 1
 
 
+def compute_decimal_tick_offset(
+    token0_address: str,
+    token0_decimals: int,
+    token1_address: str,
+    token1_decimals: int,
+) -> int:
+    """
+    Compute tick offset to account for different token decimals.
+
+    Uses token addresses to determine pool ordering (lower address = currency0).
+    This is the same logic as PoolKey.from_tokens() and cannot be wrong.
+
+    Args:
+        token0_address: Address of first token (any order)
+        token0_decimals: Decimals of first token
+        token1_address: Address of second token (any order)
+        token1_decimals: Decimals of second token
+
+    Returns:
+        Tick offset to add to human-price-derived ticks.
+        Returns 0 when both tokens have the same decimals.
+
+    Example:
+        # USDC (6 dec, 0x8335...) / volatile (18 dec, 0x9f86...) on BASE
+        offset = compute_decimal_tick_offset(
+            "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", 6,   # USDC
+            "0x9f86dB9fc6f7c9408e8Fda3Ff8ce4e78ac7a6b07", 18,  # volatile
+        )
+        # offset ≈ 276324 (= 12 * log(10)/log(1.0001))
+    """
+    if token0_decimals == token1_decimals:
+        return 0
+
+    # Determine pool ordering by address (same as PoolKey.from_tokens)
+    addr0 = int(token0_address.lower().replace("0x", ""), 16)
+    addr1 = int(token1_address.lower().replace("0x", ""), 16)
+
+    if addr0 < addr1:
+        pool_c0_dec = token0_decimals
+        pool_c1_dec = token1_decimals
+    else:
+        pool_c0_dec = token1_decimals
+        pool_c1_dec = token0_decimals
+
+    dec_diff = pool_c1_dec - pool_c0_dec
+
+    # tick_offset = dec_diff * log(10) / log(1.0001)
+    offset = int(round(dec_diff * math.log(10) / math.log(1.0001)))
+    return offset
+
+
 def get_price_range_for_tick_range(tick_lower: int, tick_upper: int) -> tuple[float, float]:
     """
     Получение диапазона цен для диапазона тиков.

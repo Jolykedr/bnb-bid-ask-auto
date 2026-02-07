@@ -34,7 +34,7 @@ from .math.distribution import (
     DistributionType,
     print_distribution
 )
-from .math.ticks import get_tick_spacing
+from .math.ticks import get_tick_spacing, compute_decimal_tick_offset
 from .contracts.position_manager import UniswapV3PositionManager, MintParams
 from .contracts.pool_factory import PoolFactory
 from .contracts.abis import ERC20_ABI
@@ -250,9 +250,17 @@ class LiquidityProvider:
         stablecoin_is_token1_in_pool = t1_addr > t0_addr
         invert_price = not stablecoin_is_token1_in_pool
 
+        # Compute decimal tick offset for mixed-decimal pairs (e.g. USDC 6 / token 18 on BASE)
+        dec_offset = compute_decimal_tick_offset(
+            token0_address=config.token0,
+            token0_decimals=config.token0_decimals,
+            token1_address=config.token1,
+            token1_decimals=config.token1_decimals,
+        )
+
         logger.info(f"Token order: config.token0={t0_addr[:10]}..., config.token1={t1_addr[:10]}...")
         logger.info(f"Stablecoin is token1 in pool: {stablecoin_is_token1_in_pool}")
-        logger.info(f"invert_price: {invert_price}")
+        logger.info(f"invert_price: {invert_price}, decimal_tick_offset: {dec_offset}")
 
         positions = calculate_bid_ask_distribution(
             current_price=config.current_price,
@@ -264,7 +272,8 @@ class LiquidityProvider:
             token0_decimals=config.token0_decimals,
             token1_decimals=config.token1_decimals,
             token1_is_stable=True,
-            invert_price=invert_price
+            invert_price=invert_price,
+            decimal_tick_offset=dec_offset
         )
 
         return positions
@@ -382,17 +391,40 @@ class LiquidityProvider:
             return False, "Account not configured"
 
         # Для bid-ask стратегии ниже текущей цены нужен стейблкоин
-        # Используем ОРИГИНАЛЬНЫЙ config.token1 (который пользователь указал как стейблкоин),
-        # а не отсортированный по адресу
-        total_amount1 = int(config.total_usd * (10 ** config.token1_decimals))
+        # Определяем стейблкоин динамически по адресу (не полагаемся на порядок token0/token1)
+        STABLECOINS = {
+            # BNB Chain
+            "0x55d398326f99059ff775485246999027b3197955": 18,  # USDT (BSC)
+            "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": 18,  # USDC (BSC)
+            "0xe9e7cea3dedca5984780bafc599bd69add087d56": 18,  # BUSD (BSC)
+            # Base
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": 6,   # USDC (Base)
+            "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca": 6,   # USDbC (Base)
+            # Ethereum
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": 6,   # USDC (ETH)
+            "0xdac17f958d2ee523a2206206994597c13d831ec7": 6,   # USDT (ETH)
+        }
 
-        # Проверяем оригинальный token1 (стейблкоин), не отсортированный
-        stablecoin_address = config.token1
-        is_sufficient, balance = self.check_balance(stablecoin_address, total_amount1)
+        t0_lower = config.token0.lower()
+        t1_lower = config.token1.lower()
+
+        if t0_lower in STABLECOINS:
+            stablecoin_address = config.token0
+            stablecoin_decimals = STABLECOINS[t0_lower]
+        elif t1_lower in STABLECOINS:
+            stablecoin_address = config.token1
+            stablecoin_decimals = STABLECOINS[t1_lower]
+        else:
+            # Fallback: assume token1 is stablecoin (legacy behavior)
+            stablecoin_address = config.token1
+            stablecoin_decimals = config.token1_decimals
+
+        total_amount = int(config.total_usd * (10 ** stablecoin_decimals))
+        is_sufficient, balance = self.check_balance(stablecoin_address, total_amount)
 
         if not is_sufficient:
-            formatted_required = self.format_amount(total_amount1, config.token1_decimals)
-            formatted_balance = self.format_amount(balance, config.token1_decimals)
+            formatted_required = self.format_amount(total_amount, stablecoin_decimals)
+            formatted_balance = self.format_amount(balance, stablecoin_decimals)
             return False, f"Insufficient stablecoin balance: required {formatted_required}, available {formatted_balance}"
 
         return True, None
@@ -521,9 +553,29 @@ class LiquidityProvider:
         logger.debug(f"Sorted token1: {token1[:10]}...")
         logger.debug(f"Swapped: {swapped}")
 
-        # Стейблкоин - это config.token1 (который пользователь указал)
-        stablecoin = config.token1
-        total_stablecoin_amount = int(config.total_usd * (10 ** config.token1_decimals))
+        # Detect stablecoin dynamically (same as validate_balances_for_ladder)
+        STABLECOINS_CL = {
+            "0x55d398326f99059ff775485246999027b3197955": 18,  # USDT (BSC)
+            "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": 18,  # USDC (BSC)
+            "0xe9e7cea3dedca5984780bafc599bd69add087d56": 18,  # BUSD (BSC)
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": 6,   # USDC (Base)
+            "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca": 6,   # USDbC (Base)
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": 6,   # USDC (ETH)
+            "0xdac17f958d2ee523a2206206994597c13d831ec7": 6,   # USDT (ETH)
+        }
+        t0_low = config.token0.lower()
+        t1_low = config.token1.lower()
+        if t0_low in STABLECOINS_CL:
+            stablecoin = config.token0
+            stablecoin_decimals = STABLECOINS_CL[t0_low]
+        elif t1_low in STABLECOINS_CL:
+            stablecoin = config.token1
+            stablecoin_decimals = STABLECOINS_CL[t1_low]
+        else:
+            stablecoin = config.token1
+            stablecoin_decimals = config.token1_decimals
+
+        total_stablecoin_amount = int(config.total_usd * (10 ** stablecoin_decimals))
 
         # Проверка баланса перед созданием
         if check_balance:
@@ -599,7 +651,7 @@ class LiquidityProvider:
         # Добавляем mint вызовы
         for pos in positions:
             # Сумма стейблкоина для этой позиции
-            stablecoin_amount = int(pos.usd_amount * (10 ** config.token1_decimals))
+            stablecoin_amount = int(pos.usd_amount * (10 ** stablecoin_decimals))
 
             # Slippage protection
             stablecoin_amount_min = int(stablecoin_amount * (1 - config.slippage_percent / 100))
@@ -618,17 +670,17 @@ class LiquidityProvider:
             tick_lower = pos.tick_lower
             tick_upper = pos.tick_upper
 
-            if swapped:
-                # Стейблкоин (config.token1) стал token0, volatile (config.token0) стал token1
-                # Для bid позиций ниже текущей цены: предоставляем stablecoin (теперь token0)
+            # Determine if stablecoin is sorted token0 or token1
+            stablecoin_is_sorted_token0 = stablecoin.lower() == token0.lower()
+
+            if stablecoin_is_sorted_token0:
+                # Stablecoin is pool's token0 → provide as amount0
                 amount0_desired = stablecoin_amount
                 amount1_desired = 0
                 amount0_min = stablecoin_amount_min
                 amount1_min = 0
             else:
-                # Порядок не изменился
-                # Стейблкоин остался token1, volatile остался token0
-                # Для позиций ниже цены: предоставляем token1 (стейблкоин)
+                # Stablecoin is pool's token1 → provide as amount1
                 amount0_desired = 0
                 amount1_desired = stablecoin_amount
                 amount0_min = 0
@@ -671,8 +723,9 @@ class LiquidityProvider:
             logger.info(f"Token order swapped: {swapped}")
 
             # Log first position amounts
-            first_stablecoin_amount = int(positions[0].usd_amount * (10 ** config.token1_decimals))
-            if swapped:
+            first_stablecoin_amount = int(positions[0].usd_amount * (10 ** stablecoin_decimals))
+            stable_is_t0 = stablecoin.lower() == token0.lower()
+            if stable_is_t0:
                 logger.info(f"First position amounts: amount0={first_stablecoin_amount} (stablecoin), amount1=0")
             else:
                 logger.info(f"First position amounts: amount0=0, amount1={first_stablecoin_amount} (stablecoin)")

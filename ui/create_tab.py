@@ -30,6 +30,19 @@ from src.contracts.v4.subgraph import try_all_sources_with_web3 as query_v4_subg
 from config import BNB_CHAIN, BNB_TESTNET, ETHEREUM, BASE, TOKENS_BNB, TOKENS_BASE
 
 
+def _format_price(price: float) -> str:
+    """Format price without scientific notation."""
+    if price == 0:
+        return "0"
+    abs_price = abs(price)
+    if abs_price >= 1:
+        return f"{price:.6f}".rstrip('0').rstrip('.')
+    elif abs_price >= 0.0001:
+        return f"{price:.8f}".rstrip('0').rstrip('.')
+    else:
+        return f"{price:.12f}".rstrip('0').rstrip('.')
+
+
 class CreateLadderWorkerV4(QThread):
     """Worker thread for V4 blockchain operations."""
 
@@ -339,11 +352,11 @@ class CreateLadderWorker(QThread):
 
             self.progress.emit("Creating ladder positions...")
             self.progress.emit(f"Config: token0={self.config.token0[:15]}... token1={self.config.token1[:15]}...")
-            self.progress.emit(f"Config: fee={self.config.fee_tier}, price={self.config.current_price:.6g}")
-            self.progress.emit(f"Config: lower_price={self.config.lower_price:.6g}, n_pos={self.config.n_positions}")
+            self.progress.emit(f"Config: fee={self.config.fee_tier}, price={_format_price(self.config.current_price)}")
+            self.progress.emit(f"Config: lower_price={_format_price(self.config.lower_price)}, n_pos={self.config.n_positions}")
 
             # Pre-validate: calculate positions and check tick alignment
-            from src.math.ticks import get_tick_spacing
+            from src.math.ticks import get_tick_spacing, compute_decimal_tick_offset
             from src.math.distribution import calculate_bid_ask_distribution
             from web3 import Web3
 
@@ -357,6 +370,15 @@ class CreateLadderWorker(QThread):
             invert_price = not stablecoin_is_token1_in_pool
             self.progress.emit(f"Stablecoin is pool's token1: {stablecoin_is_token1_in_pool}, invert_price: {invert_price}")
 
+            # Compute decimal tick offset for mixed-decimal pairs
+            dec_offset = compute_decimal_tick_offset(
+                token0_address=self.config.token0,
+                token0_decimals=self.config.token0_decimals,
+                token1_address=self.config.token1,
+                token1_decimals=self.config.token1_decimals,
+            )
+            self.progress.emit(f"Decimal tick offset: {dec_offset}")
+
             # Calculate positions to check ticks
             test_positions = calculate_bid_ask_distribution(
                 current_price=self.config.current_price,
@@ -368,13 +390,14 @@ class CreateLadderWorker(QThread):
                 token0_decimals=self.config.token0_decimals,
                 token1_decimals=self.config.token1_decimals,
                 token1_is_stable=True,
-                invert_price=invert_price
+                invert_price=invert_price,
+                decimal_tick_offset=dec_offset
             )
 
             if test_positions:
                 pos = test_positions[0]
                 self.progress.emit(f"First position: tick_lower={pos.tick_lower}, tick_upper={pos.tick_upper}")
-                self.progress.emit(f"Price range: ${pos.price_lower:.6g} - ${pos.price_upper:.6g}")
+                self.progress.emit(f"Price range: ${_format_price(pos.price_lower)} - ${_format_price(pos.price_upper)}")
 
                 # Check token order
                 # NOTE: ticks from preview_ladder are already calculated with correct invert_price
@@ -411,8 +434,25 @@ class CreateLadderWorker(QThread):
                 self.progress.emit(f"✓ Position Manager verified ({len(pm_code)} bytes)")
 
                 # Calculate stablecoin amount for first position
+                # Detect stablecoin decimals (may differ from token1 if stablecoin is token0)
+                _stables = {
+                    "0x55d398326f99059ff775485246999027b3197955": 18,
+                    "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": 18,
+                    "0xe9e7cea3dedca5984780bafc599bd69add087d56": 18,
+                    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": 6,
+                    "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca": 6,
+                }
+                _t0l = self.config.token0.lower()
+                _t1l = self.config.token1.lower()
+                if _t0l in _stables:
+                    _stable_dec = _stables[_t0l]
+                elif _t1l in _stables:
+                    _stable_dec = _stables[_t1l]
+                else:
+                    _stable_dec = self.config.token1_decimals
+
                 first_usd = pos.usd_amount
-                stablecoin_amount = int(first_usd * (10 ** self.config.token1_decimals))
+                stablecoin_amount = int(first_usd * (10 ** _stable_dec))
                 self.progress.emit(f"First pos USD: ${first_usd:.4f}, stablecoin wei: {stablecoin_amount}")
 
                 if stablecoin_amount == 0:
@@ -897,8 +937,62 @@ class CreateTab(QWidget):
             self.key_input.setEchoMode(QLineEdit.EchoMode.Password)
             self.show_key_btn.setText("Show")
 
+    def _get_current_tokens(self) -> dict:
+        """Get token dict for the currently selected network."""
+        index = self.network_combo.currentIndex()
+        if index == 3:  # Base Mainnet
+            return TOKENS_BASE
+        # BNB Mainnet, BNB Testnet, Ethereum — all use BNB tokens for now
+        return TOKENS_BNB
+
+    def _rebuild_token_combos(self):
+        """Rebuild token combo boxes for the current network."""
+        tokens = self._get_current_tokens()
+        symbols = list(tokens.keys())
+
+        # Determine default selections and token1 list per network
+        index = self.network_combo.currentIndex()
+        if index == 3:  # Base
+            default_token0 = "WETH"
+            default_token1 = "USDC"
+            token1_symbols = [s for s in symbols if s in ("USDC", "USDbC", "DAI", "WETH")]
+        else:  # BNB / ETH
+            default_token0 = "WBNB"
+            default_token1 = "USDT"
+            token1_symbols = [s for s in symbols if s in ("USDT", "USDC", "BUSD", "WBNB")]
+
+        self.token0_combo.blockSignals(True)
+        self.token1_combo.blockSignals(True)
+
+        self.token0_combo.clear()
+        self.token0_combo.addItems(symbols)
+
+        self.token1_combo.clear()
+        self.token1_combo.addItems(token1_symbols)
+
+        # Add custom tokens
+        for symbol in self.custom_tokens:
+            custom_label = f"[Custom] {symbol}"
+            self.token0_combo.addItem(custom_label)
+            self.token1_combo.addItem(custom_label)
+
+        # Set defaults
+        idx0 = self.token0_combo.findText(default_token0)
+        if idx0 >= 0:
+            self.token0_combo.setCurrentIndex(idx0)
+        idx1 = self.token1_combo.findText(default_token1)
+        if idx1 >= 0:
+            self.token1_combo.setCurrentIndex(idx1)
+
+        self.token0_combo.blockSignals(False)
+        self.token1_combo.blockSignals(False)
+
+        # Update address inputs
+        self._on_token0_combo_changed(self.token0_combo.currentIndex())
+        self._on_token1_combo_changed(self.token1_combo.currentIndex())
+
     def _on_network_changed(self, index):
-        """Update RPC URL when network changes."""
+        """Update RPC URL and token combos when network changes."""
         if index == 0:
             self.rpc_input.setText(BNB_CHAIN.rpc_url)
         elif index == 1:
@@ -907,6 +1001,9 @@ class CreateTab(QWidget):
             self.rpc_input.setText(ETHEREUM.rpc_url)
         elif index == 3:
             self.rpc_input.setText(BASE.rpc_url)
+
+        # Rebuild token combos for the new network
+        self._rebuild_token_combos()
 
     def _get_current_network(self):
         """Get current network config based on dropdown selection."""
@@ -960,24 +1057,28 @@ class CreateTab(QWidget):
     def _on_token0_combo_changed(self, index):
         """Update token0 input when combo changes."""
         symbol = self.token0_combo.currentText()
+        tokens = self._get_current_tokens()
         if symbol.startswith("[Custom] "):
             actual_symbol = symbol.replace("[Custom] ", "")
             if actual_symbol in self.custom_tokens:
                 self.token0_input.setText(self.custom_tokens[actual_symbol])
-        elif symbol in TOKENS_BNB:
-            self.token0_input.setText(TOKENS_BNB[symbol].address)
+        elif symbol in tokens:
+            self.token0_input.setText(tokens[symbol].address)
+            self._token0_decimals = tokens[symbol].decimals
         else:
             self.token0_input.clear()
 
     def _on_token1_combo_changed(self, index):
         """Update token1 input when combo changes."""
         symbol = self.token1_combo.currentText()
+        tokens = self._get_current_tokens()
         if symbol.startswith("[Custom] "):
             actual_symbol = symbol.replace("[Custom] ", "")
             if actual_symbol in self.custom_tokens:
                 self.token1_input.setText(self.custom_tokens[actual_symbol])
-        elif symbol in TOKENS_BNB:
-            self.token1_input.setText(TOKENS_BNB[symbol].address)
+        elif symbol in tokens:
+            self.token1_input.setText(tokens[symbol].address)
+            self._token1_decimals = tokens[symbol].decimals
         else:
             self.token1_input.clear()
 
@@ -1080,18 +1181,27 @@ class CreateTab(QWidget):
         tick_spacing = round(fee_percent * 200)
         return max(1, tick_spacing)
 
+    @staticmethod
+    def _format_price(price: float) -> str:
+        """Format price without scientific notation."""
+        return _format_price(price)
+
     def _should_invert_price(self, token0: str, token1: str) -> bool:
         """
-        Determine if price inversion is needed based on stablecoin position.
+        Determine if price inversion is needed based on stablecoin position IN THE POOL.
 
-        In Uniswap, pool price = token1/token0.
+        IMPORTANT: In Uniswap V3/V4, pool tokens are sorted by address (lower = currency0).
+        The config's token0/token1 order may NOT match the pool's currency0/currency1 order.
+        We must check the stablecoin's position AFTER address sorting.
 
-        If stablecoin (USDT/USDC/etc) is token1:
+        Pool price = currency1/currency0 (sorted by address, NOT by config order).
+
+        If stablecoin is pool's currency1 (higher address):
             - Pool price = stablecoin/token = "price of token in USD"
             - User enters price in USD → matches pool format
             - invert_price = False
 
-        If stablecoin is token0:
+        If stablecoin is pool's currency0 (lower address):
             - Pool price = token/stablecoin = "how many tokens per USD"
             - User enters price in USD → inverse of pool format
             - invert_price = True
@@ -1119,18 +1229,37 @@ class CreateTab(QWidget):
         token0_lower = token0.lower()
         token1_lower = token1.lower()
 
+        # Find which token is the stablecoin
         token0_is_stable = token0_lower in STABLECOINS
         token1_is_stable = token1_lower in STABLECOINS
 
-        if token1_is_stable and not token0_is_stable:
-            # Stablecoin is token1 → pool price is in USD → NO inversion
-            return False
-        elif token0_is_stable and not token1_is_stable:
-            # Stablecoin is token0 → pool price is inverse → NEED inversion
+        if not token0_is_stable and not token1_is_stable:
+            # Neither is a known stablecoin - default to True (old behavior)
             return True
+
+        # Determine which token is the stablecoin
+        if token0_is_stable and not token1_is_stable:
+            stablecoin_addr = token0_lower
+        elif token1_is_stable and not token0_is_stable:
+            stablecoin_addr = token1_lower
         else:
-            # Both or neither are stablecoins - default to True (old behavior)
+            # Both are stablecoins - default to True
             return True
+
+        # Sort by address to find pool ordering (like PoolKey.from_tokens does)
+        # Lower address = pool's currency0, higher address = pool's currency1
+        addr0_int = int(token0_lower, 16)
+        addr1_int = int(token1_lower, 16)
+
+        if addr0_int < addr1_int:
+            pool_currency0 = token0_lower
+        else:
+            pool_currency0 = token1_lower
+
+        # If stablecoin is pool's currency0 (lower address) → need inversion
+        # If stablecoin is pool's currency1 (higher address) → no inversion
+        stablecoin_is_pool_currency0 = (stablecoin_addr == pool_currency0)
+        return stablecoin_is_pool_currency0
 
     def _is_v4_mode(self) -> bool:
         """Check if V4 protocol is selected."""
@@ -1202,8 +1331,8 @@ class CreateTab(QWidget):
 
         try:
             balances = []
-            for symbol, token in TOKENS_BNB.items():
-                if symbol in ["USDT", "USDC", "BUSD", "WBNB"]:
+            tokens = self._get_current_tokens()
+            for symbol, token in tokens.items():
                     balance = self.provider.get_token_balance(token.address)
                     formatted = self.provider.format_amount(balance, token.decimals)
                     balances.append(f"{symbol}: {formatted}")
@@ -1242,6 +1371,27 @@ class CreateTab(QWidget):
                 fee_tier = self._get_fee_tier()
                 tick_spacing = None  # V3 uses standard spacing
 
+            # Compute additional parameters for accurate preview
+            extra_kwargs = {}
+            token0 = self.token0_input.text().strip()
+            token1 = self.token1_input.text().strip()
+            if token0 and token1:
+                invert = self._should_invert_price(token0, token1)
+                extra_kwargs['invert_price'] = invert
+                extra_kwargs['token0_decimals'] = self._token0_decimals
+                extra_kwargs['token1_decimals'] = self._token1_decimals
+                # Compute decimal tick offset for mixed-decimal pairs (e.g. USDC 6 / token 18)
+                from src.math.ticks import compute_decimal_tick_offset
+                dec_offset = compute_decimal_tick_offset(
+                    token0_address=token0,
+                    token0_decimals=self._token0_decimals,
+                    token1_address=token1,
+                    token1_decimals=self._token1_decimals,
+                )
+                if dec_offset != 0:
+                    extra_kwargs['decimal_tick_offset'] = dec_offset
+                    self._log(f"Decimal tick offset: {dec_offset}")
+
             self.positions = calculate_bid_ask_from_percent(
                 current_price=current_price,
                 percent_from=percent_from,
@@ -1251,7 +1401,8 @@ class CreateTab(QWidget):
                 fee_tier=fee_tier,
                 distribution_type=self.dist_combo.currentText(),
                 allow_custom_fee=self._is_v4_mode(),  # V4 supports custom fees
-                tick_spacing=tick_spacing  # Use custom tick spacing for V4
+                tick_spacing=tick_spacing,  # Use custom tick spacing for V4
+                **extra_kwargs
             )
 
             self.position_table.set_positions(self.positions, current_price)
@@ -1521,6 +1672,36 @@ class CreateTab(QWidget):
                     QMessageBox.critical(self, "Error", f"Failed to create V3 provider: {e}")
                     return
 
+            # Auto-detect decimals for V3 if still default (important for Base USDC 6 dec)
+            if self._token0_decimals == 18 or self._token1_decimals == 18:
+                try:
+                    from web3 import Web3 as Web3Check
+                    rpc_url = self.rpc_input.text().strip()
+                    proxy = self._get_proxy_config()
+                    if proxy:
+                        w3_check = Web3Check(Web3Check.HTTPProvider(endpoint_uri=rpc_url, request_kwargs={"proxies": proxy}))
+                    else:
+                        w3_check = Web3Check(Web3Check.HTTPProvider(rpc_url))
+                    erc20_dec_abi = [{"inputs": [], "name": "decimals", "outputs": [{"type": "uint8"}], "stateMutability": "view", "type": "function"}]
+
+                    if self._token0_decimals == 18:
+                        try:
+                            t0c = w3_check.eth.contract(address=Web3Check.to_checksum_address(token0), abi=erc20_dec_abi)
+                            self._token0_decimals = t0c.functions.decimals().call()
+                            self._log(f"V3 auto-detected token0 decimals: {self._token0_decimals}")
+                        except Exception as e:
+                            self._log(f"Could not detect V3 token0 decimals: {e}")
+
+                    if self._token1_decimals == 18:
+                        try:
+                            t1c = w3_check.eth.contract(address=Web3Check.to_checksum_address(token1), abi=erc20_dec_abi)
+                            self._token1_decimals = t1c.functions.decimals().call()
+                            self._log(f"V3 auto-detected token1 decimals: {self._token1_decimals}")
+                        except Exception as e:
+                            self._log(f"Could not detect V3 token1 decimals: {e}")
+                except Exception as e:
+                    self._log(f"V3 decimals auto-detection failed: {e}")
+
             config = LiquidityLadderConfig(
                 current_price=upper_price,
                 lower_price=lower_price,
@@ -1530,7 +1711,9 @@ class CreateTab(QWidget):
                 token1=token1,
                 fee_tier=self._get_fee_tier(),
                 distribution_type=self.dist_combo.currentText(),
-                slippage_percent=self.slippage_spin.value()
+                slippage_percent=self.slippage_spin.value(),
+                token0_decimals=self._token0_decimals,
+                token1_decimals=self._token1_decimals
             )
 
             # Get factory address from detected DEX
@@ -1745,35 +1928,21 @@ class CreateTab(QWidget):
         current_token0 = self.token0_combo.currentText()
         current_token1 = self.token1_combo.currentText()
 
-        # Clear custom tokens
+        # Clear custom tokens and add new ones
         self.custom_tokens.clear()
-
-        # Rebuild token0 combo
-        self.token0_combo.clear()
-        self.token0_combo.addItems(["WBNB", "USDT", "USDC", "CAKE", "ETH", "BTCB"])
-
-        # Rebuild token1 combo
-        self.token1_combo.clear()
-        self.token1_combo.addItems(["USDT", "USDC", "BUSD", "WBNB"])
-
-        # Add custom tokens to both combos
         for token in tokens:
             symbol = token.get('symbol', '')
             address = token.get('address', '')
-
             if symbol and address:
                 self.custom_tokens[symbol] = address
 
-                # Add to both combos with [Custom] prefix
-                custom_label = f"[Custom] {symbol}"
-                self.token0_combo.addItem(custom_label)
-                self.token1_combo.addItem(custom_label)
+        # Rebuild combos using current network's tokens + custom tokens
+        self._rebuild_token_combos()
 
-        # Restore selections if possible
+        # Try to restore previous selections
         idx0 = self.token0_combo.findText(current_token0)
         if idx0 >= 0:
             self.token0_combo.setCurrentIndex(idx0)
-
         idx1 = self.token1_combo.findText(current_token1)
         if idx1 >= 0:
             self.token1_combo.setCurrentIndex(idx1)
@@ -1788,9 +1957,10 @@ class CreateTab(QWidget):
             if actual_symbol in self.custom_tokens:
                 return self.custom_tokens[actual_symbol]
 
-        # Check standard tokens
-        if symbol in TOKENS_BNB:
-            return TOKENS_BNB[symbol].address
+        # Check tokens for current network
+        tokens = self._get_current_tokens()
+        if symbol in tokens:
+            return tokens[symbol].address
 
         raise ValueError(f"Unknown token: {symbol}")
 
@@ -2055,7 +2225,7 @@ class CreateTab(QWidget):
                                 price_adjusted = price_from_tick * (10 ** (dec0 - dec1))
 
                                 self._log(f"Price calc: tick={state.tick}, raw={price_from_tick:.6f}, dec0={dec0}, dec1={dec1}")
-                                self._log(f"Price adjusted: {price_adjusted:.10g}")
+                                self._log(f"Price adjusted: {self._format_price(price_adjusted)}")
 
                                 # Check if token0 is stablecoin (need to invert)
                                 stablecoins = ["USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "FRAX", "FDUSD", "PYUSD", "LUSD", "GUSD", "SUSD", "USDD", "CUSD", "USDJ", "UST", "USDN", "MUSD", "HUSD", "USDX", "USD+", "USDCE", "USDC.E", "USDT.E", "BRIDGED"]
@@ -2074,19 +2244,19 @@ class CreateTab(QWidget):
                                         display_price = 1 / price_adjusted
                                     else:
                                         display_price = price_adjusted
-                                    self._log(f"Inverted (token0 is stable): 1/{price_adjusted:.6f} = {display_price:.10g}")
+                                    self._log(f"Inverted (token0 is stable): 1/{price_adjusted:.6f} = {self._format_price(display_price)}")
                                 elif t1_is_stable and not t0_is_stable:
                                     # Pool is VOLATILE/STABLE (e.g. BULLA/USDT)
                                     # price_adjusted = USDT per 1 BULLA = USD price directly
                                     display_price = price_adjusted
-                                    self._log(f"Direct (token1 is stable): {display_price:.10g}")
+                                    self._log(f"Direct (token1 is stable): {self._format_price(display_price)}")
                                 else:
                                     # Neither or both are stablecoins - just show raw
                                     display_price = price_adjusted
-                                    self._log(f"Raw price (no stable): {display_price:.10g}")
+                                    self._log(f"Raw price (no stable): {self._format_price(display_price)}")
 
-                                self.price_input.setText(f"{display_price:.10g}")
-                                self._log(f"Final price: {display_price:.10g} USD per {t1_sym if t0_is_stable else t0_sym}")
+                                self.price_input.setText(self._format_price(display_price))
+                                self._log(f"Final price: {self._format_price(display_price)} USD per {t1_sym if t0_is_stable else t0_sym}")
 
                             # Build info message
                             if tokens_found:
@@ -2154,25 +2324,25 @@ class CreateTab(QWidget):
                                         display_price = 1 / price_adjusted
                                     else:
                                         display_price = price_adjusted
-                                    price_note = f"(1 {token1_sym} = ${display_price:.10g})"
+                                    price_note = f"(1 {token1_sym} = ${self._format_price(display_price)})"
                                 elif token1_is_stable and not token0_is_stable:
                                     # Pool is VOLATILE/STABLE - price already in correct form
                                     display_price = price_adjusted
-                                    price_note = f"(1 {token0_sym} = ${display_price:.10g})"
+                                    price_note = f"(1 {token0_sym} = ${self._format_price(display_price)})"
                                 else:
                                     # Neither or both are stablecoins - just show raw
                                     display_price = price_adjusted
                                     price_note = f"({token0_sym}/{token1_sym})"
 
-                                self.price_input.setText(f"{display_price:.10g}")
-                                self._log(f"Auto-filled price: {display_price:.10g} {price_note}")
+                                self.price_input.setText(self._format_price(display_price))
+                                self._log(f"Auto-filled price: {self._format_price(display_price)} {price_note}")
 
                                 # Build info message
                                 addr_status = "✅ Token info loaded" if (token0_addr and token1_addr) else "⚠️ Enter token addresses"
                                 self.pool_info_label.setText(
                                     f"✅ V4 Pool found on {protocol_name}!\n"
                                     f"Fee: {fee_percent}% | Tick: {state.tick}\n"
-                                    f"Price: {display_price:.10g} {price_note}\n"
+                                    f"Price: {self._format_price(display_price)} {price_note}\n"
                                     f"{addr_status}"
                                 )
                             self.pool_info_label.setStyleSheet("color: #00b894;")
@@ -2243,8 +2413,8 @@ class CreateTab(QWidget):
                                 else:
                                     display_price = price_adjusted
 
-                                self.price_input.setText(f"{display_price:.10g}")
-                                price_str = f"{display_price:.10g}"
+                                self.price_input.setText(self._format_price(display_price))
+                                price_str = self._format_price(display_price)
                                 self._log(f"Auto-filled price from StateView: {price_str}")
                         except Exception as price_err:
                             self._log(f"Could not get price from StateView: {price_err}")
@@ -2373,6 +2543,8 @@ class CreateTab(QWidget):
                 # We need to SWAP: put volatile in token0 field, stablecoin in token1 field
                 self.token0_input.setText(token1_addr)  # volatile goes to token0
                 self.token1_input.setText(token0_addr)  # stablecoin goes to token1
+                self._token0_decimals = decimals1  # volatile token decimals
+                self._token1_decimals = decimals0  # stablecoin decimals
 
                 # Price should be: stablecoin per volatile (USDT per memes)
                 # pool_price is token1/token0 = memes/USDT, so we invert
@@ -2388,8 +2560,12 @@ class CreateTab(QWidget):
                 # token1 is stablecoin (or neither/both - use as-is)
                 self.token0_input.setText(token0_addr)
                 self.token1_input.setText(token1_addr)
+                self._token0_decimals = decimals0
+                self._token1_decimals = decimals1
                 display_price = pool_price
                 display_pair = f"{token0_symbol}/{token1_symbol}"
+
+            self._log(f"Token decimals: token0={self._token0_decimals}, token1={self._token1_decimals}")
 
             # Set fee combo or custom fee input
             fee_map = {500: 0, 2500: 1, 3000: 2, 10000: 3}
@@ -2422,7 +2598,7 @@ class CreateTab(QWidget):
 
             # Update price input if we got price
             if display_price:
-                self.price_input.setText(f"{display_price:.10g}")
+                self.price_input.setText(self._format_price(display_price))
 
             # Determine DEX name for display
             dex_display_name = "V3"
@@ -2433,7 +2609,7 @@ class CreateTab(QWidget):
             fee_percent = fee / 10000
             info_text = f"✅ {dex_display_name}: {display_pair} | Fee: {fee_percent}%"
             if display_price:
-                info_text += f" | Price: {display_price:.10g}"
+                info_text += f" | Price: {self._format_price(display_price)}"
             self.pool_info_label.setText(info_text)
             self.pool_info_label.setStyleSheet("color: #00b894;")
 
