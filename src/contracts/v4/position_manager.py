@@ -735,7 +735,7 @@ class V4PositionManager:
             deadline
         ).build_transaction({
             'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address),
+            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
             'gas': gas_limit,
             'gasPrice': self.w3.eth.gas_price,
             'value': 0  # For native ETH wrapping if needed
@@ -829,7 +829,7 @@ class V4PositionManager:
             deadline
         ).build_transaction({
             'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address),
+            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
             'gas': gas_limit,
             'gasPrice': self.w3.eth.gas_price
         })
@@ -905,7 +905,7 @@ class V4PositionManager:
             deadline
         ).build_transaction({
             'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address),
+            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
             'gas': gas_limit,
             'gasPrice': self.w3.eth.gas_price
         })
@@ -991,7 +991,7 @@ class V4PositionManager:
             deadline
         ).build_transaction({
             'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address),
+            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
             'gas': gas_limit,
             'gasPrice': self.w3.eth.gas_price
         })
@@ -1075,7 +1075,7 @@ class V4PositionManager:
             deadline
         ).build_transaction({
             'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address),
+            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
             'gas': gas_limit,
             'gasPrice': self.w3.eth.gas_price,
             'value': 0
@@ -1156,7 +1156,7 @@ class V4PositionManager:
             deadline
         ).build_transaction({
             'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address),
+            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
             'gas': gas_limit,
             'gasPrice': self.w3.eth.gas_price,
             'value': 0

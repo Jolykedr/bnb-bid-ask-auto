@@ -49,7 +49,7 @@ class TestLiquidityProviderIntegration:
             provider.w3 = mock_w3
             provider.account = mock_account
             provider.chain_id = 56
-            provider.position_manager_address = "0xPositionManager"
+            provider.position_manager_address = "0xEE55555555555555555555555555555555555555"
             provider.position_manager = Mock(spec=UniswapV3PositionManager)
             provider.batcher = Mock(spec=Multicall3Batcher)
             return provider
@@ -61,8 +61,8 @@ class TestLiquidityProviderIntegration:
             lower_price=400.0,
             total_usd=1000,
             n_positions=5,
-            token0="0xToken0",
-            token1="0xToken1",
+            token0="0xAA11111111111111111111111111111111111111",
+            token1="0xBB22222222222222222222222222222222222222",
             fee_tier=2500,
             distribution_type="linear"
         )
@@ -91,14 +91,14 @@ class TestLiquidityProviderIntegration:
             lower_price=400.0,
             total_usd=1000,
             n_positions=5,
-            token0="0xToken0",
-            token1="0xToken1",
+            token0="0xAA11111111111111111111111111111111111111",
+            token1="0xBB22222222222222222222222222222222222222",
             fee_tier=2500
         )
 
         # Mock balance check - insufficient funds
         provider.get_token_balance = Mock(return_value=500 * 10**18)  # Only 500 USDT
-        provider._ensure_token_order = Mock(return_value=("0xToken0", "0xToken1", False))
+        provider._ensure_token_order = Mock(return_value=("0xAA11111111111111111111111111111111111111", "0xBB22222222222222222222222222222222222222", False))
 
         is_valid, error_msg = provider.validate_balances_for_ladder(config)
 
@@ -112,14 +112,14 @@ class TestLiquidityProviderIntegration:
             lower_price=400.0,
             total_usd=1000,
             n_positions=5,
-            token0="0xToken0",
-            token1="0xToken1",
+            token0="0xAA11111111111111111111111111111111111111",
+            token1="0xBB22222222222222222222222222222222222222",
             fee_tier=2500
         )
 
         # Mock balance check - sufficient funds
         provider.get_token_balance = Mock(return_value=2000 * 10**18)  # 2000 USDT
-        provider._ensure_token_order = Mock(return_value=("0xToken0", "0xToken1", False))
+        provider._ensure_token_order = Mock(return_value=("0xAA11111111111111111111111111111111111111", "0xBB22222222222222222222222222222222222222", False))
 
         is_valid, error_msg = provider.validate_balances_for_ladder(config)
 
@@ -186,7 +186,7 @@ class TestMulticall3BatcherIntegration:
             batcher = Multicall3Batcher.__new__(Multicall3Batcher)
             batcher.w3 = mock_w3
             batcher.account = mock_account
-            batcher.multicall_address = "0xMulticall3"
+            batcher.multicall_address = "0xFF66666666666666666666666666666666666666"
             batcher.calls = []
 
             # Mock contract
@@ -211,19 +211,19 @@ class TestMulticall3BatcherIntegration:
         batcher._get_pm_contract = Mock(return_value=mock_pm)
 
         batcher.add_mint_call(
-            position_manager="0xPM",
-            token0="0xToken0",
-            token1="0xToken1",
+            position_manager="0xDD44444444444444444444444444444444444444",
+            token0="0xAA11111111111111111111111111111111111111",
+            token1="0xBB22222222222222222222222222222222222222",
             fee=2500,
             tick_lower=-100,
             tick_upper=-50,
             amount0_desired=0,
             amount1_desired=1000 * 10**18,
-            recipient="0xRecipient"
+            recipient="0xCC33333333333333333333333333333333333333"
         )
 
         assert len(batcher.calls) == 1
-        assert batcher.calls[0].target == "0xPM"
+        assert batcher.calls[0].target == "0xDD44444444444444444444444444444444444444"
 
     def test_add_close_position_calls(self, batcher):
         """Test adding close position calls (2 calls per position)."""
@@ -232,10 +232,10 @@ class TestMulticall3BatcherIntegration:
         batcher._get_pm_contract = Mock(return_value=mock_pm)
 
         batcher.add_close_position_calls(
-            position_manager="0xPM",
+            position_manager="0xDD44444444444444444444444444444444444444",
             token_id=12345,
             liquidity=1000000,
-            recipient="0xRecipient"
+            recipient="0xCC33333333333333333333333333333333333333"
         )
 
         # Should add 2 calls: decreaseLiquidity, collect (no burn - NFT stays)
@@ -249,8 +249,15 @@ class TestMulticall3BatcherIntegration:
 
     def test_simulate_returns_results(self, batcher):
         """Test simulation returns results."""
-        batcher.calls = [Mock()]
-        batcher.calls[0].to_tuple = Mock(return_value=("0x", False, b''))
+        mock_call = Mock()
+        mock_call.target = "0xDD44444444444444444444444444444444444444"
+        mock_call.call_data = b'\x00'
+        batcher.calls = [mock_call]
+
+        # Mock PM contract для simulate
+        mock_pm = Mock()
+        mock_pm.functions.multicall.return_value.call.return_value = [b'\x00' * 32]
+        batcher._get_pm_contract = Mock(return_value=mock_pm)
 
         results = batcher.simulate()
 
@@ -292,7 +299,7 @@ class TestPositionManagerIntegration:
             pm = UniswapV3PositionManager.__new__(UniswapV3PositionManager)
             pm.w3 = mock_w3
             pm.account = mock_account
-            pm.position_manager_address = "0xPositionManager"
+            pm.position_manager_address = "0xEE55555555555555555555555555555555555555"
 
             # Mock contract
             mock_contract = Mock()
@@ -304,8 +311,8 @@ class TestPositionManagerIntegration:
                 call=Mock(return_value=(
                     0,  # nonce
                     "0x0",  # operator
-                    "0xToken0",  # token0
-                    "0xToken1",  # token1
+                    "0xAA11111111111111111111111111111111111111",  # token0
+                    "0xBB22222222222222222222222222222222222222",  # token1
                     2500,  # fee
                     -100,  # tickLower
                     -50,  # tickUpper
@@ -315,6 +322,16 @@ class TestPositionManagerIntegration:
                     0,  # tokensOwed0
                     0,  # tokensOwed1
                 ))
+            ))
+
+            # decreaseLiquidity
+            mock_contract.functions.decreaseLiquidity = Mock(return_value=Mock(
+                _encode_transaction_data=Mock(return_value=b'decrease_data')
+            ))
+
+            # collect
+            mock_contract.functions.collect = Mock(return_value=Mock(
+                _encode_transaction_data=Mock(return_value=b'collect_data')
             ))
 
             pm.contract = mock_contract
@@ -332,8 +349,8 @@ class TestPositionManagerIntegration:
     def test_encode_mint_returns_bytes(self, position_manager):
         """Test encode_mint returns encoded bytes."""
         params = MintParams(
-            token0="0xToken0",
-            token1="0xToken1",
+            token0="0xAA11111111111111111111111111111111111111",
+            token1="0xBB22222222222222222222222222222222222222",
             fee=2500,
             tick_lower=-100,
             tick_upper=-50,
@@ -343,7 +360,7 @@ class TestPositionManagerIntegration:
 
         result = position_manager.encode_mint(
             params=params,
-            recipient="0xRecipient"
+            recipient="0xCC33333333333333333333333333333333333333"
         )
 
         assert isinstance(result, bytes)
@@ -361,7 +378,7 @@ class TestPositionManagerIntegration:
         """Test encode_collect returns encoded bytes."""
         result = position_manager.encode_collect(
             token_id=12345,
-            recipient="0xRecipient"
+            recipient="0xCC33333333333333333333333333333333333333"
         )
 
         assert isinstance(result, bytes)
@@ -507,8 +524,8 @@ class TestTimeouts:
             lower_price=400.0,
             total_usd=1000,
             n_positions=5,
-            token0="0xToken0",
-            token1="0xToken1",
+            token0="0xAA11111111111111111111111111111111111111",
+            token1="0xBB22222222222222222222222222222222222222",
             fee_tier=2500
         )
 

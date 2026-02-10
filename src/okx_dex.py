@@ -357,7 +357,7 @@ class OKXDexSwap:
                 max_uint256
             ).build_transaction({
                 'from': Web3.to_checksum_address(wallet_address),
-                'nonce': w3.eth.get_transaction_count(Web3.to_checksum_address(wallet_address)),
+                'nonce': w3.eth.get_transaction_count(Web3.to_checksum_address(wallet_address), 'pending'),
                 'gas': 100000,
                 'gasPrice': w3.eth.gas_price
             })
@@ -489,7 +489,7 @@ class OKXDexSwap:
                 'to': Web3.to_checksum_address(swap_data['to']),
                 'data': swap_data['data'],
                 'value': swap_data['value'] if is_native else 0,
-                'nonce': w3.eth.get_transaction_count(Web3.to_checksum_address(wallet_address)),
+                'nonce': w3.eth.get_transaction_count(Web3.to_checksum_address(wallet_address), 'pending'),
                 'gas': swap_data['gas'],
                 'gasPrice': w3.eth.gas_price
             }

@@ -580,7 +580,7 @@ class DexSwap:
                 [swap_data]
             ).build_transaction({
                 'from': wallet_address,
-                'nonce': self.w3.eth.get_transaction_count(wallet_address),
+                'nonce': self.w3.eth.get_transaction_count(wallet_address, 'pending'),
                 'gas': 350000,
                 'gasPrice': self.w3.eth.gas_price,
                 'value': 0
@@ -659,7 +659,7 @@ class DexSwap:
                 self.router_v3_address, max_uint256
             ).build_transaction({
                 'from': wallet_address,
-                'nonce': self.w3.eth.get_transaction_count(wallet_address),
+                'nonce': self.w3.eth.get_transaction_count(wallet_address, 'pending'),
                 'gas': 100000,
                 'gasPrice': self.w3.eth.gas_price
             })
@@ -709,7 +709,7 @@ class DexSwap:
                 self.router_address, max_uint256
             ).build_transaction({
                 'from': wallet_address,
-                'nonce': self.w3.eth.get_transaction_count(wallet_address),
+                'nonce': self.w3.eth.get_transaction_count(wallet_address, 'pending'),
                 'gas': 100000,
                 'gasPrice': self.w3.eth.gas_price
             })
@@ -918,7 +918,7 @@ class DexSwap:
                     deadline
                 ).build_transaction({
                     'from': wallet_address,
-                    'nonce': self.w3.eth.get_transaction_count(wallet_address),
+                    'nonce': self.w3.eth.get_transaction_count(wallet_address, 'pending'),
                     'gas': 300000,
                     'gasPrice': self.w3.eth.gas_price
                 })
@@ -931,7 +931,7 @@ class DexSwap:
                     deadline
                 ).build_transaction({
                     'from': wallet_address,
-                    'nonce': self.w3.eth.get_transaction_count(wallet_address),
+                    'nonce': self.w3.eth.get_transaction_count(wallet_address, 'pending'),
                     'gas': 300000,
                     'gasPrice': self.w3.eth.gas_price
                 })

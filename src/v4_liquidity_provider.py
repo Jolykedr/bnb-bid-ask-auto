@@ -397,7 +397,7 @@ class V4LiquidityProvider:
             sqrt_price_x96
         ).build_transaction({
             'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address),
+            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
             'gas': 500000,
             'gasPrice': self.w3.eth.gas_price
         })
@@ -514,7 +514,7 @@ class V4LiquidityProvider:
                 sqrt_price_x96
             ).build_transaction({
                 'from': self.account.address,
-                'nonce': self.w3.eth.get_transaction_count(self.account.address),
+                'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
                 'gas': 500000,
                 'gasPrice': self.w3.eth.gas_price
             })
@@ -1100,22 +1100,7 @@ class V4LiquidityProvider:
         For bid positions we need the stablecoin.
         Check known stablecoins first, otherwise use token1.
         """
-        # Known stablecoin addresses (multi-chain)
-        STABLECOINS = {
-            # BNB Chain (56)
-            "0x55d398326f99059ff775485246999027b3197955": 18,  # USDT (BSC)
-            "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": 18,  # USDC (BSC)
-            "0xe9e7cea3dedca5984780bafc599bd69add087d56": 18,  # BUSD (BSC)
-            "0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3": 18,  # DAI (BSC)
-            # Base (8453)
-            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": 6,   # USDC (Base) - 6 decimals!
-            "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca": 6,   # USDbC bridged (Base) - 6 decimals!
-            "0x50c5725949a6f0c72e6c4a641f24049a917db0cb": 18,  # DAI (Base)
-            # Ethereum (1)
-            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": 6,   # USDC (ETH) - 6 decimals!
-            "0xdac17f958d2ee523a2206206994597c13d831ec7": 6,   # USDT (ETH) - 6 decimals!
-            "0x6b175474e89094c44da98b954eedeac495271d0f": 18,  # DAI (ETH)
-        }
+        from config import STABLECOINS
 
         token0_lower = config.token0.lower()
         token1_lower = config.token1.lower()

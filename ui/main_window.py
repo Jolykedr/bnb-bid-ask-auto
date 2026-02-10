@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QTabWidget, QMenuBar, QMenu,
     QStatusBar, QLabel, QMessageBox, QApplication
 )
-from PyQt6.QtCore import Qt, QSettings
+from PyQt6.QtCore import Qt, QSettings, QMutex, QMutexLocker
 from PyQt6.QtGui import QAction, QIcon
 
 import os
@@ -36,6 +36,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1200, 800)
 
         self.settings = QSettings("BNBLiquidityLadder", "Settings")
+        self._provider_mutex = QMutex()
 
         self.setup_ui()
         self.load_stylesheet()
@@ -188,12 +189,13 @@ class MainWindow(QMainWindow):
 
     def _on_tab_changed(self, index):
         """Handle tab change."""
-        # Sync provider between tabs
+        # Sync provider between tabs (mutex protects against worker race condition)
+        locker = QMutexLocker(self._provider_mutex)
         if index == 2:  # Manage tab
-            if self.create_tab.provider:
+            if self.create_tab.provider and self.create_tab.worker is None:
                 self.manage_tab.set_provider(self.create_tab.provider)
         elif index == 3:  # Advanced tab
-            if self.create_tab.provider:
+            if self.create_tab.provider and self.create_tab.worker is None:
                 self.advanced_tab.set_provider(self.create_tab.provider)
 
     def _on_tokens_updated(self, tokens: list):
@@ -205,7 +207,8 @@ class MainWindow(QMainWindow):
         """Handle new positions created in Create tab."""
         # Add positions to Manage tab
         if token_ids:
-            # Ensure manage tab has provider
+            locker = QMutexLocker(self._provider_mutex)
+            # Ensure manage tab has provider (safe - worker is done at this point)
             if self.create_tab.provider:
                 self.manage_tab.set_provider(self.create_tab.provider)
 

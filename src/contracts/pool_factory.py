@@ -385,7 +385,7 @@ class PoolFactory:
             token0, token1, fee
         ).build_transaction({
             'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address),
+            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
             'gas': 5000000,
             'gasPrice': self.w3.eth.gas_price
         })
@@ -447,7 +447,7 @@ class PoolFactory:
         # Build transaction
         tx = pool.functions.initialize(sqrt_price_x96).build_transaction({
             'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address),
+            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
             'gas': 500000,
             'gasPrice': self.w3.eth.gas_price
         })

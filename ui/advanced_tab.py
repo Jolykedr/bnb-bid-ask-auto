@@ -676,28 +676,13 @@ class AdvancedTab(QWidget):
         Returns:
             True if inversion is needed, False otherwise
         """
-        # Known stablecoin addresses (multi-chain) - lowercase for comparison
-        STABLECOINS = {
-            # BNB Chain (56)
-            "0x55d398326f99059ff775485246999027b3197955",  # USDT (BSC)
-            "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",  # USDC (BSC)
-            "0xe9e7cea3dedca5984780bafc599bd69add087d56",  # BUSD (BSC)
-            "0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3",  # DAI (BSC)
-            # Base (8453)
-            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",  # USDC (Base)
-            "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",  # USDbC bridged (Base)
-            "0x50c5725949a6f0c72e6c4a641f24049a917db0cb",  # DAI (Base)
-            # Ethereum (1)
-            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",  # USDC (ETH)
-            "0xdac17f958d2ee523a2206206994597c13d831ec7",  # USDT (ETH)
-            "0x6b175474e89094c44da98b954eedeac495271d0f",  # DAI (ETH)
-        }
+        from config import STABLECOIN_ADDRESSES
 
         token0_lower = token0.lower()
         token1_lower = token1.lower()
 
-        token0_is_stable = token0_lower in STABLECOINS
-        token1_is_stable = token1_lower in STABLECOINS
+        token0_is_stable = token0_lower in STABLECOIN_ADDRESSES
+        token1_is_stable = token1_lower in STABLECOIN_ADDRESSES
 
         if token1_is_stable and not token0_is_stable:
             # Stablecoin is token1 → pool price is in USD → NO inversion

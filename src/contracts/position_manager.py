@@ -128,7 +128,7 @@ class UniswapV3PositionManager:
         max_uint256 = 2**256 - 1
         tx = token.functions.approve(spender, max_uint256).build_transaction({
             'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address),
+            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
             'gas': 100000,
             'gasPrice': self.w3.eth.gas_price
         })
@@ -294,7 +294,7 @@ class UniswapV3PositionManager:
             params.to_tuple(self.account.address, deadline)
         ).build_transaction({
             'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address),
+            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
             'gas': gas_limit,
             'gasPrice': self.w3.eth.gas_price
         })

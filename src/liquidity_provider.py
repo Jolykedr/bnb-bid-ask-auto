@@ -391,19 +391,8 @@ class LiquidityProvider:
             return False, "Account not configured"
 
         # Для bid-ask стратегии ниже текущей цены нужен стейблкоин
-        # Определяем стейблкоин динамически по адресу (не полагаемся на порядок token0/token1)
-        STABLECOINS = {
-            # BNB Chain
-            "0x55d398326f99059ff775485246999027b3197955": 18,  # USDT (BSC)
-            "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": 18,  # USDC (BSC)
-            "0xe9e7cea3dedca5984780bafc599bd69add087d56": 18,  # BUSD (BSC)
-            # Base
-            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": 6,   # USDC (Base)
-            "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca": 6,   # USDbC (Base)
-            # Ethereum
-            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": 6,   # USDC (ETH)
-            "0xdac17f958d2ee523a2206206994597c13d831ec7": 6,   # USDT (ETH)
-        }
+        # Определяем стейблкоин динамически по адресу (централизованный реестр из config)
+        from config import STABLECOINS
 
         t0_lower = config.token0.lower()
         t1_lower = config.token1.lower()
@@ -482,7 +471,7 @@ class LiquidityProvider:
 
         # Use nonce manager for safe nonce handling
         nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
-                self.w3.eth.get_transaction_count(self.account.address)
+                self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
         try:
             tx = approve_fn.build_transaction({
@@ -553,24 +542,16 @@ class LiquidityProvider:
         logger.debug(f"Sorted token1: {token1[:10]}...")
         logger.debug(f"Swapped: {swapped}")
 
-        # Detect stablecoin dynamically (same as validate_balances_for_ladder)
-        STABLECOINS_CL = {
-            "0x55d398326f99059ff775485246999027b3197955": 18,  # USDT (BSC)
-            "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": 18,  # USDC (BSC)
-            "0xe9e7cea3dedca5984780bafc599bd69add087d56": 18,  # BUSD (BSC)
-            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": 6,   # USDC (Base)
-            "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca": 6,   # USDbC (Base)
-            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": 6,   # USDC (ETH)
-            "0xdac17f958d2ee523a2206206994597c13d831ec7": 6,   # USDT (ETH)
-        }
+        # Detect stablecoin dynamically (centralized registry from config)
+        from config import STABLECOINS
         t0_low = config.token0.lower()
         t1_low = config.token1.lower()
-        if t0_low in STABLECOINS_CL:
+        if t0_low in STABLECOINS:
             stablecoin = config.token0
-            stablecoin_decimals = STABLECOINS_CL[t0_low]
-        elif t1_low in STABLECOINS_CL:
+            stablecoin_decimals = STABLECOINS[t0_low]
+        elif t1_low in STABLECOINS:
             stablecoin = config.token1
-            stablecoin_decimals = STABLECOINS_CL[t1_low]
+            stablecoin_decimals = STABLECOINS[t1_low]
         else:
             stablecoin = config.token1
             stablecoin_decimals = config.token1_decimals

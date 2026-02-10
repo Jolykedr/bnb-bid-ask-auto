@@ -27,7 +27,7 @@ from src.math.distribution import calculate_bid_ask_from_percent
 from src.v4_liquidity_provider import V4LiquidityProvider, V4LadderConfig
 from src.contracts.v4.constants import V4Protocol
 from src.contracts.v4.subgraph import try_all_sources_with_web3 as query_v4_subgraph
-from config import BNB_CHAIN, BNB_TESTNET, ETHEREUM, BASE, TOKENS_BNB, TOKENS_BASE
+from config import BNB_CHAIN, BNB_TESTNET, ETHEREUM, BASE, TOKENS_BNB, TOKENS_BASE, STABLECOINS, is_stablecoin
 
 
 def _format_price(price: float) -> str:
@@ -60,6 +60,7 @@ class CreateLadderWorkerV4(QThread):
         self.gas_limit = gas_limit  # 0 = auto
 
     def run(self):
+        provider = None
         try:
             self.progress.emit(f"Connecting to {self.config.protocol.value}...")
 
@@ -104,6 +105,15 @@ class CreateLadderWorkerV4(QThread):
 
         except Exception as e:
             self.finished.emit(False, str(e), {})
+        finally:
+            # Cleanup provider resources (Web3 connections)
+            if provider is not None:
+                try:
+                    if hasattr(provider, 'w3') and hasattr(provider.w3, 'provider'):
+                        if hasattr(provider.w3.provider, 'disconnect'):
+                            provider.w3.provider.disconnect()
+                except Exception:
+                    pass
 
 
 class CreateLadderWorker(QThread):
@@ -434,20 +444,14 @@ class CreateLadderWorker(QThread):
                 self.progress.emit(f"✓ Position Manager verified ({len(pm_code)} bytes)")
 
                 # Calculate stablecoin amount for first position
-                # Detect stablecoin decimals (may differ from token1 if stablecoin is token0)
-                _stables = {
-                    "0x55d398326f99059ff775485246999027b3197955": 18,
-                    "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": 18,
-                    "0xe9e7cea3dedca5984780bafc599bd69add087d56": 18,
-                    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": 6,
-                    "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca": 6,
-                }
+                # Detect stablecoin decimals (using centralized registry from config)
+                from config import STABLECOINS as _STABLES
                 _t0l = self.config.token0.lower()
                 _t1l = self.config.token1.lower()
-                if _t0l in _stables:
-                    _stable_dec = _stables[_t0l]
-                elif _t1l in _stables:
-                    _stable_dec = _stables[_t1l]
+                if _t0l in _STABLES:
+                    _stable_dec = _STABLES[_t0l]
+                elif _t1l in _STABLES:
+                    _stable_dec = _STABLES[_t1l]
                 else:
                     _stable_dec = self.config.token1_decimals
 
@@ -477,6 +481,9 @@ class CreateLadderWorker(QThread):
 
         except Exception as e:
             self.finished.emit(False, str(e), {})
+        finally:
+            # Cleanup temporary resources (PoolFactory etc.)
+            pool_factory = None
 
 
 class CreateTab(QWidget):
@@ -526,6 +533,25 @@ class CreateTab(QWidget):
             self.pool_info_label.setText("")
             self.pool_info_label.setStyleSheet("")
         self._log("Pool state reset")
+
+    def _on_reset_pool(self):
+        """Reset button handler — clear loaded pool, token inputs, price, and position table."""
+        self._reset_pool_state()
+        # Clear pool address input
+        if hasattr(self, 'pool_input'):
+            self.pool_input.clear()
+        # Clear token address inputs
+        if hasattr(self, 'token0_input'):
+            self.token0_input.clear()
+        if hasattr(self, 'token1_input'):
+            self.token1_input.clear()
+        # Reset price
+        if hasattr(self, 'price_input'):
+            self.price_input.setText("1.0")
+        # Clear position table
+        if hasattr(self, 'position_table'):
+            self.position_table.set_positions([], 0)
+        self._log("Pool reset — все поля очищены")
 
     def setup_ui(self):
         main_layout = QHBoxLayout(self)
@@ -657,6 +683,12 @@ class CreateTab(QWidget):
         self.load_pool_btn.setMaximumWidth(60)
         self.load_pool_btn.clicked.connect(self._load_pool_info)
         pool_row.addWidget(self.load_pool_btn)
+
+        self.reset_pool_btn = QPushButton("Reset")
+        self.reset_pool_btn.setMaximumWidth(60)
+        self.reset_pool_btn.setToolTip("Сбросить загруженный пул и очистить все поля")
+        self.reset_pool_btn.clicked.connect(self._on_reset_pool)
+        pool_row.addWidget(self.reset_pool_btn)
         token_layout.addLayout(pool_row)
 
         # Pool info label
@@ -1209,29 +1241,12 @@ class CreateTab(QWidget):
         Returns:
             True if inversion is needed, False otherwise
         """
-        # Known stablecoin addresses (multi-chain) - lowercase for comparison
-        STABLECOINS = {
-            # BNB Chain (56)
-            "0x55d398326f99059ff775485246999027b3197955",  # USDT (BSC)
-            "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",  # USDC (BSC)
-            "0xe9e7cea3dedca5984780bafc599bd69add087d56",  # BUSD (BSC)
-            "0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3",  # DAI (BSC)
-            # Base (8453)
-            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",  # USDC (Base)
-            "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",  # USDbC bridged (Base)
-            "0x50c5725949a6f0c72e6c4a641f24049a917db0cb",  # DAI (Base)
-            # Ethereum (1)
-            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",  # USDC (ETH)
-            "0xdac17f958d2ee523a2206206994597c13d831ec7",  # USDT (ETH)
-            "0x6b175474e89094c44da98b954eedeac495271d0f",  # DAI (ETH)
-        }
-
         token0_lower = token0.lower()
         token1_lower = token1.lower()
 
-        # Find which token is the stablecoin
-        token0_is_stable = token0_lower in STABLECOINS
-        token1_is_stable = token1_lower in STABLECOINS
+        # Find which token is the stablecoin (using centralized registry from config)
+        token0_is_stable = is_stablecoin(token0)
+        token1_is_stable = is_stablecoin(token1)
 
         if not token0_is_stable and not token1_is_stable:
             # Neither is a known stablecoin - default to True (old behavior)
@@ -1747,6 +1762,11 @@ class CreateTab(QWidget):
         self.progress_bar.hide()
         self.create_btn.setEnabled(True)
         self.preview_btn.setEnabled(True)
+
+        # Cleanup worker thread to prevent memory leak
+        if self.worker is not None:
+            self.worker.deleteLater()
+            self.worker = None
 
         if success:
             self._log(f"SUCCESS: {message}")

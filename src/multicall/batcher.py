@@ -391,7 +391,7 @@ class Multicall3Batcher:
         # Построение транзакции
         tx_params = {
             'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address),
+            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
             'gas': gas_limit,
         }
 
