@@ -190,6 +190,7 @@ class TestPoolFactory:
             mock_contract.functions = Mock()
             mock_contract.events = Mock()
             f.factory = mock_contract
+            f.nonce_manager = None
             return f
 
     @pytest.fixture

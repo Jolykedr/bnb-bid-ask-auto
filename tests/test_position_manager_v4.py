@@ -87,6 +87,7 @@ def _make_pm(mock_w3, mock_account=None, protocol=V4Protocol.PANCAKESWAP):
 
         mock_contract = MagicMock()
         pm.contract = mock_contract
+        pm.nonce_manager = None
         return pm
 
 

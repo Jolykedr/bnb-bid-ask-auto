@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QScrollArea
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
-from PyQt6.QtGui import QFont, QColor, QPainter, QBrush
+from PyQt6.QtGui import QFont, QColor, QPainter, QBrush, QPen, QLinearGradient, QPainterPath
 
 import sys
 import os
@@ -23,106 +23,211 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from web3 import Web3
 from src.math.ticks import tick_to_price
+from src.math.liquidity import calculate_amounts
+
+
+class NumericTableWidgetItem(QTableWidgetItem):
+    """QTableWidgetItem that sorts numerically by the value stored in UserRole."""
+
+    def __init__(self, text: str, sort_value: float = 0.0):
+        super().__init__(text)
+        self.setData(Qt.ItemDataRole.UserRole, sort_value)
+
+    def __lt__(self, other):
+        if isinstance(other, QTableWidgetItem):
+            my_val = self.data(Qt.ItemDataRole.UserRole)
+            other_val = other.data(Qt.ItemDataRole.UserRole)
+            if isinstance(my_val, (int, float)) and isinstance(other_val, (int, float)):
+                return my_val < other_val
+        return super().__lt__(other)
 
 
 class PriceProgressDelegate(QStyledItemDelegate):
-    """Custom delegate to draw price range progress bar."""
+    """
+    Range Progress delegate.
+
+    The full bar represents a wider range than the position.
+    The position range is shown as a highlighted segment inside.
+    Current price is a vertical marker that can be outside the position.
+    """
 
     def _format_price(self, price: float) -> str:
-        """Format price for display, handling extreme values."""
-        if price is None or price == float('inf') or price != price:  # NaN check
+        if price is None or price == float('inf') or price != price:
             return "N/A"
         if price < 0:
             return "N/A"
-        if price > 1e12:  # Trillion - probably wrong
+        if price > 1e12:
             return "???"
         if price < 0.0000001:
-            return f"${price:.10f}"
+            return f"{price:.9f}"
         if price < 0.001:
-            return f"${price:.8f}"
+            return f"{price:.7f}"
         if price < 1:
-            # Most meme tokens - show 6 decimals
-            return f"${price:.6f}"
+            return f"{price:.5f}"
         if price < 100:
-            return f"${price:.4f}"
+            return f"{price:.3f}"
         if price < 1000:
-            return f"${price:.2f}"
+            return f"{price:.2f}"
         if price < 1000000:
-            return f"${price:,.0f}"
-        return f"${price:.2e}"
+            return f"{price:,.0f}"
+        return f"{price:.2e}"
+
+    def sizeHint(self, option, index):
+        size = super().sizeHint(option, index)
+        size.setHeight(42)
+        return size
 
     def paint(self, painter, option, index):
-        # Get data from index
         data = index.data(Qt.ItemDataRole.UserRole)
         if data is None:
             super().paint(painter, option, index)
             return
 
         painter.save()
-
-        # Background
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.fillRect(option.rect, option.palette.base())
 
-        # Extract values with safety checks
         price_lower = data.get('price_lower', 0)
         price_upper = data.get('price_upper', 1)
-        current_price = data.get('current_price', price_lower)
+        current_price = data.get('current_price', None)
         in_range = data.get('in_range', False)
 
-        # Validate prices - check for extreme/invalid values
         is_valid = True
         if price_lower is None or price_upper is None or current_price is None:
             is_valid = False
-        elif price_lower < 0 or price_upper < 0 or current_price < 0:
+        elif price_lower <= 0 or price_upper <= 0 or current_price <= 0:
             is_valid = False
         elif price_upper == float('inf') or price_lower == float('inf'):
             is_valid = False
-        elif price_upper > 1e15 or price_lower > 1e15:  # Probably wrong tick extraction
+        elif price_upper > 1e15 or price_lower > 1e15:
+            is_valid = False
+        elif price_upper <= price_lower:
             is_valid = False
 
-        # Calculate progress
-        if is_valid and price_upper > price_lower:
-            try:
-                progress = (current_price - price_lower) / (price_upper - price_lower)
-                progress = max(0.0, min(1.0, progress))
-            except (ZeroDivisionError, OverflowError):
-                progress = 0.5
-        else:
-            progress = 0.5
+        rect = option.rect.adjusted(6, 2, -6, -2)
+        bar_height = 12
+        bar_y = rect.top() + 1
 
-        # Draw progress bar background
-        rect = option.rect.adjusted(4, 4, -4, -4)
+        if not is_valid:
+            painter.setPen(QColor(128, 128, 128))
+            font = painter.font()
+            font.setPointSize(7)
+            painter.setFont(font)
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "No price data")
+            painter.restore()
+            return
 
-        # Background bar
-        painter.setBrush(QBrush(QColor(60, 60, 60)))
+        # --- Compute the visible range (wider than position) ---
+        # The bar shows ~3x the position range, centered on position midpoint
+        pos_range = price_upper - price_lower
+        padding = pos_range * 1.0  # 1x padding on each side
+        vis_min = max(0, price_lower - padding)
+        vis_max = price_upper + padding
+
+        # Make sure current_price is visible too
+        if current_price < vis_min:
+            vis_min = current_price - pos_range * 0.2
+        if current_price > vis_max:
+            vis_max = current_price + pos_range * 0.2
+        vis_min = max(0, vis_min)
+
+        vis_range = vis_max - vis_min
+        if vis_range <= 0:
+            vis_range = 1
+
+        def price_to_x(p):
+            frac = (p - vis_min) / vis_range
+            return bar_rect.left() + int(frac * bar_rect.width())
+
+        # --- Bar background track ---
+        bar_rect_full = rect.adjusted(0, 0, 0, -(rect.height() - bar_height - 2))
+        bar_rect = bar_rect_full
+        bar_rect.moveTop(bar_y)
+
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawRoundedRect(rect, 3, 3)
+        painter.setBrush(QBrush(QColor(30, 33, 43)))
+        painter.drawRoundedRect(bar_rect, 4, 4)
 
-        # Progress fill
+        # --- Position range segment (highlighted) ---
+        seg_left = price_to_x(price_lower)
+        seg_right = price_to_x(price_upper)
+        seg_left = max(bar_rect.left(), min(seg_left, bar_rect.right()))
+        seg_right = max(seg_left + 2, min(seg_right, bar_rect.right()))
+
         if in_range:
-            color = QColor(76, 175, 80)  # Green for in range
-        elif not is_valid:
-            color = QColor(128, 128, 128)  # Gray for invalid
+            gradient = QLinearGradient(seg_left, 0, seg_right, 0)
+            gradient.setColorAt(0, QColor(0, 184, 148))
+            gradient.setColorAt(1, QColor(76, 175, 80))
         else:
-            color = QColor(255, 152, 0)  # Orange for out of range
+            gradient = QLinearGradient(seg_left, 0, seg_right, 0)
+            gradient.setColorAt(0, QColor(255, 152, 0))
+            gradient.setColorAt(1, QColor(255, 107, 53))
 
-        progress_width = int(rect.width() * progress)
-        progress_rect = rect.adjusted(0, 0, -(rect.width() - progress_width), 0)
-        painter.setBrush(QBrush(color))
-        painter.drawRoundedRect(progress_rect, 3, 3)
+        painter.setBrush(QBrush(gradient))
+        from PyQt6.QtCore import QRect
+        seg_rect = QRect(seg_left, bar_rect.top() + 1, seg_right - seg_left, bar_rect.height() - 2)
+        painter.drawRoundedRect(seg_rect, 3, 3)
 
-        # Draw current price indicator
-        indicator_x = rect.left() + progress_width
+        # --- Position range border (subtle bracket marks) ---
+        pen = QPen(QColor(100, 100, 110), 1)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        bracket_h = 3
+        painter.drawLine(seg_left, bar_rect.top() - 1, seg_left, bar_rect.top() - 1 - bracket_h)
+        painter.drawLine(seg_left, bar_rect.bottom() + 1, seg_left, bar_rect.bottom() + 1 + bracket_h)
+        painter.drawLine(seg_right, bar_rect.top() - 1, seg_right, bar_rect.top() - 1 - bracket_h)
+        painter.drawLine(seg_right, bar_rect.bottom() + 1, seg_right, bar_rect.bottom() + 1 + bracket_h)
+
+        # --- Current price marker (vertical line + small triangle) ---
+        cp_x = price_to_x(current_price)
+        cp_x = max(bar_rect.left() + 1, min(cp_x, bar_rect.right() - 1))
+
+        pen = QPen(QColor(255, 255, 255), 2)
+        painter.setPen(pen)
+        painter.drawLine(cp_x, bar_rect.top() - 1, cp_x, bar_rect.bottom() + 1)
+
+        tri = QPainterPath()
+        tri.moveTo(cp_x - 3, bar_rect.bottom() + 2)
+        tri.lineTo(cp_x + 3, bar_rect.bottom() + 2)
+        tri.lineTo(cp_x, bar_rect.bottom() + 5)
+        tri.closeSubpath()
+        painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(QColor(255, 255, 255)))
-        painter.drawEllipse(indicator_x - 4, rect.center().y() - 4, 8, 8)
+        painter.fillPath(tri, QBrush(QColor(255, 255, 255)))
 
-        # Draw text with proper formatting
-        painter.setPen(QColor(255, 255, 255))
-        if is_valid:
-            text = f"{self._format_price(price_lower)} | {self._format_price(current_price)} | {self._format_price(price_upper)}"
+        # --- Price labels (one row: lower | current | upper) ---
+        font = painter.font()
+        font.setPointSize(6)
+        painter.setFont(font)
+
+        label_y = bar_rect.bottom() + 6
+        label_h = 12
+
+        # Lower price — left-aligned
+        painter.setPen(QColor(130, 130, 140))
+        painter.drawText(
+            rect.left(), label_y, rect.width() // 3, label_h,
+            Qt.AlignmentFlag.AlignLeft,
+            self._format_price(price_lower)
+        )
+
+        # Upper price — right-aligned
+        painter.drawText(
+            rect.right() - rect.width() // 3, label_y, rect.width() // 3, label_h,
+            Qt.AlignmentFlag.AlignRight,
+            self._format_price(price_upper)
+        )
+
+        # Current price — centered at marker position, colored
+        if in_range:
+            painter.setPen(QColor(0, 230, 180))
         else:
-            text = "Invalid price data"
-        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+            painter.setPen(QColor(255, 152, 0))
+        painter.drawText(
+            cp_x - 30, label_y, 60, label_h,
+            Qt.AlignmentFlag.AlignCenter,
+            self._format_price(current_price)
+        )
 
         painter.restore()
 
@@ -327,6 +432,55 @@ class LoadPositionWorker(QThread):
                 'protocol': self.protocol  # v4 or v4_pancake
             }
 
+            # Get current pool state (price, tick) and token info for V4
+            try:
+                from src.contracts.v4.pool_manager import V4PoolManager
+
+                # Create V4PoolManager directly — provider may be V3 and lack pool_manager
+                chain_id = getattr(self.provider, 'chain_id', 56)
+                pool_mgr = V4PoolManager(
+                    self.provider.w3,
+                    protocol=target_protocol,
+                    chain_id=chain_id
+                )
+
+                pool_state = pool_mgr.get_pool_state(v4_pos.pool_key)
+                if pool_state.initialized:
+                    position['current_tick'] = pool_state.tick
+
+                    # Get token decimals
+                    for addr_field, dec_key, sym_key in [
+                        (v4_pos.pool_key.currency0, 'token0_decimals', 'token0_symbol'),
+                        (v4_pos.pool_key.currency1, 'token1_decimals', 'token1_symbol'),
+                    ]:
+                        if addr_field and addr_field != "0x0000000000000000000000000000000000000000":
+                            try:
+                                token_contract = self.provider.w3.eth.contract(
+                                    address=Web3.to_checksum_address(addr_field),
+                                    abi=[
+                                        {"constant":True,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"},
+                                        {"constant":True,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"type":"function"},
+                                    ]
+                                )
+                                position[dec_key] = token_contract.functions.decimals().call()
+                                position[sym_key] = token_contract.functions.symbol().call()
+                            except Exception:
+                                position[dec_key] = 18
+
+                    dec0 = position.get('token0_decimals', 18)
+                    dec1 = position.get('token1_decimals', 18)
+                    current_price = pool_mgr.sqrt_price_x96_to_price(
+                        pool_state.sqrt_price_x96, dec0, dec1
+                    )
+                    position['current_price'] = current_price
+                    print(f"[V4 Load] Pool state: tick={pool_state.tick}, price={current_price:.10f}")
+                else:
+                    print(f"[V4 Load] Pool not initialized for this pool key")
+            except Exception as e:
+                import traceback
+                print(f"[V4 Load] Could not get pool state: {e}")
+                traceback.print_exc()
+
             print(f"[V4 Load] Emitting position_loaded signal")
             self.position_loaded.emit(self.token_id, position)
             print(f"[V4 Load] Done loading position {self.token_id}")
@@ -452,6 +606,41 @@ class ScanWalletWorker(QThread):
                             'tokens_owed1': 0,
                             'protocol': self.protocol  # v4_uniswap or v4_pancake
                         }
+
+                        # Load pool state (current tick/price) and token decimals
+                        try:
+                            from src.contracts.v4.pool_manager import V4PoolManager
+                            chain_id = getattr(self.provider, 'chain_id', 56)
+                            pool_mgr = V4PoolManager(
+                                self.provider.w3,
+                                protocol=target_protocol,
+                                chain_id=chain_id
+                            )
+                            pool_state = pool_mgr.get_pool_state(v4_pos.pool_key)
+                            if pool_state.initialized:
+                                position['current_tick'] = pool_state.tick
+                                # Get token decimals
+                                for addr_field, dec_key in [
+                                    (v4_pos.pool_key.currency0, 'token0_decimals'),
+                                    (v4_pos.pool_key.currency1, 'token1_decimals'),
+                                ]:
+                                    if addr_field and addr_field != "0x0000000000000000000000000000000000000000":
+                                        try:
+                                            tc = self.provider.w3.eth.contract(
+                                                address=Web3.to_checksum_address(addr_field),
+                                                abi=[{"constant":True,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"}]
+                                            )
+                                            position[dec_key] = tc.functions.decimals().call()
+                                        except Exception:
+                                            position[dec_key] = 18
+                                dec0 = position.get('token0_decimals', 18)
+                                dec1 = position.get('token1_decimals', 18)
+                                position['current_price'] = pool_mgr.sqrt_price_x96_to_price(
+                                    pool_state.sqrt_price_x96, dec0, dec1
+                                )
+                        except Exception as pool_err:
+                            self.progress.emit(f"Could not get pool state for {token_id}: {pool_err}")
+
                         self.position_found.emit(token_id, position)
                     except Exception as e:
                         self.progress.emit(f"Error loading V4 position {token_id}: {e}")
@@ -1107,6 +1296,10 @@ class ManageTab(QWidget):
         self.setup_ui()
         self._load_saved_positions()
 
+    def reload_settings(self):
+        """Reload settings from QSettings (called when settings dialog closes)."""
+        pass  # manage_tab reads QSettings at operation time
+
     def setup_ui(self):
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
@@ -1210,9 +1403,23 @@ class ManageTab(QWidget):
 
         self.positions_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.positions_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.positions_table.setSortingEnabled(True)
         self.positions_table.setMinimumHeight(550)
 
         table_layout.addWidget(self.positions_table)
+
+        # PnL summary row
+        pnl_row = QHBoxLayout()
+        self.pnl_summary_label = QLabel("Total: —")
+        self.pnl_summary_label.setStyleSheet("color: #aaa; font-size: 12px; padding: 4px 8px;")
+        pnl_row.addWidget(self.pnl_summary_label)
+        pnl_row.addStretch()
+
+        self.refresh_pnl_btn = QPushButton("Refresh PnL")
+        self.refresh_pnl_btn.setToolTip("Refresh all positions and recalculate PnL")
+        self.refresh_pnl_btn.clicked.connect(self._refresh_pnl)
+        pnl_row.addWidget(self.refresh_pnl_btn)
+        table_layout.addLayout(pnl_row)
 
         layout.addWidget(table_group)
 
@@ -1693,6 +1900,9 @@ class ManageTab(QWidget):
 
     def _on_scan_finished(self, total_found: int, token_ids: list, protocol: str = "v3"):
         """Handle scan completion."""
+        if self.scan_worker is not None:
+            self.scan_worker.deleteLater()
+            self.scan_worker = None
         self.progress_bar.hide()
         self.scan_btn.setEnabled(True)
         self.load_btn.setEnabled(True)
@@ -1713,6 +1923,7 @@ class ManageTab(QWidget):
 
         # Rebuild table with filter
         self._rebuild_table()
+        self._update_pnl_summary()
 
         if protocol == "v4_pancake":
             protocol_name = "PancakeSwap V4"
@@ -1751,16 +1962,27 @@ class ManageTab(QWidget):
         """Handle worker completion."""
         if worker in self.load_workers:
             self.load_workers.remove(worker)
+            worker.deleteLater()
 
         if not self.load_workers:
             self.progress_bar.hide()
             # Save all positions ONCE after ALL workers have finished
             # This prevents race condition when multiple workers complete simultaneously
             self._save_positions()
+            self._update_pnl_summary()
             self._log(f"All positions loaded ({len(self.positions_data)} total)")
 
     def _update_table_row(self, token_id: int, position: dict):
         """Update or add a table row for a position."""
+        # Temporarily disable sorting while updating to avoid row index corruption
+        self.positions_table.setSortingEnabled(False)
+        try:
+            self._update_table_row_inner(token_id, position)
+        finally:
+            self.positions_table.setSortingEnabled(True)
+
+    def _update_table_row_inner(self, token_id: int, position: dict):
+        """Inner implementation of table row update."""
         # Find existing row or create new
         row = -1
         for r in range(self.positions_table.rowCount()):
@@ -1789,9 +2011,7 @@ class ManageTab(QWidget):
         # Check if it's a V4 protocol (either "v4" or "v4_pancake")
         is_v4 = protocol and protocol.startswith("v4")
         protocol_prefix = "V4" if is_v4 else "V3"
-        token_id_item = QTableWidgetItem(f"{protocol_prefix}:{token_id}")
-        # Store raw token_id for later use
-        token_id_item.setData(Qt.ItemDataRole.UserRole, token_id)
+        token_id_item = NumericTableWidgetItem(f"{protocol_prefix}:{token_id}", float(token_id))
         self.positions_table.setItem(row, 0, token_id_item)
 
         # Detect if token0 is a stablecoin (need to invert prices)
@@ -1949,21 +2169,61 @@ class ManageTab(QWidget):
             price_range_str = f"${price_lower:,.0f} - ${price_upper:,.0f}"
         self.positions_table.setItem(row, 3, QTableWidgetItem(price_range_str))
 
-        # Liquidity (format large numbers more readably)
+        # Liquidity — convert raw L to USD value
         liquidity = position.get('liquidity', 0)
-        if liquidity >= 1e18:
-            liq_str = f"{liquidity/1e18:.2f}e18"
-        elif liquidity >= 1e15:
-            liq_str = f"{liquidity/1e15:.2f}e15"
-        elif liquidity >= 1e12:
-            liq_str = f"{liquidity/1e12:.2f}T"
-        elif liquidity >= 1e9:
-            liq_str = f"{liquidity/1e9:.2f}B"
-        elif liquidity >= 1e6:
-            liq_str = f"{liquidity/1e6:.2f}M"
+        current_tick = position.get('current_tick', None)
+        usd_value = 0.0
+        try:
+            if liquidity > 0 and ticks_valid and current_tick is not None:
+                # sqrt prices from ticks
+                sqrt_lower = 1.0001 ** (tick_lower / 2)
+                sqrt_upper = 1.0001 ** (tick_upper / 2)
+                sqrt_current = 1.0001 ** (current_tick / 2)
+
+                amounts = calculate_amounts(sqrt_current, sqrt_lower, sqrt_upper, liquidity)
+                amount0_human = amounts.amount0 / (10 ** dec0) if amounts.amount0 > 0 else 0
+                amount1_human = amounts.amount1 / (10 ** dec1) if amounts.amount1 > 0 else 0
+
+                if token0_is_stable and not token1_is_stable:
+                    # token0 is USD, token1 is volatile; raw price = token1/token0
+                    # current_price (inverted) = USD per volatile token
+                    if price_upper > 0 and price_lower > 0:
+                        mid_price = (price_lower + price_upper) / 2
+                        usd_value = amount0_human + amount1_human * mid_price
+                    else:
+                        usd_value = amount0_human
+                elif token1_is_stable and not token0_is_stable:
+                    # token1 is USD, token0 is volatile; raw price = token1/token0
+                    raw_current = position.get('current_price', 0)
+                    if raw_current and raw_current > 0:
+                        usd_value = amount1_human + amount0_human * raw_current
+                    else:
+                        usd_value = amount1_human
+                else:
+                    # No stablecoin — show raw L as fallback
+                    usd_value = -1
+        except (OverflowError, ValueError, ZeroDivisionError):
+            usd_value = -1
+
+        if usd_value >= 0:
+            if usd_value >= 1000:
+                liq_str = f"${usd_value:,.0f}"
+            elif usd_value >= 1:
+                liq_str = f"${usd_value:.2f}"
+            elif usd_value >= 0.01:
+                liq_str = f"${usd_value:.4f}"
+            else:
+                liq_str = f"${usd_value:.6f}"
         else:
-            liq_str = f"{liquidity:,.0f}"
-        liq_item = QTableWidgetItem(liq_str)
+            # Fallback: no stablecoin or error
+            if liquidity >= 1e18:
+                liq_str = f"{liquidity/1e18:.2f}e18"
+            elif liquidity >= 1e6:
+                liq_str = f"{liquidity/1e6:.2f}M"
+            else:
+                liq_str = f"{liquidity:,.0f}"
+
+        liq_item = NumericTableWidgetItem(liq_str, usd_value)
         self.positions_table.setItem(row, 4, liq_item)
 
         # Fees Earned (tokens_owed)
@@ -1981,18 +2241,36 @@ class ManageTab(QWidget):
         else:
             fees_str = f"{fees0_formatted:.6f} / {fees1_formatted:.4f}"
             stable_fees = fees1_formatted
-        self.positions_table.setItem(row, 5, QTableWidgetItem(fees_str))
+        fees_item = NumericTableWidgetItem(fees_str, stable_fees)
+        self.positions_table.setItem(row, 5, fees_item)
 
-        # PnL (simplified - just stablecoin fees for now)
-        pnl_str = f"+${stable_fees:.4f}" if stable_fees > 0 else "$0.00"
-        pnl_item = QTableWidgetItem(pnl_str)
-        if stable_fees > 0:
-            pnl_item.setForeground(QColor(76, 175, 80))
+        # PnL — show per-position value relative to proportional initial investment
+        initial_total = self.initial_investment_spin.value()
+        active_positions = sum(
+            1 for p in self.positions_data.values()
+            if isinstance(p, dict) and p.get('liquidity', 0) > 0
+        )
+        if initial_total > 0 and active_positions > 0 and usd_value > 0:
+            initial_per_pos = initial_total / active_positions
+            pnl_val = usd_value + stable_fees - initial_per_pos
+            pnl_sign = "+" if pnl_val >= 0 else ""
+            pnl_str = f"{pnl_sign}${pnl_val:.2f}"
+            pnl_item = NumericTableWidgetItem(pnl_str, pnl_val)
+            pnl_item.setForeground(QColor(76, 175, 80) if pnl_val >= 0 else QColor(255, 107, 107))
+        elif usd_value > 0:
+            # No initial investment set — show current value as "worth"
+            pnl_str = f"${usd_value:.2f}"
+            pnl_item = NumericTableWidgetItem(pnl_str, usd_value)
+            if stable_fees > 0:
+                pnl_str = f"${usd_value:.2f} +${stable_fees:.4f}"
+                pnl_item = NumericTableWidgetItem(pnl_str, usd_value + stable_fees)
+            pnl_item.setForeground(QColor(200, 200, 200))
+        else:
+            pnl_item = NumericTableWidgetItem("—", 0.0)
         self.positions_table.setItem(row, 6, pnl_item)
 
-        # Status
-        current_tick = position.get('current_tick', 0)
-        in_range = tick_lower <= current_tick <= tick_upper if current_tick else False
+        # Status (current_tick already fetched above for liquidity calc)
+        in_range = tick_lower <= current_tick <= tick_upper if current_tick is not None else False
 
         if liquidity == 0:
             status = "Empty"
@@ -2046,7 +2324,7 @@ class ManageTab(QWidget):
         self.positions_table.setItem(row, 8, progress_item)
 
         # Set row height for progress bar
-        self.positions_table.setRowHeight(row, 40)
+        self.positions_table.setRowHeight(row, 44)
 
     def _refresh_all_positions(self):
         """Refresh all loaded positions."""
@@ -2084,6 +2362,89 @@ class ManageTab(QWidget):
                 self._log(f"Refreshing {len(ids)} {protocol} positions...")
                 self._load_positions_by_ids(ids, protocol=protocol)
 
+    def _refresh_pnl(self):
+        """Refresh PnL — reload all positions and update PnL summary."""
+        if not self.provider:
+            QMessageBox.warning(self, "Error", "Connect wallet first")
+            return
+        self._refresh_all_positions()
+        # Summary will be updated as positions load in _on_position_loaded → _update_pnl_summary
+
+    def _update_pnl_summary(self):
+        """Calculate and display PnL summary below the table."""
+        total_value = 0.0
+        total_fees = 0.0
+        active_count = 0
+        from config import STABLECOINS
+
+        for token_id, position in self.positions_data.items():
+            if not isinstance(position, dict):
+                continue
+            liquidity = position.get('liquidity', 0)
+            if liquidity <= 0:
+                continue
+            active_count += 1
+
+            # Calculate current USD value
+            tick_lower = position.get('tick_lower', 0)
+            tick_upper = position.get('tick_upper', 0)
+            current_tick = position.get('current_tick', None)
+            dec0 = position.get('token0_decimals', 18)
+            dec1 = position.get('token1_decimals', 18)
+            token0 = position.get('token0', '').lower()
+            token1 = position.get('token1', '').lower()
+            token0_is_stable = token0 in STABLECOINS
+            token1_is_stable = token1 in STABLECOINS
+
+            try:
+                if current_tick is not None and tick_lower < tick_upper:
+                    sqrt_lower = 1.0001 ** (tick_lower / 2)
+                    sqrt_upper = 1.0001 ** (tick_upper / 2)
+                    sqrt_current = 1.0001 ** (current_tick / 2)
+                    amounts = calculate_amounts(sqrt_current, sqrt_lower, sqrt_upper, liquidity)
+                    a0 = amounts.amount0 / (10 ** dec0) if amounts.amount0 > 0 else 0
+                    a1 = amounts.amount1 / (10 ** dec1) if amounts.amount1 > 0 else 0
+
+                    raw_price = position.get('current_price', 0)
+                    if token0_is_stable and not token1_is_stable:
+                        # token0 is USD; raw_price = token1/token0; invert to get USD per volatile
+                        if raw_price and raw_price > 0:
+                            usd = a0 + a1 * (1 / raw_price)
+                        else:
+                            usd = a0
+                    elif token1_is_stable and not token0_is_stable:
+                        usd = a1 + a0 * (raw_price if raw_price > 0 else 0)
+                    else:
+                        usd = 0
+                    total_value += usd
+            except Exception:
+                pass
+
+            # Fees
+            fees0 = position.get('tokens_owed0', 0)
+            fees1 = position.get('tokens_owed1', 0)
+            if token0_is_stable:
+                total_fees += fees0 / (10 ** dec0)
+            elif token1_is_stable:
+                total_fees += fees1 / (10 ** dec1)
+
+        # Build summary text
+        initial = self.initial_investment_spin.value()
+        parts = [f"Positions: {active_count}", f"Value: ${total_value:.2f}"]
+        if total_fees > 0:
+            parts.append(f"Fees: ${total_fees:.4f}")
+        if initial > 0:
+            pnl = total_value + total_fees - initial
+            pnl_sign = "+" if pnl >= 0 else ""
+            pnl_pct = (pnl / initial * 100) if initial > 0 else 0
+            parts.append(f"PnL: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_pct:.1f}%)")
+            color = "#00b894" if pnl >= 0 else "#ff6b6b"
+            self.pnl_summary_label.setStyleSheet(f"color: {color}; font-size: 12px; padding: 4px 8px;")
+        else:
+            self.pnl_summary_label.setStyleSheet("color: #aaa; font-size: 12px; padding: 4px 8px;")
+
+        self.pnl_summary_label.setText(" | ".join(parts))
+
     def _update_buttons(self):
         """Update button states based on positions."""
         has_positions = len(self.positions_data) > 0
@@ -2111,9 +2472,11 @@ class ManageTab(QWidget):
         for row in selected_rows:
             item = self.positions_table.item(row, 0)
             if item:
-                # Try to get from UserRole first (raw token_id)
-                token_id = item.data(Qt.ItemDataRole.UserRole)
-                if token_id is None:
+                # Try to get from UserRole first (raw token_id, stored as float)
+                raw_id = item.data(Qt.ItemDataRole.UserRole)
+                if raw_id is not None:
+                    token_id = int(raw_id)
+                else:
                     # Fallback: parse from text (may have "V3:" or "V4:" prefix)
                     text = item.text()
                     if ":" in text:
@@ -2280,6 +2643,9 @@ class ManageTab(QWidget):
 
     def _on_batch_close_finished(self, success: bool, message: str, data: dict):
         """Handle batch close completion."""
+        if self.worker is not None:
+            self.worker.deleteLater()
+            self.worker = None
         self.progress_bar.hide()
         self.close_selected_btn.setEnabled(True)
         self.close_all_btn.setEnabled(True)
@@ -2425,6 +2791,9 @@ class ManageTab(QWidget):
 
     def _on_close_finished(self, success: bool, message: str, data: dict):
         """Handle close completion."""
+        if self.worker is not None:
+            self.worker.deleteLater()
+            self.worker = None
         self.progress_bar.hide()
         self.close_selected_btn.setEnabled(True)
         self.close_all_btn.setEnabled(True)

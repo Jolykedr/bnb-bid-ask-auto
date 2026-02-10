@@ -10,6 +10,7 @@ from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
 from decimal import Decimal
 from web3 import Web3
+from .utils import NonceManager
 
 logger = logging.getLogger(__name__)
 
@@ -312,9 +313,10 @@ class DexSwap:
         )
     """
 
-    def __init__(self, w3: Web3, chain_id: int = 56):
+    def __init__(self, w3: Web3, chain_id: int = 56, nonce_manager: 'NonceManager' = None):
         self.w3 = w3
         self.chain_id = chain_id
+        self.nonce_manager = nonce_manager
 
         if chain_id not in ROUTER_V2_ADDRESSES:
             raise ValueError(f"Unsupported chain ID: {chain_id}")
@@ -575,25 +577,39 @@ class DexSwap:
             )
 
             # Использовать multicall с deadline
-            tx = self.router_v3.functions.multicall(
-                deadline,
-                [swap_data]
-            ).build_transaction({
-                'from': wallet_address,
-                'nonce': self.w3.eth.get_transaction_count(wallet_address, 'pending'),
-                'gas': 350000,
-                'gasPrice': self.w3.eth.gas_price,
-                'value': 0
-            })
+            nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
+                    self.w3.eth.get_transaction_count(wallet_address, 'pending')
 
-            # Подписать и отправить
-            signed_tx = self.w3.eth.account.sign_transaction(tx, private_key)
-            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            try:
+                tx = self.router_v3.functions.multicall(
+                    deadline,
+                    [swap_data]
+                ).build_transaction({
+                    'from': wallet_address,
+                    'nonce': nonce,
+                    'gas': 350000,
+                    'gasPrice': self.w3.eth.gas_price,
+                    'value': 0
+                })
 
-            logger.info(f"V3 Swap TX sent: {tx_hash.hex()}")
+                # Подписать и отправить
+                signed_tx = self.w3.eth.account.sign_transaction(tx, private_key)
+                tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
 
-            # Ждём подтверждения
-            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+                logger.info(f"V3 Swap TX sent: {tx_hash.hex()}")
+
+                # Ждём подтверждения
+                receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+                if self.nonce_manager:
+                    if receipt.status == 1:
+                        self.nonce_manager.confirm_transaction(nonce)
+                    else:
+                        self.nonce_manager.release_nonce(nonce)
+            except Exception as e:
+                if self.nonce_manager:
+                    self.nonce_manager.release_nonce(nonce)
+                raise
 
             if receipt.status == 1:
                 to_decimals = self.get_token_decimals(to_token)
@@ -655,22 +671,38 @@ class DexSwap:
             logger.info(f"Approving token for {self.dex_name_v3}...")
 
             max_uint256 = 2**256 - 1
-            tx = token_contract.functions.approve(
-                self.router_v3_address, max_uint256
-            ).build_transaction({
-                'from': wallet_address,
-                'nonce': self.w3.eth.get_transaction_count(wallet_address, 'pending'),
-                'gas': 100000,
-                'gasPrice': self.w3.eth.gas_price
-            })
+            nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
+                    self.w3.eth.get_transaction_count(wallet_address, 'pending')
 
-            signed_tx = self.w3.eth.account.sign_transaction(tx, private_key)
-            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            try:
+                tx = token_contract.functions.approve(
+                    self.router_v3_address, max_uint256
+                ).build_transaction({
+                    'from': wallet_address,
+                    'nonce': nonce,
+                    'gas': 100000,
+                    'gasPrice': self.w3.eth.gas_price
+                })
 
-            logger.info(f"V3 Approve TX: {tx_hash.hex()}")
+                signed_tx = self.w3.eth.account.sign_transaction(tx, private_key)
+                tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
 
-            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-            return receipt.status == 1
+                logger.info(f"V3 Approve TX: {tx_hash.hex()}")
+
+                receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+                if self.nonce_manager:
+                    if receipt.status == 1:
+                        self.nonce_manager.confirm_transaction(nonce)
+                    else:
+                        self.nonce_manager.release_nonce(nonce)
+
+                return receipt.status == 1
+
+            except Exception as e:
+                if self.nonce_manager:
+                    self.nonce_manager.release_nonce(nonce)
+                raise
 
         except Exception as e:
             logger.error(f"Failed to approve for V3: {e}")
@@ -705,22 +737,38 @@ class DexSwap:
             logger.info(f"Approving token for {self.dex_name}...")
 
             max_uint256 = 2**256 - 1
-            tx = token_contract.functions.approve(
-                self.router_address, max_uint256
-            ).build_transaction({
-                'from': wallet_address,
-                'nonce': self.w3.eth.get_transaction_count(wallet_address, 'pending'),
-                'gas': 100000,
-                'gasPrice': self.w3.eth.gas_price
-            })
+            nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
+                    self.w3.eth.get_transaction_count(wallet_address, 'pending')
 
-            signed_tx = self.w3.eth.account.sign_transaction(tx, private_key)
-            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            try:
+                tx = token_contract.functions.approve(
+                    self.router_address, max_uint256
+                ).build_transaction({
+                    'from': wallet_address,
+                    'nonce': nonce,
+                    'gas': 100000,
+                    'gasPrice': self.w3.eth.gas_price
+                })
 
-            logger.info(f"Approve TX: {tx_hash.hex()}")
+                signed_tx = self.w3.eth.account.sign_transaction(tx, private_key)
+                tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
 
-            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-            return receipt.status == 1
+                logger.info(f"Approve TX: {tx_hash.hex()}")
+
+                receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+                if self.nonce_manager:
+                    if receipt.status == 1:
+                        self.nonce_manager.confirm_transaction(nonce)
+                    else:
+                        self.nonce_manager.release_nonce(nonce)
+
+                return receipt.status == 1
+
+            except Exception as e:
+                if self.nonce_manager:
+                    self.nonce_manager.release_nonce(nonce)
+                raise
 
         except Exception as e:
             logger.error(f"Failed to approve: {e}")
@@ -909,41 +957,55 @@ class DexSwap:
             deadline = int(time.time()) + (deadline_minutes * 60)
 
             # Построить транзакцию
-            if use_fee_on_transfer:
-                tx = self.router.functions.swapExactTokensForTokensSupportingFeeOnTransferTokens(
-                    amount_in,
-                    min_out,
-                    path,
-                    wallet_address,
-                    deadline
-                ).build_transaction({
-                    'from': wallet_address,
-                    'nonce': self.w3.eth.get_transaction_count(wallet_address, 'pending'),
-                    'gas': 300000,
-                    'gasPrice': self.w3.eth.gas_price
-                })
-            else:
-                tx = self.router.functions.swapExactTokensForTokens(
-                    amount_in,
-                    min_out,
-                    path,
-                    wallet_address,
-                    deadline
-                ).build_transaction({
-                    'from': wallet_address,
-                    'nonce': self.w3.eth.get_transaction_count(wallet_address, 'pending'),
-                    'gas': 300000,
-                    'gasPrice': self.w3.eth.gas_price
-                })
+            nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
+                    self.w3.eth.get_transaction_count(wallet_address, 'pending')
 
-            # Подписать и отправить
-            signed_tx = self.w3.eth.account.sign_transaction(tx, private_key)
-            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            try:
+                if use_fee_on_transfer:
+                    tx = self.router.functions.swapExactTokensForTokensSupportingFeeOnTransferTokens(
+                        amount_in,
+                        min_out,
+                        path,
+                        wallet_address,
+                        deadline
+                    ).build_transaction({
+                        'from': wallet_address,
+                        'nonce': nonce,
+                        'gas': 300000,
+                        'gasPrice': self.w3.eth.gas_price
+                    })
+                else:
+                    tx = self.router.functions.swapExactTokensForTokens(
+                        amount_in,
+                        min_out,
+                        path,
+                        wallet_address,
+                        deadline
+                    ).build_transaction({
+                        'from': wallet_address,
+                        'nonce': nonce,
+                        'gas': 300000,
+                        'gasPrice': self.w3.eth.gas_price
+                    })
 
-            logger.info(f"V2 Swap TX sent: {tx_hash.hex()}")
+                # Подписать и отправить
+                signed_tx = self.w3.eth.account.sign_transaction(tx, private_key)
+                tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
 
-            # Ждём подтверждения
-            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+                logger.info(f"V2 Swap TX sent: {tx_hash.hex()}")
+
+                # Ждём подтверждения
+                receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+                if self.nonce_manager:
+                    if receipt.status == 1:
+                        self.nonce_manager.confirm_transaction(nonce)
+                    else:
+                        self.nonce_manager.release_nonce(nonce)
+            except Exception as e:
+                if self.nonce_manager:
+                    self.nonce_manager.release_nonce(nonce)
+                raise
 
             if receipt.status == 1:
                 actual_out = expected_out

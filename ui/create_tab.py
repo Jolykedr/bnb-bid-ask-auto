@@ -1984,6 +1984,15 @@ class CreateTab(QWidget):
 
         raise ValueError(f"Unknown token: {symbol}")
 
+    def reload_settings(self):
+        """Reload settings from QSettings (called when settings dialog closes)."""
+        tx_settings = QSettings("BNBLiquidityLadder", "Settings")
+        gas_override = tx_settings.value("tx/gas_limit_override", 0, type=int)
+        if gas_override > 0:
+            self.gas_limit_spin.setValue(gas_override)
+        slippage = tx_settings.value("tx/slippage", 0.5, type=float)
+        self.slippage_spin.setValue(slippage)
+
     def _load_saved_wallet(self):
         """Load saved wallet from settings (with master password decryption)."""
         try:

@@ -178,6 +178,7 @@ class TestUniswapV3PositionManager:
             ))
 
             pm.contract = mock_contract
+            pm.nonce_manager = None
             return pm
 
     def test_get_position_returns_dict(self, pm):

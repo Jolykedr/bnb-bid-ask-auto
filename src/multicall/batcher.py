@@ -19,6 +19,7 @@ from eth_abi import decode
 import time
 
 from ..contracts.abis import MULTICALL3_ABI, POSITION_MANAGER_ABI
+from ..utils import NonceManager
 
 # Настройка логгера
 logger = logging.getLogger(__name__)
@@ -81,10 +82,12 @@ class Multicall3Batcher:
         self,
         w3: Web3,
         account: LocalAccount = None,
-        multicall_address: str = MULTICALL3_ADDRESS
+        multicall_address: str = MULTICALL3_ADDRESS,
+        nonce_manager: 'NonceManager' = None
     ):
         self.w3 = w3
         self.account = account
+        self.nonce_manager = nonce_manager
         self.multicall_address = Web3.to_checksum_address(multicall_address)
         self.contract: Contract = w3.eth.contract(
             address=self.multicall_address,
@@ -389,39 +392,54 @@ class Multicall3Batcher:
                 gas_limit = 3000000  # fallback
 
         # Построение транзакции
-        tx_params = {
-            'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
-            'gas': gas_limit,
-        }
+        nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
+                self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
-        # EIP-1559 или legacy
-        if max_priority_fee:
-            tx_params['maxPriorityFeePerGas'] = max_priority_fee
-            tx_params['maxFeePerGas'] = self.w3.eth.gas_price * 2
-        else:
-            tx_params['gasPrice'] = gas_price or self.w3.eth.gas_price
+        try:
+            tx_params = {
+                'from': self.account.address,
+                'nonce': nonce,
+                'gas': gas_limit,
+            }
 
-        # Используем multicall Position Manager'а
-        tx = pm_contract.functions.multicall(call_data_list).build_transaction(tx_params)
+            # EIP-1559 или legacy
+            if max_priority_fee:
+                tx_params['maxPriorityFeePerGas'] = max_priority_fee
+                tx_params['maxFeePerGas'] = self.w3.eth.gas_price * 2
+            else:
+                tx_params['gasPrice'] = gas_price or self.w3.eth.gas_price
 
-        # Подпись и отправка
-        signed = self.account.sign_transaction(tx)
-        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            # Используем multicall Position Manager'а
+            tx = pm_contract.functions.multicall(call_data_list).build_transaction(tx_params)
 
-        logger.info(f"Transaction sent: {tx_hash.hex()}")
+            # Подпись и отправка
+            signed = self.account.sign_transaction(tx)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
 
-        # Ожидание подтверждения с таймаутом
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+            logger.info(f"Transaction sent: {tx_hash.hex()}")
 
-        # Декодирование результатов
-        results = []
-        token_ids = []
+            # Ожидание подтверждения с таймаутом
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
 
-        # Парсим события для получения token_ids
-        token_ids = self._parse_events_from_receipt(receipt, position_manager_address)
+            if self.nonce_manager:
+                if receipt['status'] == 1:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
 
-        return tx_hash.hex(), results, receipt, token_ids
+            # Декодирование результатов
+            results = []
+            token_ids = []
+
+            # Парсим события для получения token_ids
+            token_ids = self._parse_events_from_receipt(receipt, position_manager_address)
+
+            return tx_hash.hex(), results, receipt, token_ids
+
+        except Exception as e:
+            if self.nonce_manager:
+                self.nonce_manager.release_nonce(nonce)
+            raise
 
     def simulate(self, position_manager_address: str = None) -> List[CallResult]:
         """

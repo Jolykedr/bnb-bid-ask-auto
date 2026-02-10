@@ -13,6 +13,7 @@ import time
 
 from .abis import POSITION_MANAGER_ABI, ERC20_ABI, ERC721_ENUMERABLE_ABI
 from ..math.distribution import BidAskPosition
+from ..utils import NonceManager
 
 
 @dataclass
@@ -76,10 +77,12 @@ class UniswapV3PositionManager:
         self,
         w3: Web3,
         position_manager_address: str,
-        account: LocalAccount = None
+        account: LocalAccount = None,
+        nonce_manager: 'NonceManager' = None
     ):
         self.w3 = w3
         self.account = account
+        self.nonce_manager = nonce_manager
         self.position_manager_address = Web3.to_checksum_address(position_manager_address)
         self.contract: Contract = w3.eth.contract(
             address=self.position_manager_address,
@@ -126,20 +129,35 @@ class UniswapV3PositionManager:
 
         # Делаем approve на максимум
         max_uint256 = 2**256 - 1
-        tx = token.functions.approve(spender, max_uint256).build_transaction({
-            'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
-            'gas': 100000,
-            'gasPrice': self.w3.eth.gas_price
-        })
+        nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
+                self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
-        signed = self.account.sign_transaction(tx)
-        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+        try:
+            tx = token.functions.approve(spender, max_uint256).build_transaction({
+                'from': self.account.address,
+                'nonce': nonce,
+                'gas': 100000,
+                'gasPrice': self.w3.eth.gas_price
+            })
 
-        # Ждём подтверждения с таймаутом
-        self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+            signed = self.account.sign_transaction(tx)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
 
-        return tx_hash.hex()
+            # Ждём подтверждения с таймаутом
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+
+            if self.nonce_manager:
+                if receipt['status'] == 1:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
+
+            return tx_hash.hex()
+
+        except Exception as e:
+            if self.nonce_manager:
+                self.nonce_manager.release_nonce(nonce)
+            raise
 
     def encode_mint(self, params: MintParams, recipient: str, deadline: int = None) -> bytes:
         """
@@ -290,41 +308,56 @@ class UniswapV3PositionManager:
         """
         deadline = int(time.time()) + 3600
 
-        tx = self.contract.functions.mint(
-            params.to_tuple(self.account.address, deadline)
-        ).build_transaction({
-            'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
-            'gas': gas_limit,
-            'gasPrice': self.w3.eth.gas_price
-        })
+        nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
+                self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
-        signed = self.account.sign_transaction(tx)
-        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+        try:
+            tx = self.contract.functions.mint(
+                params.to_tuple(self.account.address, deadline)
+            ).build_transaction({
+                'from': self.account.address,
+                'nonce': nonce,
+                'gas': gas_limit,
+                'gasPrice': self.w3.eth.gas_price
+            })
 
-        # Ждём подтверждения с таймаутом
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+            signed = self.account.sign_transaction(tx)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
 
-        # Парсим события для получения результатов
-        event_data = self._parse_mint_events(receipt)
+            # Ждём подтверждения с таймаутом
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
 
-        if event_data:
+            if self.nonce_manager:
+                if receipt['status'] == 1:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
+
+            # Парсим события для получения результатов
+            event_data = self._parse_mint_events(receipt)
+
+            if event_data:
+                return MintResult(
+                    token_id=event_data['token_id'],
+                    liquidity=event_data['liquidity'],
+                    amount0=event_data['amount0'],
+                    amount1=event_data['amount1'],
+                    tx_hash=tx_hash.hex()
+                )
+
+            # Fallback если не удалось распарсить события
             return MintResult(
-                token_id=event_data['token_id'],
-                liquidity=event_data['liquidity'],
-                amount0=event_data['amount0'],
-                amount1=event_data['amount1'],
+                token_id=0,
+                liquidity=0,
+                amount0=0,
+                amount1=0,
                 tx_hash=tx_hash.hex()
             )
 
-        # Fallback если не удалось распарсить события
-        return MintResult(
-            token_id=0,
-            liquidity=0,
-            amount0=0,
-            amount1=0,
-            tx_hash=tx_hash.hex()
-        )
+        except Exception as e:
+            if self.nonce_manager:
+                self.nonce_manager.release_nonce(nonce)
+            raise
 
     def get_position(self, token_id: int) -> dict:
         """Получение информации о позиции."""

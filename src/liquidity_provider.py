@@ -205,21 +205,22 @@ class LiquidityProvider:
         self.position_manager_address = position_manager_address
         self.position_manager = None
 
-        if position_manager_address:
-            self.position_manager = UniswapV3PositionManager(
-                self.w3,
-                position_manager_address,
-                self.account
-            )
-
-        self.batcher = Multicall3Batcher(self.w3, self.account)
-
         # Initialize utility managers
         self.decimals_cache = DecimalsCache(self.w3)
         self.gas_estimator = GasEstimator(self.w3, buffer_percent=20)
         self.nonce_manager = None
         if self.account:
             self.nonce_manager = NonceManager(self.w3, self.account.address)
+
+        if position_manager_address:
+            self.position_manager = UniswapV3PositionManager(
+                self.w3,
+                position_manager_address,
+                self.account,
+                nonce_manager=self.nonce_manager
+            )
+
+        self.batcher = Multicall3Batcher(self.w3, self.account, nonce_manager=self.nonce_manager)
 
     def preview_ladder(self, config: LiquidityLadderConfig) -> List[BidAskPosition]:
         """

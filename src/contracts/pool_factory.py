@@ -14,6 +14,7 @@ import time
 import math
 
 from .abis import ERC20_ABI
+from ..utils import NonceManager
 
 # Настройка логгера
 logger = logging.getLogger(__name__)
@@ -173,11 +174,13 @@ class PoolFactory:
         w3: Web3,
         account: LocalAccount = None,
         factory_address: str = None,
-        chain_id: int = 56
+        chain_id: int = 56,
+        nonce_manager: 'NonceManager' = None
     ):
         self.w3 = w3
         self.account = account
         self.chain_id = chain_id
+        self.nonce_manager = nonce_manager
 
         # Use provided address or default for chain
         if factory_address:
@@ -381,34 +384,49 @@ class PoolFactory:
             raise ValueError(f"Pool already exists at {existing}")
 
         # Build transaction
-        tx = self.factory.functions.createPool(
-            token0, token1, fee
-        ).build_transaction({
-            'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
-            'gas': 5000000,
-            'gasPrice': self.w3.eth.gas_price
-        })
+        nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
+                self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
-        # Sign and send
-        signed = self.account.sign_transaction(tx)
-        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-
-        # Wait for receipt
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
-
-        # Parse PoolCreated event to get pool address
-        pool_address = None
         try:
-            events = self.factory.events.PoolCreated().process_receipt(receipt)
-            if events:
-                pool_address = events[0]['args']['pool']
-        except Exception as e:
-            logger.debug(f"Failed to parse PoolCreated event: {e}")
-            # Fallback: get pool address after creation
-            pool_address = self.get_pool_address(token0, token1, fee)
+            tx = self.factory.functions.createPool(
+                token0, token1, fee
+            ).build_transaction({
+                'from': self.account.address,
+                'nonce': nonce,
+                'gas': 5000000,
+                'gasPrice': self.w3.eth.gas_price
+            })
 
-        return tx_hash.hex(), pool_address
+            # Sign and send
+            signed = self.account.sign_transaction(tx)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+
+            # Wait for receipt
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+
+            if self.nonce_manager:
+                if receipt['status'] == 1:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
+
+            # Parse PoolCreated event to get pool address
+            pool_address = None
+            try:
+                events = self.factory.events.PoolCreated().process_receipt(receipt)
+                if events:
+                    pool_address = events[0]['args']['pool']
+            except Exception as e:
+                logger.debug(f"Failed to parse PoolCreated event: {e}")
+                # Fallback: get pool address after creation
+                pool_address = self.get_pool_address(token0, token1, fee)
+
+            return tx_hash.hex(), pool_address
+
+        except Exception as e:
+            if self.nonce_manager:
+                self.nonce_manager.release_nonce(nonce)
+            raise
 
     def initialize_pool(
         self,
@@ -445,21 +463,36 @@ class PoolFactory:
         sqrt_price_x96 = int(sqrt_price * (2 ** 96))
 
         # Build transaction
-        tx = pool.functions.initialize(sqrt_price_x96).build_transaction({
-            'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
-            'gas': 500000,
-            'gasPrice': self.w3.eth.gas_price
-        })
+        nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
+                self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
-        # Sign and send
-        signed = self.account.sign_transaction(tx)
-        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+        try:
+            tx = pool.functions.initialize(sqrt_price_x96).build_transaction({
+                'from': self.account.address,
+                'nonce': nonce,
+                'gas': 500000,
+                'gasPrice': self.w3.eth.gas_price
+            })
 
-        # Wait for receipt
-        self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+            # Sign and send
+            signed = self.account.sign_transaction(tx)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
 
-        return tx_hash.hex()
+            # Wait for receipt
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+
+            if self.nonce_manager:
+                if receipt['status'] == 1:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
+
+            return tx_hash.hex()
+
+        except Exception as e:
+            if self.nonce_manager:
+                self.nonce_manager.release_nonce(nonce)
+            raise
 
     def create_and_initialize_pool(
         self,

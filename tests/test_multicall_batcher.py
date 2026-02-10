@@ -194,6 +194,7 @@ def _make_batcher(mock_w3, mock_account, mock_pm=None):
         b.multicall_address = MULTICALL3_ADDRESS
         b.contract = Mock()
         b.calls = []
+        b.nonce_manager = None
         b._pm_contract = None
         b._get_pm_contract = Mock(return_value=mock_pm)
         return b

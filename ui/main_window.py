@@ -231,8 +231,12 @@ class MainWindow(QMainWindow):
         """Open settings dialog."""
         dialog = SettingsDialog(self)
         if dialog.exec():
-            # Settings changed, could reload theme etc.
+            # Settings changed - apply live without restart
             self.load_stylesheet()
+            # Notify all tabs to reload settings
+            for tab in [self.create_tab, self.manage_tab, self.advanced_tab, self.calculator_tab]:
+                if hasattr(tab, 'reload_settings'):
+                    tab.reload_settings()
 
     def _show_about(self):
         """Show about dialog."""

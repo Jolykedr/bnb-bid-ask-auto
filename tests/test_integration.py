@@ -52,6 +52,7 @@ class TestLiquidityProviderIntegration:
             provider.position_manager_address = "0xEE55555555555555555555555555555555555555"
             provider.position_manager = Mock(spec=UniswapV3PositionManager)
             provider.batcher = Mock(spec=Multicall3Batcher)
+            provider.nonce_manager = None
             return provider
 
     def test_preview_ladder_calculates_positions(self, provider):
@@ -200,6 +201,7 @@ class TestMulticall3BatcherIntegration:
                 (True, b'\x00' * 32)
             ])
             batcher.contract = mock_contract
+            batcher.nonce_manager = None
 
             return batcher
 
@@ -335,6 +337,7 @@ class TestPositionManagerIntegration:
             ))
 
             pm.contract = mock_contract
+            pm.nonce_manager = None
             return pm
 
     def test_get_position_returns_dict(self, position_manager):

@@ -98,6 +98,20 @@ class SettingsDialog(QDialog):
         gas_row.addStretch()
         tx_group_layout.addLayout(gas_row)
 
+        # Gas limit override
+        gas_limit_row = QHBoxLayout()
+        gas_limit_row.addWidget(QLabel("Gas Limit Override:"))
+        self.gas_limit_spin = QDoubleSpinBox()
+        self.gas_limit_spin.setRange(0, 10000000)
+        self.gas_limit_spin.setValue(0)
+        self.gas_limit_spin.setDecimals(0)
+        self.gas_limit_spin.setSingleStep(100000)
+        self.gas_limit_spin.setSpecialValueText("Auto")
+        self.gas_limit_spin.setToolTip("0 = auto-estimate gas. Set manually for congested networks (e.g. 500000)")
+        gas_limit_row.addWidget(self.gas_limit_spin)
+        gas_limit_row.addStretch()
+        tx_group_layout.addLayout(gas_limit_row)
+
         # Transaction timeout
         timeout_row = QHBoxLayout()
         timeout_row.addWidget(QLabel("Transaction Timeout:"))
@@ -298,6 +312,9 @@ class SettingsDialog(QDialog):
         self.gas_multiplier_spin.setValue(
             self.settings.value("tx/gas_multiplier", 1.2, type=float)
         )
+        self.gas_limit_spin.setValue(
+            self.settings.value("tx/gas_limit_override", 0, type=float)
+        )
         self.timeout_spin.setValue(
             self.settings.value("tx/timeout", 300, type=float)
         )
@@ -311,7 +328,7 @@ class SettingsDialog(QDialog):
             self.settings.value("calc/fee_tier", 1, type=int)
         )
         self.positions_spin.setValue(
-            self.settings.value("calc/positions", 7, type=float)
+            self.settings.value("calc/positions", 7, type=int)
         )
         self.theme_combo.setCurrentIndex(
             self.settings.value("appearance/theme", 0, type=int)
@@ -342,6 +359,7 @@ class SettingsDialog(QDialog):
         self.settings.setValue("network/default_network", self.network_combo.currentIndex())
         self.settings.setValue("tx/slippage", self.slippage_spin.value())
         self.settings.setValue("tx/gas_multiplier", self.gas_multiplier_spin.value())
+        self.settings.setValue("tx/gas_limit_override", int(self.gas_limit_spin.value()))
         self.settings.setValue("tx/timeout", self.timeout_spin.value())
         self.settings.setValue("tx/simulate_first", self.simulate_check.isChecked())
         self.settings.setValue("calc/distribution", self.dist_combo.currentIndex())

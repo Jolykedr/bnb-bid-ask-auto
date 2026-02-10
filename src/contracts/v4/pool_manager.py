@@ -129,6 +129,39 @@ class V4PoolManager:
                 abi=V4_STATE_VIEW_ABI
             )
 
+    def _compute_pool_id(self, pool_key: PoolKey) -> bytes:
+        """
+        Compute pool ID respecting protocol differences.
+
+        Uniswap V4 PoolKey:     (currency0, currency1, fee, tickSpacing, hooks)
+        PancakeSwap V4 PoolKey:  (currency0, currency1, hooks, poolManager, fee, parameters)
+            where parameters = bytes32(uint256(int256(tickSpacing)))
+        """
+        if self.protocol == V4Protocol.PANCAKESWAP:
+            # PancakeSwap V4: PoolKey has different field order and includes poolManager + parameters
+            tick_spacing = pool_key.tick_spacing
+            if tick_spacing >= 0:
+                params_int = tick_spacing
+            else:
+                params_int = (1 << 256) + tick_spacing
+            parameters = params_int.to_bytes(32, 'big')
+
+            encoded = encode(
+                ['address', 'address', 'address', 'address', 'uint24', 'bytes32'],
+                [
+                    Web3.to_checksum_address(pool_key.currency0),
+                    Web3.to_checksum_address(pool_key.currency1),
+                    Web3.to_checksum_address(pool_key.hooks),
+                    self.pool_manager_address,
+                    pool_key.fee,
+                    parameters
+                ]
+            )
+            return Web3.keccak(encoded)
+        else:
+            # Uniswap V4: standard PoolKey encoding
+            return pool_key.get_pool_id()
+
     def get_pool_state(self, pool_key: PoolKey) -> V4PoolState:
         """
         Get pool state information.
@@ -139,18 +172,22 @@ class V4PoolManager:
         Returns:
             V4PoolState with current pool state
         """
-        pool_id = pool_key.get_pool_id()
+        pool_id = self._compute_pool_id(pool_key)
 
         try:
-            # Get slot0 data
-            slot0 = self.contract.functions.getSlot0(pool_id).call()
+            # Use StateView if available (Uniswap V4) — PoolManager.getSlot0 doesn't exist there
+            if self.state_view_contract:
+                slot0 = self.state_view_contract.functions.getSlot0(pool_id).call()
+                liquidity = self.state_view_contract.functions.getLiquidity(pool_id).call()
+            else:
+                # Direct query to PoolManager (PancakeSwap V4)
+                slot0 = self.contract.functions.getSlot0(pool_id).call()
+                liquidity = self.contract.functions.getLiquidity(pool_id).call()
+
             sqrt_price_x96 = slot0[0]
             tick = slot0[1]
             protocol_fee = slot0[2]
             lp_fee = slot0[3]
-
-            # Get liquidity
-            liquidity = self.contract.functions.getLiquidity(pool_id).call()
 
             return V4PoolState(
                 pool_id=pool_id,
@@ -162,7 +199,7 @@ class V4PoolManager:
                 initialized=sqrt_price_x96 > 0
             )
         except Exception as e:
-            # Pool might not exist
+            print(f"[V4 PoolManager] getSlot0 failed: {e}")
             return V4PoolState(
                 pool_id=pool_id,
                 sqrt_price_x96=0,

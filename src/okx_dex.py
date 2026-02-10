@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 import requests
 from web3 import Web3
+from .utils import NonceManager
 
 logger = logging.getLogger(__name__)
 
@@ -112,12 +113,14 @@ class OKXDexSwap:
         api_key: str,
         secret_key: str,
         passphrase: str,
-        project_id: str = ""
+        project_id: str = "",
+        nonce_manager: 'NonceManager' = None
     ):
         self.api_key = api_key
         self.secret_key = secret_key
         self.passphrase = passphrase
         self.project_id = project_id
+        self.nonce_manager = nonce_manager
         self.session = requests.Session()
 
     def _get_timestamp(self) -> str:
@@ -352,30 +355,45 @@ class OKXDexSwap:
             # Используем максимальное значение для approve
             max_uint256 = 2**256 - 1
 
-            tx = token_contract.functions.approve(
-                Web3.to_checksum_address(dex_address),
-                max_uint256
-            ).build_transaction({
-                'from': Web3.to_checksum_address(wallet_address),
-                'nonce': w3.eth.get_transaction_count(Web3.to_checksum_address(wallet_address), 'pending'),
-                'gas': 100000,
-                'gasPrice': w3.eth.gas_price
-            })
+            nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
+                    w3.eth.get_transaction_count(Web3.to_checksum_address(wallet_address), 'pending')
 
-            signed_tx = w3.eth.account.sign_transaction(tx, private_key)
-            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            try:
+                tx = token_contract.functions.approve(
+                    Web3.to_checksum_address(dex_address),
+                    max_uint256
+                ).build_transaction({
+                    'from': Web3.to_checksum_address(wallet_address),
+                    'nonce': nonce,
+                    'gas': 100000,
+                    'gasPrice': w3.eth.gas_price
+                })
 
-            logger.info(f"Approve TX sent: {tx_hash.hex()}")
+                signed_tx = w3.eth.account.sign_transaction(tx, private_key)
+                tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
 
-            # Ждём подтверждения
-            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+                logger.info(f"Approve TX sent: {tx_hash.hex()}")
 
-            if receipt.status == 1:
-                logger.info("Token approved successfully")
-                return True
-            else:
-                logger.error("Approve transaction failed")
-                return False
+                # Ждём подтверждения
+                receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+                if self.nonce_manager:
+                    if receipt.status == 1:
+                        self.nonce_manager.confirm_transaction(nonce)
+                    else:
+                        self.nonce_manager.release_nonce(nonce)
+
+                if receipt.status == 1:
+                    logger.info("Token approved successfully")
+                    return True
+                else:
+                    logger.error("Approve transaction failed")
+                    return False
+
+            except Exception as e:
+                if self.nonce_manager:
+                    self.nonce_manager.release_nonce(nonce)
+                raise
 
         except Exception as e:
             logger.error(f"Failed to approve token: {e}")
@@ -484,24 +502,38 @@ class OKXDexSwap:
                 )
 
             # Построить транзакцию
-            tx = {
-                'from': Web3.to_checksum_address(wallet_address),
-                'to': Web3.to_checksum_address(swap_data['to']),
-                'data': swap_data['data'],
-                'value': swap_data['value'] if is_native else 0,
-                'nonce': w3.eth.get_transaction_count(Web3.to_checksum_address(wallet_address), 'pending'),
-                'gas': swap_data['gas'],
-                'gasPrice': w3.eth.gas_price
-            }
+            nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
+                    w3.eth.get_transaction_count(Web3.to_checksum_address(wallet_address), 'pending')
 
-            # Подписать и отправить
-            signed_tx = w3.eth.account.sign_transaction(tx, private_key)
-            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            try:
+                tx = {
+                    'from': Web3.to_checksum_address(wallet_address),
+                    'to': Web3.to_checksum_address(swap_data['to']),
+                    'data': swap_data['data'],
+                    'value': swap_data['value'] if is_native else 0,
+                    'nonce': nonce,
+                    'gas': swap_data['gas'],
+                    'gasPrice': w3.eth.gas_price
+                }
 
-            logger.info(f"Swap TX sent: {tx_hash.hex()}")
+                # Подписать и отправить
+                signed_tx = w3.eth.account.sign_transaction(tx, private_key)
+                tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
 
-            # Ждём подтверждения
-            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+                logger.info(f"Swap TX sent: {tx_hash.hex()}")
+
+                # Ждём подтверждения
+                receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+                if self.nonce_manager:
+                    if receipt.status == 1:
+                        self.nonce_manager.confirm_transaction(nonce)
+                    else:
+                        self.nonce_manager.release_nonce(nonce)
+            except Exception as e:
+                if self.nonce_manager:
+                    self.nonce_manager.release_nonce(nonce)
+                raise
 
             if receipt.status == 1:
                 # Получить котировку для расчёта USD value

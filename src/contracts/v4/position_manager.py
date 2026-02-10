@@ -15,6 +15,7 @@ from eth_account.signers.local import LocalAccount
 from .abis import V4_POSITION_MANAGER_ABI, PANCAKE_V4_POSITION_MANAGER_ABI, V4Actions, PancakeV4Actions
 from .constants import V4Protocol, get_v4_addresses
 from .pool_manager import PoolKey
+from ...utils import NonceManager
 
 
 @dataclass
@@ -51,12 +52,14 @@ class V4PositionManager:
         account: LocalAccount = None,
         protocol: V4Protocol = V4Protocol.PANCAKESWAP,
         chain_id: int = 56,
-        position_manager_address: str = None
+        position_manager_address: str = None,
+        nonce_manager: 'NonceManager' = None
     ):
         self.w3 = w3
         self.account = account
         self.protocol = protocol
         self.chain_id = chain_id
+        self.nonce_manager = nonce_manager
 
         # Get addresses
         if position_manager_address:
@@ -730,34 +733,49 @@ class V4PositionManager:
         payload = self._encode_actions(actions)
 
         # Build transaction
-        tx = self.contract.functions.modifyLiquidities(
-            payload,
-            deadline
-        ).build_transaction({
-            'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
-            'gas': gas_limit,
-            'gasPrice': self.w3.eth.gas_price,
-            'value': 0  # For native ETH wrapping if needed
-        })
+        nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
+                self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
-        # Sign and send
-        signed = self.account.sign_transaction(tx)
-        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+        try:
+            tx = self.contract.functions.modifyLiquidities(
+                payload,
+                deadline
+            ).build_transaction({
+                'from': self.account.address,
+                'nonce': nonce,
+                'gas': gas_limit,
+                'gasPrice': self.w3.eth.gas_price,
+                'value': 0  # For native ETH wrapping if needed
+            })
 
-        # Wait for receipt
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+            # Sign and send
+            signed = self.account.sign_transaction(tx)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
 
-        # Parse Transfer event to get tokenId
-        token_id = self._parse_mint_event(receipt)
+            # Wait for receipt
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
 
-        return MintResult(
-            token_id=token_id,
-            liquidity=liquidity,
-            amount0=0,  # Would need to decode from logs
-            amount1=0,
-            tx_hash=tx_hash.hex()
-        )
+            if self.nonce_manager:
+                if receipt['status'] == 1:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
+
+            # Parse Transfer event to get tokenId
+            token_id = self._parse_mint_event(receipt)
+
+            return MintResult(
+                token_id=token_id,
+                liquidity=liquidity,
+                amount0=0,  # Would need to decode from logs
+                amount1=0,
+                tx_hash=tx_hash.hex()
+            )
+
+        except Exception as e:
+            if self.nonce_manager:
+                self.nonce_manager.release_nonce(nonce)
+            raise
 
     def _parse_mint_event(self, receipt) -> int:
         """Parse Transfer event to get minted token ID."""
@@ -824,24 +842,39 @@ class V4PositionManager:
         )
 
         # Build transaction
-        tx = self.contract.functions.modifyLiquidities(
-            payload,
-            deadline
-        ).build_transaction({
-            'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
-            'gas': gas_limit,
-            'gasPrice': self.w3.eth.gas_price
-        })
+        nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
+                self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
-        # Sign and send
-        signed = self.account.sign_transaction(tx)
-        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+        try:
+            tx = self.contract.functions.modifyLiquidities(
+                payload,
+                deadline
+            ).build_transaction({
+                'from': self.account.address,
+                'nonce': nonce,
+                'gas': gas_limit,
+                'gasPrice': self.w3.eth.gas_price
+            })
 
-        # Wait for receipt
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+            # Sign and send
+            signed = self.account.sign_transaction(tx)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
 
-        return tx_hash.hex(), 0, 0  # Amounts would need log parsing
+            # Wait for receipt
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+
+            if self.nonce_manager:
+                if receipt['status'] == 1:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
+
+            return tx_hash.hex(), 0, 0  # Amounts would need log parsing
+
+        except Exception as e:
+            if self.nonce_manager:
+                self.nonce_manager.release_nonce(nonce)
+            raise
 
     def close_position_with_tokens(
         self,
@@ -900,24 +933,39 @@ class V4PositionManager:
         )
 
         # Build transaction
-        tx = self.contract.functions.modifyLiquidities(
-            payload,
-            deadline
-        ).build_transaction({
-            'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
-            'gas': gas_limit,
-            'gasPrice': self.w3.eth.gas_price
-        })
+        nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
+                self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
-        # Sign and send
-        signed = self.account.sign_transaction(tx)
-        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+        try:
+            tx = self.contract.functions.modifyLiquidities(
+                payload,
+                deadline
+            ).build_transaction({
+                'from': self.account.address,
+                'nonce': nonce,
+                'gas': gas_limit,
+                'gasPrice': self.w3.eth.gas_price
+            })
 
-        # Wait for receipt
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+            # Sign and send
+            signed = self.account.sign_transaction(tx)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
 
-        return tx_hash.hex(), 0, 0
+            # Wait for receipt
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+
+            if self.nonce_manager:
+                if receipt['status'] == 1:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
+
+            return tx_hash.hex(), 0, 0
+
+        except Exception as e:
+            if self.nonce_manager:
+                self.nonce_manager.release_nonce(nonce)
+            raise
 
     def close_positions_batch(
         self,
@@ -986,33 +1034,48 @@ class V4PositionManager:
         payload = self.build_batch_close_payload(normalized_positions, recipient)
 
         # Build transaction
-        tx = self.contract.functions.modifyLiquidities(
-            payload,
-            deadline
-        ).build_transaction({
-            'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
-            'gas': gas_limit,
-            'gasPrice': self.w3.eth.gas_price
-        })
+        nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
+                self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
-        print(f"[V4] Sending batch close TX, gas limit: {gas_limit}")
+        try:
+            tx = self.contract.functions.modifyLiquidities(
+                payload,
+                deadline
+            ).build_transaction({
+                'from': self.account.address,
+                'nonce': nonce,
+                'gas': gas_limit,
+                'gasPrice': self.w3.eth.gas_price
+            })
 
-        # Sign and send
-        signed = self.account.sign_transaction(tx)
-        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            print(f"[V4] Sending batch close TX, gas limit: {gas_limit}")
 
-        print(f"[V4] TX sent: {tx_hash.hex()}")
+            # Sign and send
+            signed = self.account.sign_transaction(tx)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
 
-        # Wait for receipt
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+            print(f"[V4] TX sent: {tx_hash.hex()}")
 
-        gas_used = receipt.get('gasUsed', 0)
-        success = receipt['status'] == 1
+            # Wait for receipt
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
 
-        print(f"[V4] Batch close {'SUCCESS' if success else 'FAILED'}, gas used: {gas_used}")
+            gas_used = receipt.get('gasUsed', 0)
+            success = receipt['status'] == 1
 
-        return tx_hash.hex(), success, gas_used
+            if self.nonce_manager:
+                if success:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
+
+            print(f"[V4] Batch close {'SUCCESS' if success else 'FAILED'}, gas used: {gas_used}")
+
+            return tx_hash.hex(), success, gas_used
+
+        except Exception as e:
+            if self.nonce_manager:
+                self.nonce_manager.release_nonce(nonce)
+            raise
 
     def multicall(
         self,
@@ -1070,36 +1133,50 @@ class V4PositionManager:
                 raise Exception(f"Gas estimation failed (tx would revert): {error_msg}")
 
         # Build transaction using modifyLiquidities
-        tx = self.contract.functions.modifyLiquidities(
-            unlock_data,
-            deadline
-        ).build_transaction({
-            'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
-            'gas': gas_limit,
-            'gasPrice': self.w3.eth.gas_price,
-            'value': 0
-        })
+        nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
+                self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
-        # Sign and send
-        signed = self.account.sign_transaction(tx)
-        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+        try:
+            tx = self.contract.functions.modifyLiquidities(
+                unlock_data,
+                deadline
+            ).build_transaction({
+                'from': self.account.address,
+                'nonce': nonce,
+                'gas': gas_limit,
+                'gasPrice': self.w3.eth.gas_price,
+                'value': 0
+            })
 
-        print(f"[V4] TX sent: {tx_hash.hex()}")
+            # Sign and send
+            signed = self.account.sign_transaction(tx)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
 
-        # Wait for receipt
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+            print(f"[V4] TX sent: {tx_hash.hex()}")
 
-        # Check transaction status
-        if receipt['status'] != 1:
-            raise Exception(
-                f"Transaction reverted! TX: {tx_hash.hex()}. "
-                f"Check https://bscscan.com/tx/{tx_hash.hex()} for details."
-            )
+            # Wait for receipt
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
 
-        print(f"[V4] TX confirmed, gas used: {receipt.get('gasUsed', 'unknown')}")
+            # Check transaction status
+            if receipt['status'] != 1:
+                if self.nonce_manager:
+                    self.nonce_manager.release_nonce(nonce)
+                raise Exception(
+                    f"Transaction reverted! TX: {tx_hash.hex()}. "
+                    f"Check https://bscscan.com/tx/{tx_hash.hex()} for details."
+                )
 
-        return tx_hash.hex(), []
+            if self.nonce_manager:
+                self.nonce_manager.confirm_transaction(nonce)
+
+            print(f"[V4] TX confirmed, gas used: {receipt.get('gasUsed', 'unknown')}")
+
+            return tx_hash.hex(), []
+
+        except Exception as e:
+            if self.nonce_manager:
+                self.nonce_manager.release_nonce(nonce)
+            raise
 
     def execute_modify_liquidities(
         self,
@@ -1151,36 +1228,50 @@ class V4PositionManager:
                 raise Exception(f"Gas estimation failed (tx would revert): {error_msg}")
 
         # Build transaction
-        tx = self.contract.functions.modifyLiquidities(
-            unlock_data,
-            deadline
-        ).build_transaction({
-            'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
-            'gas': gas_limit,
-            'gasPrice': self.w3.eth.gas_price,
-            'value': 0
-        })
+        nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
+                self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
-        # Sign and send
-        signed = self.account.sign_transaction(tx)
-        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+        try:
+            tx = self.contract.functions.modifyLiquidities(
+                unlock_data,
+                deadline
+            ).build_transaction({
+                'from': self.account.address,
+                'nonce': nonce,
+                'gas': gas_limit,
+                'gasPrice': self.w3.eth.gas_price,
+                'value': 0
+            })
 
-        print(f"[V4] TX sent: {tx_hash.hex()}")
+            # Sign and send
+            signed = self.account.sign_transaction(tx)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
 
-        # Wait for receipt
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+            print(f"[V4] TX sent: {tx_hash.hex()}")
 
-        # Check transaction status
-        if receipt['status'] != 1:
-            raise Exception(
-                f"Transaction reverted! TX: {tx_hash.hex()}. "
-                f"Check https://bscscan.com/tx/{tx_hash.hex()} for details."
-            )
+            # Wait for receipt
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
 
-        print(f"[V4] TX confirmed, gas used: {receipt.get('gasUsed', 'unknown')}")
+            # Check transaction status
+            if receipt['status'] != 1:
+                if self.nonce_manager:
+                    self.nonce_manager.release_nonce(nonce)
+                raise Exception(
+                    f"Transaction reverted! TX: {tx_hash.hex()}. "
+                    f"Check https://bscscan.com/tx/{tx_hash.hex()} for details."
+                )
 
-        return tx_hash.hex(), []
+            if self.nonce_manager:
+                self.nonce_manager.confirm_transaction(nonce)
+
+            print(f"[V4] TX confirmed, gas used: {receipt.get('gasUsed', 'unknown')}")
+
+            return tx_hash.hex(), []
+
+        except Exception as e:
+            if self.nonce_manager:
+                self.nonce_manager.release_nonce(nonce)
+            raise
 
     # ============== Wallet Scanning Methods ==============
 

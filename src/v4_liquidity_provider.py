@@ -264,19 +264,20 @@ class V4LiquidityProvider:
             chain_id=chain_id
         )
 
-        self.position_manager = V4PositionManager(
-            self.w3,
-            account=self.account,
-            protocol=protocol,
-            chain_id=chain_id
-        )
-
         # Initialize utility managers
         self.decimals_cache = DecimalsCache(self.w3)
         self.gas_estimator = GasEstimator(self.w3, buffer_percent=20)
         self.nonce_manager = None  # Initialized lazily when account is set
         if self.account:
             self.nonce_manager = NonceManager(self.w3, self.account.address)
+
+        self.position_manager = V4PositionManager(
+            self.w3,
+            account=self.account,
+            protocol=protocol,
+            chain_id=chain_id,
+            nonce_manager=self.nonce_manager
+        )
 
     def preview_ladder(self, config: V4LadderConfig) -> List[BidAskPosition]:
         """Preview positions without creating them."""
@@ -392,31 +393,46 @@ class V4LiquidityProvider:
         logger.debug(f"Pool key: {pool_key.to_tuple()}")
 
         # V4 uses PositionManager.initializePool() for pool creation
-        tx = self.position_manager.contract.functions.initializePool(
-            pool_key.to_tuple(),
-            sqrt_price_x96
-        ).build_transaction({
-            'from': self.account.address,
-            'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
-            'gas': 500000,
-            'gasPrice': self.w3.eth.gas_price
-        })
+        nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
+                self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
-        signed = self.account.sign_transaction(tx)
-        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+        try:
+            tx = self.position_manager.contract.functions.initializePool(
+                pool_key.to_tuple(),
+                sqrt_price_x96
+            ).build_transaction({
+                'from': self.account.address,
+                'nonce': nonce,
+                'gas': 500000,
+                'gasPrice': self.w3.eth.gas_price
+            })
 
-        success = receipt['status'] == 1
+            signed = self.account.sign_transaction(tx)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
 
-        # Verify pool was created
-        if success:
-            state = self.pool_manager.get_pool_state(pool_key)
-            if state.initialized:
-                logger.info(f"Pool created and verified! Tick: {state.tick}, sqrtPriceX96: {state.sqrt_price_x96}")
-            else:
-                logger.warning("Transaction succeeded but pool not initialized - may need to check manually")
+            success = receipt['status'] == 1
 
-        return tx_hash.hex(), success
+            if self.nonce_manager:
+                if success:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
+
+            # Verify pool was created
+            if success:
+                state = self.pool_manager.get_pool_state(pool_key)
+                if state.initialized:
+                    logger.info(f"Pool created and verified! Tick: {state.tick}, sqrtPriceX96: {state.sqrt_price_x96}")
+                else:
+                    logger.warning("Transaction succeeded but pool not initialized - may need to check manually")
+
+            return tx_hash.hex(), success
+
+        except Exception as e:
+            if self.nonce_manager:
+                self.nonce_manager.release_nonce(nonce)
+            raise
 
     def create_pool_only(
         self,
@@ -472,7 +488,7 @@ class V4LiquidityProvider:
             tick_spacing=tick_spacing,
             hooks=hooks
         )
-        pool_id = pool_key.get_pool_id()
+        pool_id = self.pool_manager._compute_pool_id(pool_key)
 
         logger.info("=" * 50)
         logger.info("CREATE POOL ONLY (without liquidity)")
@@ -508,13 +524,16 @@ class V4LiquidityProvider:
         logger.info(f"sqrtPriceX96: {sqrt_price_x96}")
 
         # Create pool via PositionManager.initializePool()
+        nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
+                self.w3.eth.get_transaction_count(self.account.address, 'pending')
+
         try:
             tx = self.position_manager.contract.functions.initializePool(
                 pool_key.to_tuple(),
                 sqrt_price_x96
             ).build_transaction({
                 'from': self.account.address,
-                'nonce': self.w3.eth.get_transaction_count(self.account.address, 'pending'),
+                'nonce': nonce,
                 'gas': 500000,
                 'gasPrice': self.w3.eth.gas_price
             })
@@ -525,6 +544,12 @@ class V4LiquidityProvider:
 
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
             success = receipt['status'] == 1
+
+            if self.nonce_manager:
+                if success:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
 
             if success:
                 # Verify pool was created
@@ -543,6 +568,8 @@ class V4LiquidityProvider:
             return tx_hash.hex(), pool_id, success
 
         except Exception as e:
+            if self.nonce_manager:
+                self.nonce_manager.release_nonce(nonce)
             logger.error(f"Pool creation error: {e}")
             return None, pool_id, False
 
@@ -1173,8 +1200,8 @@ class V4LiquidityProvider:
         logger.info(f"Positions: {len(positions)}")
         logger.debug(f"Position Manager: {self.position_manager.position_manager_address}")
 
-        # Compute pool_id from pool_key
-        computed_pool_id = pool_key.get_pool_id()
+        # Compute pool_id from pool_key (protocol-aware)
+        computed_pool_id = self.pool_manager._compute_pool_id(pool_key)
         logger.info(f"Computed pool_id: 0x{computed_pool_id.hex()}")
         logger.debug(f"PoolKey: currency0={pool_key.currency0}")
         logger.debug(f"PoolKey: currency1={pool_key.currency1}")
@@ -1228,7 +1255,7 @@ class V4LiquidityProvider:
                                     tick_spacing=try_tick_spacing,
                                     hooks=config.hooks
                                 )
-                                test_pool_id = test_pool_key.get_pool_id()
+                                test_pool_id = self.pool_manager._compute_pool_id(test_pool_key)
                                 if test_pool_id == config.pool_id:
                                     logger.info(f"  MATCH FOUND! fee={actual_fee}, tick_spacing={try_tick_spacing}")
                                     # Update pool_key with correct values

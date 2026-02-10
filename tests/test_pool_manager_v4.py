@@ -218,7 +218,7 @@ class TestV4PoolManager:
             pm.w3 = mock_w3
             pm.protocol = V4Protocol.PANCAKESWAP
             pm.chain_id = 56
-            pm.pool_manager_address = "0xPoolManager"
+            pm.pool_manager_address = "0xa0FfB9c1CE1Fe56963B0321B32E7A0302114058b"
             pm.state_view_contract = None
             pm.state_view_address = None
 

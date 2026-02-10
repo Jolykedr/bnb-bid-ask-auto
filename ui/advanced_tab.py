@@ -166,6 +166,10 @@ class AdvancedTab(QWidget):
         self.setup_ui()
         self.load_saved_tokens()
 
+    def reload_settings(self):
+        """Reload settings from QSettings (called when settings dialog closes)."""
+        pass  # advanced_tab reads QSettings at operation time
+
     def setup_ui(self):
         layout = QVBoxLayout(self)
 
@@ -794,6 +798,10 @@ class AdvancedTab(QWidget):
         self.v4_create_progress.show()
         self.v4_create_pool_btn.setEnabled(False)
 
+        if self.worker is not None:
+            self.worker.deleteLater()
+            self.worker = None
+
         self.worker = CreateV4PoolWorker(
             provider=self.v4_provider,
             token0=token0,
@@ -813,6 +821,9 @@ class AdvancedTab(QWidget):
 
     def _on_v4_pool_created(self, success: bool, message: str, data: dict):
         """Handle V4 pool creation result."""
+        if self.worker is not None:
+            self.worker.deleteLater()
+            self.worker = None
         self.v4_create_progress.hide()
         self.v4_create_pool_btn.setEnabled(True)
 
@@ -904,12 +915,18 @@ class AdvancedTab(QWidget):
             return
 
         self.load_token_btn.setEnabled(False)
+        if self.worker is not None:
+            self.worker.deleteLater()
+            self.worker = None
         self.worker = LoadTokenWorker(self.factory, address)
         self.worker.finished.connect(self._on_token_loaded)
         self.worker.start()
 
     def _on_token_loaded(self, success: bool, message: str, info: TokenInfo):
         """Handle token info loaded."""
+        if self.worker is not None:
+            self.worker.deleteLater()
+            self.worker = None
         self.load_token_btn.setEnabled(True)
 
         if success and info:
@@ -1191,6 +1208,10 @@ class AdvancedTab(QWidget):
         self.create_progress.show()
         self.create_pool_btn.setEnabled(False)
 
+        if self.worker is not None:
+            self.worker.deleteLater()
+            self.worker = None
+
         self.worker = CreatePoolWorker(
             self.factory, token0, token1, fee,
             initial_price if initial_price > 0 else None,
@@ -1202,6 +1223,9 @@ class AdvancedTab(QWidget):
 
     def _on_pool_created(self, success: bool, message: str, data: dict):
         """Handle pool creation result."""
+        if self.worker is not None:
+            self.worker.deleteLater()
+            self.worker = None
         self.create_progress.hide()
         self.create_pool_btn.setEnabled(True)
 
