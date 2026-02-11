@@ -284,8 +284,11 @@ class DecimalsCache:
             return decimals
 
         except Exception as e:
-            logger.warning(f"Failed to get decimals for {token_address[:10]}...: {e}, defaulting to 18")
-            return 18
+            logger.error(f"Failed to get decimals for {token_address[:10]}...: {e}")
+            raise RuntimeError(
+                f"Cannot determine decimals for token {token_address}: {e}. "
+                f"Check RPC connection or add token to KNOWN_DECIMALS."
+            ) from e
 
     def get_decimals_batch(self, token_addresses: List[str]) -> Dict[str, int]:
         """

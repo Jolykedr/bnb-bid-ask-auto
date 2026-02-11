@@ -184,8 +184,55 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Handle window close event."""
+        self._cleanup_workers()
         self.save_geometry()
         event.accept()
+
+    def _cleanup_workers(self):
+        """Stop all running workers before closing."""
+        # Create tab worker
+        if hasattr(self, 'create_tab') and self.create_tab.worker is not None:
+            if self.create_tab.worker.isRunning():
+                self.create_tab.worker.quit()
+                self.create_tab.worker.wait(3000)
+            self.create_tab.worker.deleteLater()
+            self.create_tab.worker = None
+
+        # Manage tab workers
+        if hasattr(self, 'manage_tab'):
+            # Main worker (BatchClose, ClosePositions)
+            if hasattr(self.manage_tab, 'worker') and self.manage_tab.worker is not None:
+                if self.manage_tab.worker.isRunning():
+                    self.manage_tab.worker.quit()
+                    self.manage_tab.worker.wait(3000)
+                self.manage_tab.worker.deleteLater()
+                self.manage_tab.worker = None
+
+            # Load position workers (list)
+            if hasattr(self.manage_tab, 'load_workers'):
+                for w in self.manage_tab.load_workers:
+                    if w.isRunning():
+                        w.quit()
+                        w.wait(2000)
+                    w.deleteLater()
+                self.manage_tab.load_workers.clear()
+
+            # Scan worker
+            if hasattr(self.manage_tab, 'scan_worker') and self.manage_tab.scan_worker is not None:
+                if self.manage_tab.scan_worker.isRunning():
+                    self.manage_tab.scan_worker.quit()
+                    self.manage_tab.scan_worker.wait(3000)
+                self.manage_tab.scan_worker.deleteLater()
+                self.manage_tab.scan_worker = None
+
+        # Advanced tab worker
+        if hasattr(self, 'advanced_tab') and hasattr(self.advanced_tab, 'worker'):
+            if self.advanced_tab.worker is not None:
+                if self.advanced_tab.worker.isRunning():
+                    self.advanced_tab.worker.quit()
+                    self.advanced_tab.worker.wait(3000)
+                self.advanced_tab.worker.deleteLater()
+                self.advanced_tab.worker = None
 
     def _on_tab_changed(self, index):
         """Handle tab change."""

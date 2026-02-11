@@ -6,11 +6,14 @@ Uses action-based encoding system.
 """
 
 import time
+import logging
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from web3 import Web3
 from eth_abi import encode, decode
 from eth_account.signers.local import LocalAccount
+
+logger = logging.getLogger(__name__)
 
 from .abis import V4_POSITION_MANAGER_ABI, PANCAKE_V4_POSITION_MANAGER_ABI, V4Actions, PancakeV4Actions
 from .constants import V4Protocol, get_v4_addresses
@@ -102,90 +105,14 @@ class V4PositionManager:
             # info: can be packed uint256 OR unpacked tuple depending on ABI
             pool_key_tuple = result[0]
             info = result[1]
+            tick_spacing = pool_key_tuple[3]
 
-            print(f"[V4] getPoolAndPositionInfo raw result[1] type: {type(info)}, value: {info}")
+            logger.debug(f"V4 getPoolAndPositionInfo #{token_id}: info type={type(info).__name__}")
 
-            # Decode PositionInfo - handle both packed and unpacked formats
-            tick_lower = None
-            tick_upper = None
+            # Decode PositionInfo — deterministic extraction
+            tick_lower, tick_upper = self._extract_ticks(info, tick_spacing)
 
-            if isinstance(info, (list, tuple)):
-                # Unpacked tuple format: (hasSubscriber, tickLower, tickUpper) or similar
-                print(f"[V4] info is tuple/list with {len(info)} elements: {info}")
-                if len(info) >= 3:
-                    # Try different tuple layouts
-                    # Layout 1: (hasSubscriber, tickLower, tickUpper)
-                    # Layout 2: (tickLower, tickUpper, hasSubscriber)
-                    val0, val1, val2 = info[0], info[1], info[2]
-
-                    # hasSubscriber is boolean or 0/1, ticks are larger ints
-                    if isinstance(val0, bool) or (isinstance(val0, int) and val0 in [0, 1] and abs(val1) > 1):
-                        tick_lower = val1
-                        tick_upper = val2
-                    elif isinstance(val2, bool) or (isinstance(val2, int) and val2 in [0, 1] and abs(val0) > 1):
-                        tick_lower = val0
-                        tick_upper = val1
-                    else:
-                        # Assume (tickLower, tickUpper, ...)
-                        tick_lower = val0
-                        tick_upper = val1
-                elif len(info) == 2:
-                    tick_lower, tick_upper = info[0], info[1]
-
-            elif isinstance(info, int):
-                # Packed uint256 - try multiple bit layouts
-                print(f"[V4] info is packed int: {info} (0x{info:064x})")
-
-                # Layout 1: Uniswap V4 standard (tickLower at bits 232-255, tickUpper at 208-231)
-                tl_232 = (info >> 232) & 0xFFFFFF
-                if tl_232 >= 0x800000:
-                    tl_232 -= 0x1000000
-                tu_208 = (info >> 208) & 0xFFFFFF
-                if tu_208 >= 0x800000:
-                    tu_208 -= 0x1000000
-
-                # Layout 2: Alternative (tickLower at bits 24-47, tickUpper at bits 0-23)
-                tl_24 = (info >> 24) & 0xFFFFFF
-                if tl_24 >= 0x800000:
-                    tl_24 -= 0x1000000
-                tu_0 = info & 0xFFFFFF
-                if tu_0 >= 0x800000:
-                    tu_0 -= 0x1000000
-
-                # Layout 3: (tickUpper at bits 32-55, tickLower at bits 8-31)
-                tu_32 = (info >> 32) & 0xFFFFFF
-                if tu_32 >= 0x800000:
-                    tu_32 -= 0x1000000
-                tl_8 = (info >> 8) & 0xFFFFFF
-                if tl_8 >= 0x800000:
-                    tl_8 -= 0x1000000
-
-                print(f"[V4] Layout 1 (232/208): tl={tl_232}, tu={tu_208}")
-                print(f"[V4] Layout 2 (24/0): tl={tl_24}, tu={tu_0}")
-                print(f"[V4] Layout 3 (8/32): tl={tl_8}, tu={tu_32}")
-
-                # Check which layout gives valid tick values (-887272 to 887272)
-                MIN_TICK, MAX_TICK = -887272, 887272
-
-                if MIN_TICK <= tl_232 <= MAX_TICK and MIN_TICK <= tu_208 <= MAX_TICK and tl_232 < tu_208:
-                    tick_lower, tick_upper = tl_232, tu_208
-                    print(f"[V4] Using Layout 1 (232/208)")
-                elif MIN_TICK <= tl_24 <= MAX_TICK and MIN_TICK <= tu_0 <= MAX_TICK and tl_24 < tu_0:
-                    tick_lower, tick_upper = tl_24, tu_0
-                    print(f"[V4] Using Layout 2 (24/0)")
-                elif MIN_TICK <= tl_8 <= MAX_TICK and MIN_TICK <= tu_32 <= MAX_TICK and tl_8 < tu_32:
-                    tick_lower, tick_upper = tl_8, tu_32
-                    print(f"[V4] Using Layout 3 (8/32)")
-                else:
-                    # None of the layouts work - use Layout 1 as default but warn
-                    tick_lower, tick_upper = tl_232, tu_208
-                    print(f"[V4] WARNING: No valid tick layout found, using Layout 1")
-
-            # Validate we got ticks
-            if tick_lower is None or tick_upper is None:
-                raise ValueError(f"Could not extract ticks from info: {info}")
-
-            print(f"[V4] Extracted ticks: lower={tick_lower}, upper={tick_upper}")
+            logger.debug(f"V4 Position #{token_id}: ticks={tick_lower}/{tick_upper}")
 
             # Get liquidity separately
             try:
@@ -334,6 +261,90 @@ class V4PositionManager:
         except Exception as e:
             raise ValueError(f"Failed to get position {token_id}: {e}")
 
+    def _extract_ticks(self, info, tick_spacing: int = 0) -> Tuple[int, int]:
+        """
+        Извлечение tickLower и tickUpper из PositionInfo (packed int или tuple).
+
+        Deterministic: использует tick_spacing для валидации при нескольких совпадениях.
+        """
+        MIN_TICK, MAX_TICK = -887272, 887272
+
+        if isinstance(info, (list, tuple)):
+            # Unpacked tuple (PancakeSwap V4 or newer ABIs)
+            if len(info) >= 3:
+                # hasSubscriber is always bool in web3.py ABI decoding
+                if isinstance(info[0], bool):
+                    # (hasSubscriber, tickLower, tickUpper)
+                    return int(info[1]), int(info[2])
+                elif isinstance(info[2], bool):
+                    # (tickLower, tickUpper, hasSubscriber)
+                    return int(info[0]), int(info[1])
+                else:
+                    # All ints: first two should be (tickLower, tickUpper)
+                    tl, tu = int(info[0]), int(info[1])
+                    if tl < tu:
+                        return tl, tu
+                    # Try second pair
+                    tl2, tu2 = int(info[1]), int(info[2])
+                    if tl2 < tu2:
+                        return tl2, tu2
+                    return tl, tu  # fallback
+            elif len(info) == 2:
+                return int(info[0]), int(info[1])
+            else:
+                raise ValueError(f"Unexpected PositionInfo tuple length: {len(info)}")
+
+        elif isinstance(info, int):
+            # Packed uint256 (Uniswap V4)
+            # Uniswap V4 PositionInfo bytes32 layout (from LSB):
+            #   bits 0-7:   hasSubscriber/flags
+            #   bits 8-31:  tickLower (int24)
+            #   bits 32-55: tickUpper (int24)
+            #   bits 56+:   poolId (truncated)
+            # This matches raw positionInfo(uint256) byte layout.
+            layouts = [
+                (8, 32, "standard (8/32)"),
+                (24, 48, "alt (24/48)"),
+                (232, 208, "top-down (232/208)"),
+            ]
+
+            best_match = None
+            for tl_off, tu_off, name in layouts:
+                tl = (info >> tl_off) & 0xFFFFFF
+                if tl >= 0x800000:
+                    tl -= 0x1000000
+                tu = (info >> tu_off) & 0xFFFFFF
+                if tu >= 0x800000:
+                    tu -= 0x1000000
+
+                if not (MIN_TICK <= tl <= MAX_TICK and MIN_TICK <= tu <= MAX_TICK and tl < tu):
+                    continue
+
+                # Strong match: ticks aligned to tick_spacing
+                if tick_spacing > 0 and tl % tick_spacing == 0 and tu % tick_spacing == 0:
+                    logger.debug(f"Tick layout: {name} (tick_spacing aligned)")
+                    return tl, tu
+
+                if best_match is None:
+                    best_match = (tl, tu, name)
+
+            if best_match:
+                logger.debug(f"Tick layout: {best_match[2]}")
+                return best_match[0], best_match[1]
+
+            # No valid layout — use primary (8/32) and warn
+            tl = (info >> 8) & 0xFFFFFF
+            if tl >= 0x800000:
+                tl -= 0x1000000
+            tu = (info >> 32) & 0xFFFFFF
+            if tu >= 0x800000:
+                tu -= 0x1000000
+            logger.warning(f"No valid tick layout for packed info 0x{info:064x}, default: tl={tl} tu={tu}")
+            return tl, tu
+
+        else:
+            raise ValueError(f"Unexpected PositionInfo type: {type(info)}, value={info}")
+
     def _get_position_liquidity(self, token_id: int) -> int:
         """Get liquidity for a position using getPositionLiquidity."""
         try:
@@ -392,10 +403,9 @@ class V4PositionManager:
         # Action: MINT_POSITION
         action = self.actions.MINT_POSITION
 
-        # Debug logging
+        # Debug logging (pool_id NOT logged — PoolKey.get_pool_id() is Uniswap-only, wrong for PancakeSwap)
         print(f"[V4 MINT] Action code: 0x{action:02x}")
-        print(f"[V4 MINT] PoolKey: {pool_key.to_tuple()}")
-        print(f"[V4 MINT] Computed pool_id: 0x{pool_key.get_pool_id().hex()}")
+        print(f"[V4 MINT] PoolKey: {pool_key.currency0}/{pool_key.currency1} fee={pool_key.fee} ts={pool_key.tick_spacing}")
         print(f"[V4 MINT] tick_lower={tick_lower}, tick_upper={tick_upper}")
         print(f"[V4 MINT] liquidity={liquidity}")
         print(f"[V4 MINT] amount0_max={amount0_max}, amount1_max={amount1_max}")
@@ -736,6 +746,7 @@ class V4PositionManager:
         nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
                 self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
+        tx_sent = False
         try:
             tx = self.contract.functions.modifyLiquidities(
                 payload,
@@ -751,15 +762,14 @@ class V4PositionManager:
             # Sign and send
             signed = self.account.sign_transaction(tx)
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_sent = True
 
             # Wait for receipt
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
 
+            # TX mined — nonce consumed (even if reverted)
             if self.nonce_manager:
-                if receipt['status'] == 1:
-                    self.nonce_manager.confirm_transaction(nonce)
-                else:
-                    self.nonce_manager.release_nonce(nonce)
+                self.nonce_manager.confirm_transaction(nonce)
 
             # Parse Transfer event to get tokenId
             token_id = self._parse_mint_event(receipt)
@@ -774,7 +784,10 @@ class V4PositionManager:
 
         except Exception as e:
             if self.nonce_manager:
-                self.nonce_manager.release_nonce(nonce)
+                if tx_sent:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
             raise
 
     def _parse_mint_event(self, receipt) -> int:
@@ -845,6 +858,7 @@ class V4PositionManager:
         nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
                 self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
+        tx_sent = False
         try:
             tx = self.contract.functions.modifyLiquidities(
                 payload,
@@ -859,21 +873,23 @@ class V4PositionManager:
             # Sign and send
             signed = self.account.sign_transaction(tx)
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_sent = True
 
             # Wait for receipt
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
 
+            # TX mined — nonce consumed (even if reverted)
             if self.nonce_manager:
-                if receipt['status'] == 1:
-                    self.nonce_manager.confirm_transaction(nonce)
-                else:
-                    self.nonce_manager.release_nonce(nonce)
+                self.nonce_manager.confirm_transaction(nonce)
 
             return tx_hash.hex(), 0, 0  # Amounts would need log parsing
 
         except Exception as e:
             if self.nonce_manager:
-                self.nonce_manager.release_nonce(nonce)
+                if tx_sent:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
             raise
 
     def close_position_with_tokens(
@@ -936,6 +952,7 @@ class V4PositionManager:
         nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
                 self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
+        tx_sent = False
         try:
             tx = self.contract.functions.modifyLiquidities(
                 payload,
@@ -950,21 +967,23 @@ class V4PositionManager:
             # Sign and send
             signed = self.account.sign_transaction(tx)
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_sent = True
 
             # Wait for receipt
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
 
+            # TX mined — nonce consumed (even if reverted)
             if self.nonce_manager:
-                if receipt['status'] == 1:
-                    self.nonce_manager.confirm_transaction(nonce)
-                else:
-                    self.nonce_manager.release_nonce(nonce)
+                self.nonce_manager.confirm_transaction(nonce)
 
             return tx_hash.hex(), 0, 0
 
         except Exception as e:
             if self.nonce_manager:
-                self.nonce_manager.release_nonce(nonce)
+                if tx_sent:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
             raise
 
     def close_positions_batch(
@@ -1037,6 +1056,7 @@ class V4PositionManager:
         nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
                 self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
+        tx_sent = False
         try:
             tx = self.contract.functions.modifyLiquidities(
                 payload,
@@ -1053,6 +1073,7 @@ class V4PositionManager:
             # Sign and send
             signed = self.account.sign_transaction(tx)
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_sent = True
 
             print(f"[V4] TX sent: {tx_hash.hex()}")
 
@@ -1062,11 +1083,9 @@ class V4PositionManager:
             gas_used = receipt.get('gasUsed', 0)
             success = receipt['status'] == 1
 
+            # TX mined — nonce consumed (even if reverted)
             if self.nonce_manager:
-                if success:
-                    self.nonce_manager.confirm_transaction(nonce)
-                else:
-                    self.nonce_manager.release_nonce(nonce)
+                self.nonce_manager.confirm_transaction(nonce)
 
             print(f"[V4] Batch close {'SUCCESS' if success else 'FAILED'}, gas used: {gas_used}")
 
@@ -1074,7 +1093,10 @@ class V4PositionManager:
 
         except Exception as e:
             if self.nonce_manager:
-                self.nonce_manager.release_nonce(nonce)
+                if tx_sent:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
             raise
 
     def multicall(
@@ -1136,6 +1158,7 @@ class V4PositionManager:
         nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
                 self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
+        tx_sent = False
         try:
             tx = self.contract.functions.modifyLiquidities(
                 unlock_data,
@@ -1151,30 +1174,30 @@ class V4PositionManager:
             # Sign and send
             signed = self.account.sign_transaction(tx)
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_sent = True
 
             print(f"[V4] TX sent: {tx_hash.hex()}")
 
             # Wait for receipt
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
 
-            # Check transaction status
+            # Nonce использован on-chain (TX замайнена, даже если revert)
+            if self.nonce_manager:
+                self.nonce_manager.confirm_transaction(nonce)
+
             if receipt['status'] != 1:
-                if self.nonce_manager:
-                    self.nonce_manager.release_nonce(nonce)
                 raise Exception(
                     f"Transaction reverted! TX: {tx_hash.hex()}. "
                     f"Check https://bscscan.com/tx/{tx_hash.hex()} for details."
                 )
-
-            if self.nonce_manager:
-                self.nonce_manager.confirm_transaction(nonce)
 
             print(f"[V4] TX confirmed, gas used: {receipt.get('gasUsed', 'unknown')}")
 
             return tx_hash.hex(), []
 
         except Exception as e:
-            if self.nonce_manager:
+            # release только если TX не была отправлена в сеть
+            if self.nonce_manager and not tx_sent:
                 self.nonce_manager.release_nonce(nonce)
             raise
 
@@ -1231,6 +1254,7 @@ class V4PositionManager:
         nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
                 self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
+        tx_sent = False
         try:
             tx = self.contract.functions.modifyLiquidities(
                 unlock_data,
@@ -1246,30 +1270,30 @@ class V4PositionManager:
             # Sign and send
             signed = self.account.sign_transaction(tx)
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_sent = True
 
             print(f"[V4] TX sent: {tx_hash.hex()}")
 
             # Wait for receipt
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
 
-            # Check transaction status
+            # Nonce использован on-chain (TX замайнена, даже если revert)
+            if self.nonce_manager:
+                self.nonce_manager.confirm_transaction(nonce)
+
             if receipt['status'] != 1:
-                if self.nonce_manager:
-                    self.nonce_manager.release_nonce(nonce)
                 raise Exception(
                     f"Transaction reverted! TX: {tx_hash.hex()}. "
                     f"Check https://bscscan.com/tx/{tx_hash.hex()} for details."
                 )
-
-            if self.nonce_manager:
-                self.nonce_manager.confirm_transaction(nonce)
 
             print(f"[V4] TX confirmed, gas used: {receipt.get('gasUsed', 'unknown')}")
 
             return tx_hash.hex(), []
 
         except Exception as e:
-            if self.nonce_manager:
+            # release только если TX не была отправлена в сеть
+            if self.nonce_manager and not tx_sent:
                 self.nonce_manager.release_nonce(nonce)
             raise
 

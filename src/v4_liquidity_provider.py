@@ -281,6 +281,7 @@ class V4LiquidityProvider:
 
     def preview_ladder(self, config: V4LadderConfig) -> List[BidAskPosition]:
         """Preview positions without creating them."""
+        from config import is_stablecoin
         # Convert fee percent to tick spacing
         tick_spacing = config.tick_spacing or suggest_tick_spacing(config.fee_percent)
 
@@ -302,7 +303,7 @@ class V4LiquidityProvider:
             distribution_type=config.distribution_type,
             token0_decimals=config.token0_decimals,
             token1_decimals=config.token1_decimals,
-            token1_is_stable=True,
+            token1_is_stable=is_stablecoin(config.token1),
             allow_custom_fee=True,  # V4 supports custom fees
             tick_spacing=tick_spacing,  # Pass actual tick_spacing for proper alignment
             invert_price=config.invert_price,  # Invert price for TOKEN/USD → pool price conversion
@@ -623,6 +624,7 @@ class V4LiquidityProvider:
         nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
                 self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
+        tx_sent = False
         try:
             tx = approve_fn.build_transaction({
                 'from': self.account.address,
@@ -633,21 +635,22 @@ class V4LiquidityProvider:
 
             signed = self.account.sign_transaction(tx)
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_sent = True
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
 
-            if receipt['status'] != 1:
-                if self.nonce_manager:
-                    self.nonce_manager.release_nonce(nonce)
-                raise Exception(f"ERC20 approve failed! TX: {tx_hash.hex()}")
-
+            # Nonce использован on-chain (TX замайнена, даже если revert)
             if self.nonce_manager:
                 self.nonce_manager.confirm_transaction(nonce)
+
+            if receipt['status'] != 1:
+                raise Exception(f"ERC20 approve failed! TX: {tx_hash.hex()}")
 
             logger.info(f"ERC20 approve confirmed: {tx_hash.hex()}")
             return tx_hash.hex()
 
         except Exception as e:
-            if self.nonce_manager:
+            # release только если TX не была отправлена в сеть
+            if self.nonce_manager and not tx_sent:
                 self.nonce_manager.release_nonce(nonce)
             raise
 
@@ -697,6 +700,7 @@ class V4LiquidityProvider:
         nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
                 self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
+        tx_sent = False
         try:
             tx = approve_fn.build_transaction({
                 'from': self.account.address,
@@ -707,15 +711,15 @@ class V4LiquidityProvider:
 
             signed = self.account.sign_transaction(tx)
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_sent = True
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
 
-            if receipt['status'] != 1:
-                if self.nonce_manager:
-                    self.nonce_manager.release_nonce(nonce)
-                raise Exception(f"Permit2 approval transaction failed! TX: {tx_hash.hex()}")
-
+            # Nonce использован on-chain (TX замайнена, даже если revert)
             if self.nonce_manager:
                 self.nonce_manager.confirm_transaction(nonce)
+
+            if receipt['status'] != 1:
+                raise Exception(f"Permit2 approval transaction failed! TX: {tx_hash.hex()}")
 
             logger.info(f"Permit2 approval tx: {tx_hash.hex()}")
 
@@ -736,7 +740,8 @@ class V4LiquidityProvider:
             return tx_hash.hex()
 
         except Exception as e:
-            if self.nonce_manager:
+            # release только если TX не была отправлена в сеть
+            if self.nonce_manager and not tx_sent:
                 self.nonce_manager.release_nonce(nonce)
             raise
 
@@ -1452,6 +1457,7 @@ class V4LiquidityProvider:
             logger.info("skip_approvals=True, verifying existing approvals...")
             approval_state = self.check_approvals(config)
 
+            # Проверка quote token (стейблкоин)
             if not approval_state['erc20_to_permit2']['approved']:
                 return V4LadderResult(
                     positions=positions,
@@ -1460,7 +1466,7 @@ class V4LiquidityProvider:
                     token_ids=[],
                     pool_created=pool_created,
                     success=False,
-                    error=f"ERC20 not approved to Permit2. Run approve_tokens_for_ladder() first. Current allowance: {approval_state['erc20_to_permit2']['allowance']}"
+                    error=f"Quote ERC20 not approved to Permit2. Run approve_tokens_for_ladder() first. Current allowance: {approval_state['erc20_to_permit2']['allowance']}"
                 )
 
             if not approval_state['permit2_to_position_manager']['approved']:
@@ -1472,7 +1478,7 @@ class V4LiquidityProvider:
                         token_ids=[],
                         pool_created=pool_created,
                         success=False,
-                        error=f"Permit2 allowance EXPIRED! Expiration: {approval_state['permit2_to_position_manager']['expiration']}. Run approve_tokens_for_ladder() first."
+                        error=f"Quote Permit2 allowance EXPIRED! Expiration: {approval_state['permit2_to_position_manager']['expiration']}. Run approve_tokens_for_ladder() first."
                     )
                 return V4LadderResult(
                     positions=positions,
@@ -1481,10 +1487,43 @@ class V4LiquidityProvider:
                     token_ids=[],
                     pool_created=pool_created,
                     success=False,
-                    error=f"Permit2 not approved to PositionManager. Run approve_tokens_for_ladder() first."
+                    error=f"Quote Permit2 not approved to PositionManager. Run approve_tokens_for_ladder() first."
                 )
 
-            logger.info("Approvals verified OK")
+            # Проверка base token (volatile)
+            if not approval_state['base_erc20_to_permit2']['approved']:
+                return V4LadderResult(
+                    positions=positions,
+                    tx_hash=None,
+                    gas_used=None,
+                    token_ids=[],
+                    pool_created=pool_created,
+                    success=False,
+                    error=f"Base ERC20 not approved to Permit2. Run approve_tokens_for_ladder() first. Current allowance: {approval_state['base_erc20_to_permit2']['allowance']}"
+                )
+
+            if not approval_state['base_permit2_to_position_manager']['approved']:
+                if approval_state['base_permit2_to_position_manager']['expired']:
+                    return V4LadderResult(
+                        positions=positions,
+                        tx_hash=None,
+                        gas_used=None,
+                        token_ids=[],
+                        pool_created=pool_created,
+                        success=False,
+                        error=f"Base Permit2 allowance EXPIRED! Expiration: {approval_state['base_permit2_to_position_manager']['expiration']}. Run approve_tokens_for_ladder() first."
+                    )
+                return V4LadderResult(
+                    positions=positions,
+                    tx_hash=None,
+                    gas_used=None,
+                    token_ids=[],
+                    pool_created=pool_created,
+                    success=False,
+                    error=f"Base Permit2 not approved to PositionManager. Run approve_tokens_for_ladder() first."
+                )
+
+            logger.info("Approvals verified OK (both quote and base tokens)")
         else:
             # Do approvals inline
             logger.info("Performing token approvals...")
@@ -1788,7 +1827,7 @@ class V4LiquidityProvider:
         if recipient is None:
             recipient = self.account.address
 
-        payloads = []
+        positions_to_close = []
         deadline = int(time.time()) + 3600
 
         for token_id in token_ids:
@@ -1797,28 +1836,33 @@ class V4LiquidityProvider:
                 logger.info(f"Closing position {token_id}: ticks=[{position.tick_lower}, {position.tick_upper}], liquidity={position.liquidity}")
 
                 if position.liquidity > 0:
-                    payload = self.position_manager.build_close_position_payload(
-                        token_id=token_id,
-                        liquidity=position.liquidity,
-                        recipient=recipient,
-                        currency0=addr0,
-                        currency1=addr1,
-                        burn=burn
-                    )
-                    payloads.append(payload)
+                    positions_to_close.append({
+                        'token_id': token_id,
+                        'liquidity': position.liquidity,
+                        'currency0': addr0,
+                        'currency1': addr1
+                    })
                 else:
                     logger.warning(f"Position {token_id} has zero liquidity, skipping")
             except Exception as e:
                 logger.error(f"Error processing position {token_id}: {e}")
 
-        if not payloads:
+        if not positions_to_close:
             logger.warning("No positions to close (all have zero liquidity or errored)")
             return None, False, None
 
-        logger.info(f"Closing {len(payloads)} positions...")
+        logger.info(f"Closing {len(positions_to_close)} positions via batch...")
 
-        tx_hash, _ = self.position_manager.multicall(
-            payloads=payloads,
+        # build_batch_close_payload корректно собирает все actions
+        # в один unlockData (в отличие от multicall, который ожидает List[List[bytes]])
+        unlock_data = self.position_manager.build_batch_close_payload(
+            positions=positions_to_close,
+            recipient=recipient,
+            burn=burn
+        )
+
+        tx_hash, _ = self.position_manager.execute_modify_liquidities(
+            unlock_data=unlock_data,
             deadline=deadline,
             timeout=timeout
         )

@@ -341,6 +341,94 @@ class Multicall3Batcher:
 
         return token_ids
 
+    def _parse_results_from_receipt(
+        self,
+        receipt: TxReceipt,
+        position_manager_address: str
+    ) -> List[CallResult]:
+        """
+        Парсинг результатов вызовов из событий receipt.
+
+        Multicall on-chain не возвращает return data в receipt,
+        но мы можем извлечь информацию из IncreaseLiquidity events.
+        Каждое событие содержит: tokenId, liquidity, amount0, amount1.
+        """
+        results = []
+        pm_contract = self._get_pm_contract(position_manager_address)
+
+        # Парсим IncreaseLiquidity events для получения деталей
+        try:
+            events = pm_contract.events.IncreaseLiquidity().process_receipt(receipt)
+            for event in events:
+                args = event.get('args', {})
+                result = CallResult(
+                    success=True,
+                    return_data=b'',
+                    decoded_data={
+                        'event': 'IncreaseLiquidity',
+                        'tokenId': args.get('tokenId', 0),
+                        'liquidity': args.get('liquidity', 0),
+                        'amount0': args.get('amount0', 0),
+                        'amount1': args.get('amount1', 0),
+                    }
+                )
+                results.append(result)
+                logger.info(
+                    f"  Mint result: tokenId={args.get('tokenId')}, "
+                    f"liq={args.get('liquidity')}, "
+                    f"amount0={args.get('amount0')}, amount1={args.get('amount1')}"
+                )
+        except Exception as e:
+            logger.debug(f"Could not parse IncreaseLiquidity events via ABI: {e}")
+
+            # Fallback: парсим вручную из raw logs
+            increase_liq_topic = Web3.keccak(
+                text="IncreaseLiquidity(uint256,uint128,uint256,uint256)"
+            )
+            for log in receipt.get('logs', []):
+                if log['address'].lower() != position_manager_address.lower():
+                    continue
+                topics = log.get('topics', [])
+                if not topics or topics[0] != increase_liq_topic:
+                    continue
+                try:
+                    token_id = int(topics[1].hex(), 16) if len(topics) > 1 else 0
+                    data = log.get('data', b'')
+                    if isinstance(data, (bytes, bytearray)) and len(data) >= 96:
+                        liquidity = int.from_bytes(data[0:32], 'big')
+                        amount0 = int.from_bytes(data[32:64], 'big')
+                        amount1 = int.from_bytes(data[64:96], 'big')
+                    else:
+                        liquidity = amount0 = amount1 = 0
+
+                    results.append(CallResult(
+                        success=True,
+                        return_data=b'',
+                        decoded_data={
+                            'event': 'IncreaseLiquidity',
+                            'tokenId': token_id,
+                            'liquidity': liquidity,
+                            'amount0': amount0,
+                            'amount1': amount1,
+                        }
+                    ))
+                    logger.info(
+                        f"  Mint result (raw): tokenId={token_id}, "
+                        f"liq={liquidity}, amount0={amount0}, amount1={amount1}"
+                    )
+                except Exception as parse_err:
+                    logger.warning(f"Failed to parse IncreaseLiquidity log: {parse_err}")
+
+        # Если TX failed — один результат с success=False
+        if receipt.get('status', 0) != 1 and not results:
+            results.append(CallResult(
+                success=False,
+                return_data=b'',
+                decoded_data={'error': 'Transaction reverted'}
+            ))
+
+        return results
+
     def execute(
         self,
         gas_limit: int = None,
@@ -395,6 +483,7 @@ class Multicall3Batcher:
         nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
                 self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
+        tx_sent = False
         try:
             tx_params = {
                 'from': self.account.address,
@@ -415,30 +504,37 @@ class Multicall3Batcher:
             # Подпись и отправка
             signed = self.account.sign_transaction(tx)
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_sent = True
 
             logger.info(f"Transaction sent: {tx_hash.hex()}")
 
             # Ожидание подтверждения с таймаутом
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
 
+            # TX mined — nonce consumed (even if reverted)
             if self.nonce_manager:
-                if receipt['status'] == 1:
-                    self.nonce_manager.confirm_transaction(nonce)
-                else:
-                    self.nonce_manager.release_nonce(nonce)
+                self.nonce_manager.confirm_transaction(nonce)
 
-            # Декодирование результатов
-            results = []
-            token_ids = []
-
-            # Парсим события для получения token_ids
+            # Парсим события для получения token_ids и результатов
             token_ids = self._parse_events_from_receipt(receipt, position_manager_address)
+            results = self._parse_results_from_receipt(receipt, position_manager_address)
+
+            gas_used = receipt.get('gasUsed', 0)
+            status = receipt.get('status', 0)
+            logger.info(
+                f"Batch TX {'SUCCESS' if status == 1 else 'FAILED'}: "
+                f"{len(token_ids)} positions created, gas={gas_used}, "
+                f"{len(results)} call results parsed"
+            )
 
             return tx_hash.hex(), results, receipt, token_ids
 
         except Exception as e:
             if self.nonce_manager:
-                self.nonce_manager.release_nonce(nonce)
+                if tx_sent:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
             raise
 
     def simulate(self, position_manager_address: str = None) -> List[CallResult]:

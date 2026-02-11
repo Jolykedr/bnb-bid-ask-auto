@@ -232,6 +232,7 @@ class LiquidityProvider:
         Returns:
             Список позиций с рассчитанными параметрами
         """
+        from config import is_stablecoin
         # Determine if we need to invert price based on token order
         # Pool price = token1/token0
         # If token1 is stablecoin: pool price = USD price → invert_price = False
@@ -272,7 +273,7 @@ class LiquidityProvider:
             distribution_type=config.distribution_type,
             token0_decimals=config.token0_decimals,
             token1_decimals=config.token1_decimals,
-            token1_is_stable=True,
+            token1_is_stable=is_stablecoin(config.token1),
             invert_price=invert_price,
             decimal_tick_offset=dec_offset
         )
@@ -474,6 +475,7 @@ class LiquidityProvider:
         nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
                 self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
+        tx_sent = False
         try:
             tx = approve_fn.build_transaction({
                 'from': self.account.address,
@@ -484,17 +486,26 @@ class LiquidityProvider:
 
             signed = self.account.sign_transaction(tx)
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-            self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+            tx_sent = True
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
 
             if self.nonce_manager:
                 self.nonce_manager.confirm_transaction(nonce)
+
+            if receipt.get('status', 0) != 1:
+                raise Exception(
+                    f"Approve TX reverted! TX: {tx_hash.hex()}, gasUsed: {receipt.get('gasUsed', 'N/A')}"
+                )
 
             logger.info(f"Approved! TX: {tx_hash.hex()}")
             return tx_hash.hex()
 
         except Exception as e:
             if self.nonce_manager:
-                self.nonce_manager.release_nonce(nonce)
+                if tx_sent:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
             raise
 
     def create_ladder(
@@ -864,8 +875,14 @@ class LiquidityProvider:
             position_manager_address=self.position_manager_address
         )
         gas_used = receipt.get('gasUsed', None)
+        success = receipt.get('status', 0) == 1
 
-        return tx_hash, True, gas_used
+        if success:
+            logger.info(f"Positions closed successfully! TX: {tx_hash}")
+        else:
+            logger.error(f"Close positions TX reverted! TX: {tx_hash}")
+
+        return tx_hash, success, gas_used
 
     def get_token_balance(self, token_address: str, address: str = None) -> int:
         """Получение баланса токена."""

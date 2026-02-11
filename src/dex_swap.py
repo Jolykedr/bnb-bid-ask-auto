@@ -372,6 +372,64 @@ class DexSwap:
         except:
             return 18
 
+    # ERC20 Transfer(address,address,uint256) event topic
+    TRANSFER_TOPIC = Web3.keccak(text="Transfer(address,address,uint256)")
+
+    def _parse_actual_output(self, receipt, to_token: str, wallet_address: str) -> Optional[int]:
+        """
+        Парсинг реально полученного количества из Transfer event в receipt.
+
+        Args:
+            receipt: Transaction receipt
+            to_token: Адрес выходного токена
+            wallet_address: Адрес получателя
+
+        Returns:
+            Actual amount received или None если не удалось распарсить
+        """
+        try:
+            to_token_lower = to_token.lower()
+            wallet_lower = wallet_address.lower()
+            best_amount = 0
+
+            for log_entry in receipt.get('logs', []):
+                # Проверяем: адрес контракта = to_token
+                if log_entry.get('address', '').lower() != to_token_lower:
+                    continue
+
+                topics = log_entry.get('topics', [])
+                if len(topics) < 3:
+                    continue
+
+                # Topic[0] = Transfer event signature
+                if topics[0] != self.TRANSFER_TOPIC:
+                    continue
+
+                # Topic[2] = recipient (padded address)
+                recipient = '0x' + topics[2].hex()[-40:]
+                if recipient.lower() != wallet_lower:
+                    continue
+
+                # Data = amount (uint256)
+                data = log_entry.get('data', b'')
+                if isinstance(data, (bytes, bytearray)):
+                    amount = int.from_bytes(data, 'big')
+                else:
+                    amount = int(data, 16) if data.startswith('0x') else int(data)
+
+                # Берём наибольший transfer (на случай нескольких)
+                if amount > best_amount:
+                    best_amount = amount
+
+            if best_amount > 0:
+                logger.info(f"Parsed actual output from Transfer event: {best_amount}")
+                return best_amount
+
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to parse Transfer events: {e}")
+            return None
+
     def get_quote(self, from_token: str, to_token: str, amount_in: int) -> int:
         """
         Получить котировку для свопа.
@@ -421,7 +479,7 @@ class DexSwap:
 
         return []
 
-    def get_quote_v3(self, from_token: str, to_token: str, amount_in: int, fee: int = None) -> Tuple[int, int]:
+    def get_quote_v3(self, from_token: str, to_token: str, amount_in: int, fee: int = None) -> Tuple[int, int, int]:
         """
         Получить котировку V3 для свопа.
 
@@ -432,10 +490,11 @@ class DexSwap:
             fee: Fee tier (100, 500, 2500/3000, 10000). Если None - пробуем все
 
         Returns:
-            (amount_out, best_fee) - количество токенов на выходе и лучший fee tier
+            (amount_out, best_fee, multi_hop_fee2) - количество на выходе, fee,
+            и fee2 для multi-hop (0 = direct swap)
         """
         if not self.v3_available:
-            return (0, 0)
+            return (0, 0, 0)
 
         from_token = Web3.to_checksum_address(from_token)
         to_token = Web3.to_checksum_address(to_token)
@@ -443,6 +502,7 @@ class DexSwap:
         fees_to_try = [fee] if fee else self.fee_tiers
         best_out = 0
         best_fee = 0
+        best_fee2 = 0  # 0 = direct swap
 
         for fee_tier in fees_to_try:
             try:
@@ -461,14 +521,15 @@ class DexSwap:
                 if amount_out > best_out:
                     best_out = amount_out
                     best_fee = fee_tier
+                    best_fee2 = 0  # direct
                     logger.debug(f"V3 quote fee={fee_tier}: {amount_out}")
 
             except Exception as e:
                 logger.debug(f"V3 quote failed for fee={fee_tier}: {e}")
                 continue
 
-        # Если прямой путь не работает, пробуем через WETH (multi-hop)
-        if best_out == 0 and from_token.lower() != self.weth_address.lower() and to_token.lower() != self.weth_address.lower():
+        # Пробуем через WETH (multi-hop) — даже если прямой путь найден
+        if from_token.lower() != self.weth_address.lower() and to_token.lower() != self.weth_address.lower():
             for fee1 in self.fee_tiers[:2]:  # Только низкие fee для первого хопа
                 for fee2 in self.fee_tiers[:2]:
                     try:
@@ -485,13 +546,14 @@ class DexSwap:
 
                             if final_amount > best_out:
                                 best_out = final_amount
-                                best_fee = fee1  # Используем fee первого хопа как индикатор
-                                logger.debug(f"V3 multi-hop quote: {final_amount}")
+                                best_fee = fee1
+                                best_fee2 = fee2
+                                logger.debug(f"V3 multi-hop quote fee1={fee1} fee2={fee2}: {final_amount}")
 
                     except Exception as e:
                         continue
 
-        return (best_out, best_fee)
+        return (best_out, best_fee, best_fee2)
 
     def swap_v3(
         self,
@@ -533,7 +595,7 @@ class DexSwap:
             wallet_address = Web3.to_checksum_address(wallet_address)
 
             # Получить лучшую котировку
-            expected_out, best_fee = self.get_quote_v3(from_token, to_token, amount_in, fee)
+            expected_out, best_fee, multi_hop_fee2 = self.get_quote_v3(from_token, to_token, amount_in, fee)
 
             if expected_out == 0:
                 return SwapResult(
@@ -542,7 +604,11 @@ class DexSwap:
                     error="No V3 liquidity found"
                 )
 
-            logger.info(f"V3 swap: best fee tier = {best_fee/10000}%, expected out = {expected_out}")
+            is_multi_hop = multi_hop_fee2 > 0
+            if is_multi_hop:
+                logger.info(f"V3 swap: MULTI-HOP fee1={best_fee/10000}% fee2={multi_hop_fee2/10000}%, expected out = {expected_out}")
+            else:
+                logger.info(f"V3 swap: DIRECT fee={best_fee/10000}%, expected out = {expected_out}")
 
             # Рассчитать минимум с учётом слипажа
             min_out = int(expected_out * (100 - slippage) / 100)
@@ -559,27 +625,46 @@ class DexSwap:
             import time
             deadline = int(time.time()) + (deadline_minutes * 60)
 
-            # Построить параметры для exactInputSingle
-            swap_params = (
-                from_token,       # tokenIn
-                to_token,         # tokenOut
-                best_fee,         # fee
-                wallet_address,   # recipient
-                amount_in,        # amountIn
-                min_out,          # amountOutMinimum
-                0                 # sqrtPriceLimitX96 (0 = no limit)
-            )
-
-            # Encode exactInputSingle call
-            swap_data = self.router_v3.encodeABI(
-                fn_name='exactInputSingle',
-                args=[swap_params]
-            )
+            if is_multi_hop:
+                # Multi-hop: encode path as bytes (tokenIn + fee1 + WETH + fee2 + tokenOut)
+                path = (
+                    bytes.fromhex(from_token[2:])
+                    + best_fee.to_bytes(3, 'big')
+                    + bytes.fromhex(self.weth_address[2:])
+                    + multi_hop_fee2.to_bytes(3, 'big')
+                    + bytes.fromhex(to_token[2:])
+                )
+                swap_params = (
+                    path,             # path (encoded)
+                    wallet_address,   # recipient
+                    amount_in,        # amountIn
+                    min_out,          # amountOutMinimum
+                )
+                swap_data = self.router_v3.encodeABI(
+                    fn_name='exactInput',
+                    args=[swap_params]
+                )
+            else:
+                # Direct: exactInputSingle
+                swap_params = (
+                    from_token,       # tokenIn
+                    to_token,         # tokenOut
+                    best_fee,         # fee
+                    wallet_address,   # recipient
+                    amount_in,        # amountIn
+                    min_out,          # amountOutMinimum
+                    0                 # sqrtPriceLimitX96 (0 = no limit)
+                )
+                swap_data = self.router_v3.encodeABI(
+                    fn_name='exactInputSingle',
+                    args=[swap_params]
+                )
 
             # Использовать multicall с deadline
             nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
                     self.w3.eth.get_transaction_count(wallet_address, 'pending')
 
+            tx_sent = False
             try:
                 tx = self.router_v3.functions.multicall(
                     deadline,
@@ -587,7 +672,7 @@ class DexSwap:
                 ).build_transaction({
                     'from': wallet_address,
                     'nonce': nonce,
-                    'gas': 350000,
+                    'gas': 500000 if is_multi_hop else 350000,
                     'gasPrice': self.w3.eth.gas_price,
                     'value': 0
                 })
@@ -595,6 +680,7 @@ class DexSwap:
                 # Подписать и отправить
                 signed_tx = self.w3.eth.account.sign_transaction(tx, private_key)
                 tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                tx_sent = True
 
                 logger.info(f"V3 Swap TX sent: {tx_hash.hex()}")
 
@@ -602,18 +688,28 @@ class DexSwap:
                 receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
 
                 if self.nonce_manager:
-                    if receipt.status == 1:
+                    self.nonce_manager.confirm_transaction(nonce)
+            except Exception as e:
+                if self.nonce_manager:
+                    if tx_sent:
                         self.nonce_manager.confirm_transaction(nonce)
                     else:
                         self.nonce_manager.release_nonce(nonce)
-            except Exception as e:
-                if self.nonce_manager:
-                    self.nonce_manager.release_nonce(nonce)
                 raise
 
             if receipt.status == 1:
+                # Парсим реальное количество из Transfer events
+                actual_out = self._parse_actual_output(receipt, to_token, wallet_address)
+                if actual_out is None:
+                    actual_out = expected_out
+                    logger.warning(f"Could not parse actual output, using expected: {expected_out}")
+                else:
+                    if actual_out != expected_out:
+                        logger.info(f"Actual output differs: expected={expected_out}, actual={actual_out}")
+
+                # USD: для стейблкоинов amount/10^decimals ≈ USD, для остальных конвертируем
                 to_decimals = self.get_token_decimals(to_token)
-                to_amount_usd = expected_out / (10 ** to_decimals)
+                to_amount_usd = actual_out / (10 ** to_decimals)
 
                 return SwapResult(
                     success=True,
@@ -621,7 +717,7 @@ class DexSwap:
                     from_token=from_token,
                     to_token=to_token,
                     from_amount=amount_in,
-                    to_amount=expected_out,
+                    to_amount=actual_out,
                     to_amount_usd=to_amount_usd,
                     gas_used=receipt.gasUsed
                 )
@@ -692,10 +788,7 @@ class DexSwap:
                 receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
 
                 if self.nonce_manager:
-                    if receipt.status == 1:
-                        self.nonce_manager.confirm_transaction(nonce)
-                    else:
-                        self.nonce_manager.release_nonce(nonce)
+                    self.nonce_manager.confirm_transaction(nonce)
 
                 return receipt.status == 1
 
@@ -758,10 +851,7 @@ class DexSwap:
                 receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
 
                 if self.nonce_manager:
-                    if receipt.status == 1:
-                        self.nonce_manager.confirm_transaction(nonce)
-                    else:
-                        self.nonce_manager.release_nonce(nonce)
+                    self.nonce_manager.confirm_transaction(nonce)
 
                 return receipt.status == 1
 
@@ -844,7 +934,7 @@ class DexSwap:
             # Пробуем V3 сначала (если доступен и prefer_v3=True)
             if prefer_v3 and self.v3_available:
                 logger.info("Trying V3 swap first...")
-                v3_quote, best_fee = self.get_quote_v3(from_token, to_token, amount_in)
+                v3_quote, best_fee, _ = self.get_quote_v3(from_token, to_token, amount_in)
 
                 if v3_quote > 0:
                     logger.info(f"V3 quote found: {v3_quote} (fee tier: {best_fee/10000}%)")
@@ -960,6 +1050,7 @@ class DexSwap:
             nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
                     self.w3.eth.get_transaction_count(wallet_address, 'pending')
 
+            tx_sent = False
             try:
                 if use_fee_on_transfer:
                     tx = self.router.functions.swapExactTokensForTokensSupportingFeeOnTransferTokens(
@@ -991,6 +1082,7 @@ class DexSwap:
                 # Подписать и отправить
                 signed_tx = self.w3.eth.account.sign_transaction(tx, private_key)
                 tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                tx_sent = True
 
                 logger.info(f"V2 Swap TX sent: {tx_hash.hex()}")
 
@@ -998,17 +1090,24 @@ class DexSwap:
                 receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
 
                 if self.nonce_manager:
-                    if receipt.status == 1:
+                    self.nonce_manager.confirm_transaction(nonce)
+            except Exception as e:
+                if self.nonce_manager:
+                    if tx_sent:
                         self.nonce_manager.confirm_transaction(nonce)
                     else:
                         self.nonce_manager.release_nonce(nonce)
-            except Exception as e:
-                if self.nonce_manager:
-                    self.nonce_manager.release_nonce(nonce)
                 raise
 
             if receipt.status == 1:
-                actual_out = expected_out
+                # Парсим реальное количество из Transfer events
+                actual_out = self._parse_actual_output(receipt, to_token, wallet_address)
+                if actual_out is None:
+                    actual_out = expected_out
+                    logger.warning(f"Could not parse actual V2 output, using expected: {expected_out}")
+                else:
+                    if actual_out != expected_out:
+                        logger.info(f"V2 actual output differs: expected={expected_out}, actual={actual_out}")
 
                 to_decimals = self.get_token_decimals(to_token)
                 to_amount_usd = actual_out / (10 ** to_decimals)

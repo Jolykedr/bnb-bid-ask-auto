@@ -725,12 +725,11 @@ class TestV4LiquidityProvider:
         spender_used = allowance_call_args[0][1]  # Второй позиционный аргумент
         assert spender_used.lower() == provider.position_manager.position_manager_address.lower()
 
-    def test_check_and_approve_failed_tx_releases_nonce(self, provider):
-        """При неуспешной транзакции nonce освобождается.
+    def test_check_and_approve_failed_tx_confirms_nonce(self, provider):
+        """При ревертнутой TX nonce подтверждается (он использован on-chain).
 
-        Примечание: release_nonce вызывается дважды — сначала в блоке
-        'if receipt.status != 1', затем в 'except' (т.к. raise re-enters except).
-        Важно, что nonce гарантированно освобождён.
+        TX была отправлена и замайнена (status=0), значит nonce потрачен.
+        Нужно confirm, а не release, иначе будет nonce gap.
         """
         mock_contract = Mock()
         mock_contract.functions.allowance = Mock(
@@ -742,10 +741,10 @@ class TestV4LiquidityProvider:
         provider.w3.eth.contract = Mock(return_value=mock_contract)
         provider.gas_estimator.estimate = Mock(return_value=60_000)
 
-        # Транзакция не проходит
+        # Транзакция замайнена но ревертнулась
         provider.w3.eth.send_raw_transaction = Mock(return_value=b'\xaa' * 32)
         provider.w3.eth.wait_for_transaction_receipt = Mock(return_value={
-            'status': 0,  # FAILED
+            'status': 0,  # FAILED but mined
             'gasUsed': 21_000,
         })
 
@@ -756,9 +755,10 @@ class TestV4LiquidityProvider:
                 spender="0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
             )
 
-        # release_nonce вызывается 2 раза: в блоке status!=1 и в except (re-raise)
-        assert provider.nonce_manager.release_nonce.call_count >= 1
-        provider.nonce_manager.release_nonce.assert_called_with(1)
+        # confirm_transaction (не release!) — nonce использован on-chain
+        provider.nonce_manager.confirm_transaction.assert_called_with(1)
+        # release_nonce НЕ должен вызываться (TX была отправлена)
+        provider.nonce_manager.release_nonce.assert_not_called()
 
     def test_check_and_approve_exception_releases_nonce(self, provider):
         """При исключении во время approve nonce освобождается."""
@@ -957,8 +957,8 @@ class TestV4LiquidityProvider:
         assert isinstance(result, str)
         provider.nonce_manager.confirm_transaction.assert_called_once()
 
-    def test_approve_on_permit2_failed_tx_raises(self, provider):
-        """При неуспешной транзакции Permit2 approve выбрасывает исключение."""
+    def test_approve_on_permit2_failed_tx_confirms_nonce(self, provider):
+        """При ревертнутой Permit2 approve TX nonce подтверждается (использован on-chain)."""
         mock_contract = Mock()
         mock_approve_fn = Mock()
         mock_approve_fn.build_transaction = Mock(return_value={})
@@ -980,7 +980,10 @@ class TestV4LiquidityProvider:
                 permit2_address=PERMIT2_PANCAKESWAP,
             )
 
-        provider.nonce_manager.release_nonce.assert_called()
+        # TX была отправлена и замайнена (status=0) → nonce использован → confirm
+        provider.nonce_manager.confirm_transaction.assert_called_with(1)
+        # release НЕ должен вызываться
+        provider.nonce_manager.release_nonce.assert_not_called()
 
     def test_approve_on_permit2_zero_expiration_raises(self, provider):
         """Если Permit2 allowance не установился (expiration=0), выбрасывает ошибку."""

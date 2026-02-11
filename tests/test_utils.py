@@ -264,15 +264,14 @@ class TestDecimalsCache:
         assert d2 == 6
         assert w3.eth.contract.call_count == 1
 
-    def test_fallback_on_error(self):
-        """При ошибке возвращается 18 (по умолчанию)."""
+    def test_raises_on_rpc_error(self):
+        """При ошибке RPC бросает RuntimeError (не молчит с 18)."""
         w3 = MagicMock()
         w3.eth.contract.side_effect = Exception("RPC error")
 
         cache = DecimalsCache(w3)
-        decimals = cache.get_decimals("0x0000000000000000000000000000000000000003")
-
-        assert decimals == 18
+        with pytest.raises(RuntimeError, match="Cannot determine decimals"):
+            cache.get_decimals("0x0000000000000000000000000000000000000003")
 
     def test_get_decimals_batch(self):
         """Batch получение decimals для нескольких токенов."""

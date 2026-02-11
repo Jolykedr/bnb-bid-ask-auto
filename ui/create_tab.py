@@ -399,7 +399,7 @@ class CreateLadderWorker(QThread):
                 distribution_type=self.config.distribution_type,
                 token0_decimals=self.config.token0_decimals,
                 token1_decimals=self.config.token1_decimals,
-                token1_is_stable=True,
+                token1_is_stable=is_stablecoin(self.config.token1),
                 invert_price=invert_price,
                 decimal_tick_offset=dec_offset
             )

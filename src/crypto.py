@@ -16,6 +16,7 @@ Secure Key Storage Module
 
 import os
 import base64
+import ctypes
 import hashlib
 import secrets
 from typing import Optional, Tuple
@@ -45,6 +46,24 @@ NONCE_SIZE = 12    # 96 бит (рекомендуется для GCM)
 KEY_SIZE = 32      # 256 бит для AES-256
 TAG_SIZE = 16      # 128 бит (стандарт для GCM)
 ITERATIONS = 600_000  # OWASP рекомендация для PBKDF2-SHA256 (2023)
+
+
+def _secure_zero(data):
+    """
+    Обнуление байтов в памяти (best-effort для CPython).
+
+    Работает с bytearray и bytes. Для immutable bytes использует ctypes
+    для прямой записи в буфер (CPython-specific, не гарантируется).
+    """
+    if isinstance(data, bytearray):
+        for i in range(len(data)):
+            data[i] = 0
+    elif isinstance(data, bytes) and len(data) > 0:
+        try:
+            buf = (ctypes.c_char * len(data)).from_address(id(data) + bytes.__basicsize__)
+            ctypes.memset(buf, 0, len(data))
+        except Exception:
+            pass  # Не-CPython или другая ошибка — пропускаем
 
 
 class CryptoError(Exception):
@@ -136,23 +155,29 @@ def encrypt_key(private_key: str, password: str) -> str:
     # Деривация ключа из пароля
     key = _derive_key(password, salt)
 
-    # Шифруем
-    plaintext = private_key.encode('utf-8')
+    try:
+        # Шифруем
+        plaintext = bytearray(private_key.encode('utf-8'))
 
-    if CRYPTO_BACKEND == "cryptography":
-        aesgcm = AESGCM(key)
-        ciphertext = aesgcm.encrypt(nonce, plaintext, None)  # ciphertext + tag
+        if CRYPTO_BACKEND == "cryptography":
+            aesgcm = AESGCM(key)
+            ciphertext = aesgcm.encrypt(nonce, bytes(plaintext), None)  # ciphertext + tag
 
-    elif CRYPTO_BACKEND == "pycryptodome":
-        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
-        ciphertext, tag = cipher.encrypt_and_digest(plaintext)
-        ciphertext = ciphertext + tag  # Объединяем для совместимости
+        elif CRYPTO_BACKEND == "pycryptodome":
+            cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+            ciphertext, tag = cipher.encrypt_and_digest(bytes(plaintext))
+            ciphertext = ciphertext + tag  # Объединяем для совместимости
 
-    # Формат: version + salt + nonce + ciphertext
-    encrypted_data = VERSION + salt + nonce + ciphertext
+        # Формат: version + salt + nonce + ciphertext
+        encrypted_data = VERSION + salt + nonce + ciphertext
 
-    # Возвращаем как base64 для удобного хранения
-    return base64.b64encode(encrypted_data).decode('ascii')
+        # Возвращаем как base64 для удобного хранения
+        return base64.b64encode(encrypted_data).decode('ascii')
+    finally:
+        # Обнуление sensitive data
+        if 'plaintext' in dir():
+            _secure_zero(plaintext)
+        _secure_zero(key)
 
 
 def decrypt_key(encrypted_data: str, password: str) -> str:
@@ -196,20 +221,27 @@ def decrypt_key(encrypted_data: str, password: str) -> str:
         # Деривация ключа
         key = _derive_key(password, salt)
 
-        # Расшифровываем
-        if CRYPTO_BACKEND == "cryptography":
-            aesgcm = AESGCM(key)
-            plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+        try:
+            # Расшифровываем
+            if CRYPTO_BACKEND == "cryptography":
+                aesgcm = AESGCM(key)
+                plaintext_bytes = aesgcm.decrypt(nonce, ciphertext, None)
 
-        elif CRYPTO_BACKEND == "pycryptodome":
-            # Разделяем ciphertext и tag
-            actual_ciphertext = ciphertext[:-TAG_SIZE]
-            tag = ciphertext[-TAG_SIZE:]
+            elif CRYPTO_BACKEND == "pycryptodome":
+                # Разделяем ciphertext и tag
+                actual_ciphertext = ciphertext[:-TAG_SIZE]
+                tag = ciphertext[-TAG_SIZE:]
 
-            cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
-            plaintext = cipher.decrypt_and_verify(actual_ciphertext, tag)
+                cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+                plaintext_bytes = cipher.decrypt_and_verify(actual_ciphertext, tag)
 
-        return plaintext.decode('utf-8')
+            result = plaintext_bytes.decode('utf-8')
+            return result
+        finally:
+            # Обнуление sensitive data
+            if 'plaintext_bytes' in dir():
+                _secure_zero(plaintext_bytes)
+            _secure_zero(key)
 
     except (ValueError, base64.binascii.Error) as e:
         raise DecryptionError(f"Повреждённые данные: {e}")
