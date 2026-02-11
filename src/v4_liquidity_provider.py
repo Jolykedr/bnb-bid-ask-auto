@@ -1706,7 +1706,7 @@ class V4LiquidityProvider:
                         Web3.to_checksum_address(pos_manager_addr)
                     ).call()
                     permit2_info = f"({permit2_allowance[0]}, exp={permit2_allowance[1]})"
-                except:
+                except Exception:
                     permit2_info = "(error)"
 
                 logger.info(f"  {token_name} ({token_addr[:10]}...): balance={balance}, ERC20->Permit2={erc20_allowance}, Permit2->PosMan={permit2_info}")

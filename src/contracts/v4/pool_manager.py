@@ -34,7 +34,10 @@ class PoolKey:
         )
 
     def get_pool_id(self) -> bytes:
-        """Calculate pool ID (keccak256 of encoded pool key)."""
+        """Calculate pool ID for Uniswap V4 (keccak256 of encoded pool key).
+        NOTE: For PancakeSwap V4, use V4PoolManager._compute_pool_id() instead —
+        PancakeSwap uses a different PoolKey encoding format.
+        """
         encoded = encode(
             ['address', 'address', 'uint24', 'int24', 'address'],
             list(self.to_tuple())

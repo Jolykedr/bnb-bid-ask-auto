@@ -249,7 +249,7 @@ class PoolFactory:
         try:
             decimals = token.functions.decimals().call()
         except Exception as e:
-            logger.debug(f"Failed to get decimals for {address}: {e}")
+            logger.warning(f"Failed to get decimals for {address}: {e}, defaulting to 18")
             decimals = 18
 
         try:

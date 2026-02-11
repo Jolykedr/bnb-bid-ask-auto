@@ -12,7 +12,6 @@ Uniswap V3 Liquidity Mathematics
 
 from decimal import Decimal, getcontext
 from dataclasses import dataclass
-from .ticks import tick_to_price, Q96
 
 # Высокая точность для финансовых расчётов
 getcontext().prec = 50

@@ -148,6 +148,35 @@ class V4PositionManager:
             traceback.print_exc()
             print(f"[V4] Trying legacy getPositionInfo...")
 
+        # Try PancakeSwap-specific positions() function
+        try:
+            result = self.contract.functions.positions(token_id).call()
+            # Returns: (poolKey, tickLower, tickUpper, liquidity)
+            pool_key_tuple = result[0]
+            tick_lower = result[1]
+            tick_upper = result[2]
+            liquidity = result[3]
+
+            pool_key = PoolKey(
+                currency0=pool_key_tuple[0],
+                currency1=pool_key_tuple[1],
+                fee=pool_key_tuple[2],
+                tick_spacing=pool_key_tuple[3],
+                hooks=pool_key_tuple[4]
+            )
+
+            print(f"[V4] positions() success: {pool_key.currency0[:10]}.../{pool_key.currency1[:10]}..., liq={liquidity}")
+
+            return V4Position(
+                token_id=token_id,
+                pool_key=pool_key,
+                tick_lower=tick_lower,
+                tick_upper=tick_upper,
+                liquidity=liquidity
+            )
+        except Exception as e:
+            print(f"[V4] positions() failed for {token_id}: {e}")
+
         # Try legacy getPositionInfo
         try:
             result = self.contract.functions.getPositionInfo(token_id).call()
@@ -771,6 +800,9 @@ class V4PositionManager:
             if self.nonce_manager:
                 self.nonce_manager.confirm_transaction(nonce)
 
+            if receipt['status'] != 1:
+                raise Exception(f"Mint position reverted! TX: {tx_hash.hex()}")
+
             # Parse Transfer event to get tokenId
             token_id = self._parse_mint_event(receipt)
 
@@ -882,6 +914,9 @@ class V4PositionManager:
             if self.nonce_manager:
                 self.nonce_manager.confirm_transaction(nonce)
 
+            if receipt['status'] != 1:
+                raise Exception(f"Close position reverted! TX: {tx_hash.hex()}, token_id: {token_id}")
+
             return tx_hash.hex(), 0, 0  # Amounts would need log parsing
 
         except Exception as e:
@@ -975,6 +1010,9 @@ class V4PositionManager:
             # TX mined — nonce consumed (even if reverted)
             if self.nonce_manager:
                 self.nonce_manager.confirm_transaction(nonce)
+
+            if receipt['status'] != 1:
+                raise Exception(f"Close position with tokens reverted! TX: {tx_hash.hex()}, token_id: {token_id}")
 
             return tx_hash.hex(), 0, 0
 
@@ -1419,9 +1457,13 @@ class V4PositionManager:
         token_ids = []
 
         try:
-            # BSCScan API endpoint for ERC721 token transfers
-            # We get all NFT transfers TO this address from this contract
-            api_url = "https://api.bscscan.com/api"
+            # Select block explorer API by chain
+            EXPLORER_APIS = {
+                56: "https://api.bscscan.com/api",
+                1: "https://api.etherscan.io/api",
+                8453: "https://api.basescan.org/api",
+            }
+            api_url = EXPLORER_APIS.get(self.chain_id, "https://api.bscscan.com/api")
 
             params = {
                 'module': 'account',
@@ -1430,7 +1472,7 @@ class V4PositionManager:
                 'address': address,
                 'page': 1,
                 'offset': 1000,  # Max 1000 results
-                'sort': 'desc'
+                'sort': 'asc'  # Oldest first — so last write per token_id = newest transfer
             }
 
             print(f"[V4] Querying BSCScan API for NFTs...")

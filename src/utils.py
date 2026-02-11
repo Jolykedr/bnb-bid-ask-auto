@@ -538,7 +538,7 @@ class BatchRPC:
         def decode_uint8(data: bytes) -> int:
             if len(data) >= 32:
                 return int.from_bytes(data[:32], 'big')
-            return 18  # Default
+            raise RuntimeError(f"Failed to decode decimals for {token_address}: response too short ({len(data)} bytes)")
 
         self.add_call(token_address, call_data, decode_uint8)
 

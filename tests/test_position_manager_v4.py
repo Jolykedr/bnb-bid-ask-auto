@@ -313,6 +313,10 @@ class TestV4PositionManager:
         pm.contract.functions.getPoolAndPositionInfo.return_value = MagicMock(
             call=MagicMock(side_effect=Exception("not supported"))
         )
+        # positions() (PancakeSwap path) also fails
+        pm.contract.functions.positions.return_value = MagicMock(
+            call=MagicMock(side_effect=Exception("not supported"))
+        )
 
         pool_key_tuple = (
             Web3.to_checksum_address(TOKEN_A),

@@ -14,10 +14,8 @@ Secure Key Storage Module
     - Защита от timing attacks через constant-time сравнения
 """
 
-import os
 import base64
 import ctypes
-import hashlib
 import secrets
 from typing import Optional, Tuple
 

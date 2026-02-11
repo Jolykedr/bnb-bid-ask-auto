@@ -146,11 +146,12 @@ class UniswapV3PositionManager:
             # Ждём подтверждения с таймаутом
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
 
+            # TX mined — nonce consumed (even if reverted)
             if self.nonce_manager:
-                if receipt['status'] == 1:
-                    self.nonce_manager.confirm_transaction(nonce)
-                else:
-                    self.nonce_manager.release_nonce(nonce)
+                self.nonce_manager.confirm_transaction(nonce)
+
+            if receipt['status'] != 1:
+                raise Exception(f"Approve transaction reverted! TX: {tx_hash.hex()}")
 
             return tx_hash.hex()
 

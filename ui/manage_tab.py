@@ -579,7 +579,7 @@ class ScanWalletWorker(QThread):
                                     abi=ERC20_ABI + [{"inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}], "stateMutability": "view", "type": "function"}]
                                 )
                                 token0_symbol = token0_contract.functions.symbol().call()
-                            except:
+                            except Exception:
                                 pass
                             try:
                                 token1_contract = self.provider.w3.eth.contract(
@@ -587,7 +587,7 @@ class ScanWalletWorker(QThread):
                                     abi=ERC20_ABI + [{"inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}], "stateMutability": "view", "type": "function"}]
                                 )
                                 token1_symbol = token1_contract.functions.symbol().call()
-                            except:
+                            except Exception:
                                 pass
 
                         # Convert V4Position to dict format compatible with table
@@ -1713,6 +1713,15 @@ class ManageTab(QWidget):
 
     def _load_positions_by_ids(self, token_ids: list, protocol: str = None):
         """Load specific positions by their IDs."""
+        # Cancel existing workers to prevent duplicates
+        if self.load_workers:
+            for w in self.load_workers:
+                if w.isRunning():
+                    w.quit()
+                    w.wait(1000)
+                w.deleteLater()
+            self.load_workers.clear()
+
         try:
             self.progress_bar.show()
 
@@ -2020,38 +2029,10 @@ class ManageTab(QWidget):
         token0_sym = position.get('token0_symbol', '')
         token1_sym = position.get('token1_symbol', '')
 
-        # Known stablecoin addresses on BNB Chain (lowercase for comparison)
-        STABLECOIN_ADDRESSES = {
-            "0x55d398326f99059ff775485246999027b3197955": "USDT",  # BSC-USD (USDT)
-            "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": "USDC",  # USD Coin
-            "0xe9e7cea3dedca5984780bafc599bd69add087d56": "BUSD",  # BUSD
-            "0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3": "DAI",   # DAI
-            "0x14016e85a25aeb13065688cafb43044c2ef86784": "TUSD",  # TrueUSD
-        }
-
-        stablecoins_symbols = ["USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "FRAX"]
-
-        # Check by address first (more reliable for V4)
-        token0_addr_lower = token0_addr.lower() if token0_addr else ''
-        token1_addr_lower = token1_addr.lower() if token1_addr else ''
-
-        if token0_addr_lower in STABLECOIN_ADDRESSES:
-            token0_is_stable = True
-            if not token0_sym:
-                token0_sym = STABLECOIN_ADDRESSES[token0_addr_lower]
-        elif token0_sym and token0_sym.upper() in stablecoins_symbols:
-            token0_is_stable = True
-        else:
-            token0_is_stable = False
-
-        if token1_addr_lower in STABLECOIN_ADDRESSES:
-            token1_is_stable = True
-            if not token1_sym:
-                token1_sym = STABLECOIN_ADDRESSES[token1_addr_lower]
-        elif token1_sym and token1_sym.upper() in stablecoins_symbols:
-            token1_is_stable = True
-        else:
-            token1_is_stable = False
+        # Use centralized stablecoin detection (supports BNB, BASE, ETH)
+        from config import is_stablecoin
+        token0_is_stable = bool(token0_addr) and is_stablecoin(token0_addr)
+        token1_is_stable = bool(token1_addr) and is_stablecoin(token1_addr)
 
         # Default symbols if not found
         if not token0_sym:
@@ -2611,7 +2592,7 @@ class ManageTab(QWidget):
                     private_key = main_window.create_tab.private_key
                 elif hasattr(self.provider, 'account') and hasattr(self.provider.account, 'key'):
                     private_key = self.provider.account.key.hex()
-            except:
+            except Exception:
                 pass
 
             if not private_key:
@@ -2750,7 +2731,7 @@ class ManageTab(QWidget):
                     private_key = main_window.create_tab.private_key
                 elif hasattr(self.provider, 'account') and hasattr(self.provider.account, 'key'):
                     private_key = self.provider.account.key.hex()
-            except:
+            except Exception:
                 pass
 
             if not private_key:

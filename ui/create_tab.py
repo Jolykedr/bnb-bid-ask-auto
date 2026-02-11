@@ -1094,6 +1094,8 @@ class CreateTab(QWidget):
             actual_symbol = symbol.replace("[Custom] ", "")
             if actual_symbol in self.custom_tokens:
                 self.token0_input.setText(self.custom_tokens[actual_symbol])
+                if hasattr(self, 'custom_token_decimals') and actual_symbol in self.custom_token_decimals:
+                    self._token0_decimals = self.custom_token_decimals[actual_symbol]
         elif symbol in tokens:
             self.token0_input.setText(tokens[symbol].address)
             self._token0_decimals = tokens[symbol].decimals
@@ -1108,6 +1110,8 @@ class CreateTab(QWidget):
             actual_symbol = symbol.replace("[Custom] ", "")
             if actual_symbol in self.custom_tokens:
                 self.token1_input.setText(self.custom_tokens[actual_symbol])
+                if hasattr(self, 'custom_token_decimals') and actual_symbol in self.custom_token_decimals:
+                    self._token1_decimals = self.custom_token_decimals[actual_symbol]
         elif symbol in tokens:
             self.token1_input.setText(tokens[symbol].address)
             self._token1_decimals = tokens[symbol].decimals
@@ -1489,7 +1493,11 @@ class CreateTab(QWidget):
             return
 
         # Calculate price range
-        current_price = float(self.price_input.text().strip())
+        try:
+            current_price = float(self.price_input.text().strip())
+        except (ValueError, AttributeError):
+            QMessageBox.critical(self, "Error", "Invalid price value")
+            return
         percent_from = self.range_from_spin.value()
         percent_to = self.range_to_spin.value()
 
@@ -1948,13 +1956,18 @@ class CreateTab(QWidget):
         current_token0 = self.token0_combo.currentText()
         current_token1 = self.token1_combo.currentText()
 
-        # Clear custom tokens and add new ones
+        # Clear custom tokens and add new ones (store decimals too)
         self.custom_tokens.clear()
+        if not hasattr(self, 'custom_token_decimals'):
+            self.custom_token_decimals = {}
+        self.custom_token_decimals.clear()
         for token in tokens:
             symbol = token.get('symbol', '')
             address = token.get('address', '')
+            decimals = token.get('decimals', 18)
             if symbol and address:
                 self.custom_tokens[symbol] = address
+                self.custom_token_decimals[symbol] = decimals
 
         # Rebuild combos using current network's tokens + custom tokens
         self._rebuild_token_combos()
@@ -2256,12 +2269,11 @@ class CreateTab(QWidget):
                                 self._log(f"Price calc: tick={state.tick}, raw={price_from_tick:.6f}, dec0={dec0}, dec1={dec1}")
                                 self._log(f"Price adjusted: {self._format_price(price_adjusted)}")
 
-                                # Check if token0 is stablecoin (need to invert)
-                                stablecoins = ["USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "FRAX", "FDUSD", "PYUSD", "LUSD", "GUSD", "SUSD", "USDD", "CUSD", "USDJ", "UST", "USDN", "MUSD", "HUSD", "USDX", "USD+", "USDCE", "USDC.E", "USDT.E", "BRIDGED"]
+                                # Check if token0 is stablecoin (need to invert) — by address
+                                t0_is_stable = is_stablecoin(subgraph_info.token0_address) if hasattr(subgraph_info, 'token0_address') else False
+                                t1_is_stable = is_stablecoin(subgraph_info.token1_address) if hasattr(subgraph_info, 'token1_address') else False
                                 t0_sym = subgraph_info.token0_symbol.upper()
                                 t1_sym = subgraph_info.token1_symbol.upper()
-                                t0_is_stable = t0_sym in stablecoins
-                                t1_is_stable = t1_sym in stablecoins
 
                                 self._log(f"Tokens: {t0_sym} (stable={t0_is_stable}) / {t1_sym} (stable={t1_is_stable})")
 
@@ -2339,10 +2351,9 @@ class CreateTab(QWidget):
                                 # price_adjusted = raw_price * 10^(decimals0 - decimals1)
                                 price_adjusted = raw_price * (10 ** (token0_dec - token1_dec))
 
-                                # Determine if we need to invert
-                                stablecoins = ["USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "FRAX", "FDUSD", "PYUSD", "LUSD", "GUSD", "SUSD", "USDD", "CUSD", "USDJ", "UST", "USDN", "MUSD", "HUSD", "USDX", "USD+", "USDCE", "USDC.E", "USDT.E", "BRIDGED"]
-                                token0_is_stable = token0_sym.upper() in stablecoins
-                                token1_is_stable = token1_sym.upper() in stablecoins
+                                # Determine if we need to invert — by address
+                                token0_is_stable = is_stablecoin(token0_addr) if token0_addr else False
+                                token1_is_stable = is_stablecoin(token1_addr) if token1_addr else False
 
                                 self._log(f"Raw price: {raw_price}, adjusted: {price_adjusted}")
                                 self._log(f"Token0 is stable: {token0_is_stable}, Token1 is stable: {token1_is_stable}")
@@ -2432,9 +2443,8 @@ class CreateTab(QWidget):
                                 price_raw = sqrt_price ** 2
                                 price_adjusted = price_raw * (10 ** (subgraph_info.token0_decimals - subgraph_info.token1_decimals))
 
-                                # Invert if token0 is stablecoin
-                                stablecoins = ["USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "FRAX", "FDUSD", "PYUSD", "LUSD", "GUSD", "SUSD", "USDD", "CUSD", "USDJ", "UST", "USDN", "MUSD", "HUSD", "USDX", "USD+", "USDCE", "USDC.E", "USDT.E", "BRIDGED"]
-                                if subgraph_info.token0_symbol.upper() in stablecoins:
+                                # Invert if token0 is stablecoin — by address
+                                if is_stablecoin(subgraph_info.token0_address) if hasattr(subgraph_info, 'token0_address') else False:
                                     if price_adjusted > 0:
                                         display_price = 1 / price_adjusted
                                     else:
@@ -2549,12 +2559,10 @@ class CreateTab(QWidget):
             except Exception:
                 decimals1 = 18
 
-            # Known stablecoins to detect which token is the quote currency
-            stablecoins = ["USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "FRAX", "FDUSD", "PYUSD", "LUSD", "GUSD", "SUSD", "USDD", "CUSD", "USDJ", "UST", "USDN", "MUSD", "HUSD", "USDX", "USD+", "USDCE", "USDC.E", "USDT.E", "BRIDGED"]
-
             # Determine if we need to swap: token0 should be volatile, token1 should be stablecoin
-            token0_is_stable = token0_symbol.upper() in stablecoins
-            token1_is_stable = token1_symbol.upper() in stablecoins
+            # Use address-based detection (more reliable than symbol matching)
+            token0_is_stable = is_stablecoin(token0_addr)
+            token1_is_stable = is_stablecoin(token1_addr)
 
             # Get current price from slot0
             try:

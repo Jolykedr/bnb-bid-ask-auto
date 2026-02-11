@@ -369,7 +369,8 @@ class DexSwap:
                 abi=ERC20_ABI
             )
             return contract.functions.decimals().call()
-        except:
+        except Exception as e:
+            logger.warning(f"Failed to get decimals for {token_address}: {e}, defaulting to 18")
             return 18
 
     # ERC20 Transfer(address,address,uint256) event topic
@@ -465,7 +466,7 @@ class DexSwap:
             # Проверить прямой путь
             self.router.functions.getAmountsOut(10**18, direct_path).call()
             return direct_path
-        except:
+        except Exception:
             pass
 
         # Путь через WETH
@@ -474,7 +475,7 @@ class DexSwap:
             try:
                 self.router.functions.getAmountsOut(10**18, weth_path).call()
                 return weth_path
-            except:
+            except Exception:
                 pass
 
         return []
@@ -934,10 +935,11 @@ class DexSwap:
             # Пробуем V3 сначала (если доступен и prefer_v3=True)
             if prefer_v3 and self.v3_available:
                 logger.info("Trying V3 swap first...")
-                v3_quote, best_fee, _ = self.get_quote_v3(from_token, to_token, amount_in)
+                v3_quote, best_fee, multi_hop_fee2 = self.get_quote_v3(from_token, to_token, amount_in)
 
                 if v3_quote > 0:
-                    logger.info(f"V3 quote found: {v3_quote} (fee tier: {best_fee/10000}%)")
+                    is_multi_hop = multi_hop_fee2 > 0
+                    logger.info(f"V3 quote found: {v3_quote} (fee: {best_fee/10000}%{f', hop2={multi_hop_fee2/10000}%' if is_multi_hop else ''})")
 
                     # Сравнить с V2 котировкой
                     v2_quote = self.get_quote(from_token, to_token, amount_in)
@@ -945,10 +947,11 @@ class DexSwap:
                     # Использовать V3 если котировка лучше или V2 недоступен
                     if v3_quote >= v2_quote or v2_quote == 0:
                         logger.info(f"Using V3 (V3: {v3_quote} vs V2: {v2_quote})")
+                        # Pass fee=None for multi-hop so swap_v3 re-discovers the best route
                         result = self.swap_v3(
                             from_token, to_token, amount_in,
                             wallet_address, private_key,
-                            slippage, deadline_minutes, best_fee
+                            slippage, deadline_minutes, best_fee if not is_multi_hop else None
                         )
                         if result.success:
                             return result
