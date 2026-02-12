@@ -209,6 +209,14 @@ class LiquidityProvider:
 
         self.batcher = Multicall3Batcher(self.w3, self.account, nonce_manager=self.nonce_manager)
 
+    def disconnect(self):
+        """Close Web3 HTTP provider session to free resources."""
+        try:
+            if hasattr(self.w3.provider, '_session'):
+                self.w3.provider._session.close()
+        except Exception:
+            pass
+
     def preview_ladder(self, config: LiquidityLadderConfig) -> List[BidAskPosition]:
         """
         Предпросмотр позиций без создания транзакции.

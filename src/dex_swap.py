@@ -15,24 +15,10 @@ from .utils import NonceManager
 
 logger = logging.getLogger(__name__)
 
-# Токены которые НЕ нужно продавать (стейблкоины и нативные токены)
-STABLE_TOKENS = {
-    # BNB Chain (56)
-    "0x55d398326f99059ff775485246999027b3197955": "USDT",  # BSC USDT
-    "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": "USDC",  # BSC USDC
-    "0xe9e7cea3dedca5984780bafc599bd69add087d56": "BUSD",  # BUSD
-    "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c": "WBNB",  # Wrapped BNB
-    "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee": "BNB",   # Native BNB
-
-    # Ethereum (1)
-    "0xdac17f958d2ee523a2206206994597c13d831ec7": "USDT",  # ETH USDT
-    "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": "USDC",  # ETH USDC
-    "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": "WETH",  # WETH
-
-    # Base (8453)
-    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": "USDC",  # Base USDC
-    "0x4200000000000000000000000000000000000006": "WETH",  # Base WETH
-}
+# Import centralized STABLE_TOKENS from config (single source of truth)
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from config import STABLE_TOKENS
 
 # Router адреса для разных сетей (V2)
 ROUTER_V2_ADDRESSES = {
@@ -795,6 +781,7 @@ class DexSwap:
             nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
                     self.w3.eth.get_transaction_count(wallet_address, 'pending')
 
+            tx_sent = False
             try:
                 tx = token_contract.functions.approve(
                     self.router_v3_address, max_uint256
@@ -807,6 +794,7 @@ class DexSwap:
 
                 signed_tx = account.sign_transaction(tx)
                 tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                tx_sent = True
 
                 logger.info(f"V3 Approve TX: {tx_hash.hex()}")
 
@@ -819,7 +807,10 @@ class DexSwap:
 
             except Exception as e:
                 if self.nonce_manager:
-                    self.nonce_manager.release_nonce(nonce)
+                    if tx_sent:
+                        self.nonce_manager.confirm_transaction(nonce)
+                    else:
+                        self.nonce_manager.release_nonce(nonce)
                 raise
 
         except Exception as e:
@@ -859,6 +850,7 @@ class DexSwap:
             nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
                     self.w3.eth.get_transaction_count(wallet_address, 'pending')
 
+            tx_sent = False
             try:
                 tx = token_contract.functions.approve(
                     self.router_address, max_uint256
@@ -871,6 +863,7 @@ class DexSwap:
 
                 signed_tx = account.sign_transaction(tx)
                 tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                tx_sent = True
 
                 logger.info(f"Approve TX: {tx_hash.hex()}")
 
@@ -883,7 +876,10 @@ class DexSwap:
 
             except Exception as e:
                 if self.nonce_manager:
-                    self.nonce_manager.release_nonce(nonce)
+                    if tx_sent:
+                        self.nonce_manager.confirm_transaction(nonce)
+                    else:
+                        self.nonce_manager.release_nonce(nonce)
                 raise
 
         except Exception as e:

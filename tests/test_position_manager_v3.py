@@ -729,17 +729,19 @@ class TestMintSingle:
         pm.nonce_manager.confirm_transaction.assert_called_once_with(10)
         pm.nonce_manager.release_nonce.assert_not_called()
 
-    def test_mint_single_nonce_release_on_revert(self, pm, mint_params):
-        """On status=0, nonce_manager.confirm_transaction is called (TX mined, nonce consumed)."""
+    def test_mint_single_raises_on_revert(self, pm, mint_params):
+        """On status=0, mint_single raises Exception; nonce is still confirmed (TX was mined)."""
         pm.w3.eth.wait_for_transaction_receipt.return_value = {
             'status': 0, 'gasUsed': 300_000, 'logs': []
         }
         pm._parse_mint_events = Mock(return_value=None)
 
-        result = pm.mint_single(mint_params)
+        with pytest.raises(Exception, match="Mint transaction reverted"):
+            pm.mint_single(mint_params)
 
         # TX was mined (even though reverted), so nonce is consumed on-chain
-        pm.nonce_manager.confirm_transaction.assert_called_once_with(10)
+        # confirm is called twice: once in try block (before raise), once in except (tx_sent=True)
+        assert pm.nonce_manager.confirm_transaction.call_count == 2
         pm.nonce_manager.release_nonce.assert_not_called()
 
     def test_mint_single_fallback_result_when_no_events(self, pm, mint_params):

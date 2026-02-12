@@ -267,6 +267,14 @@ class V4LiquidityProvider:
             nonce_manager=self.nonce_manager
         )
 
+    def disconnect(self):
+        """Close Web3 HTTP provider session to free resources."""
+        try:
+            if hasattr(self.w3.provider, '_session'):
+                self.w3.provider._session.close()
+        except Exception:
+            pass
+
     def preview_ladder(self, config: V4LadderConfig) -> List[BidAskPosition]:
         """Preview positions without creating them."""
         from config import is_stablecoin
@@ -766,8 +774,14 @@ class V4LiquidityProvider:
             volatile_decimals = config.token0_decimals if pool_key.currency0.lower() == config.token0.lower() else config.token1_decimals
 
         # Auto-detect decimals using cache (override config if different)
-        stablecoin_decimals = self.decimals_cache.get_decimals(stablecoin_address)
-        volatile_decimals = self.decimals_cache.get_decimals(volatile_token)
+        try:
+            stablecoin_decimals = self.decimals_cache.get_decimals(stablecoin_address)
+        except RuntimeError:
+            logger.warning(f"Could not fetch decimals for stablecoin {stablecoin_address[:10]}..., using config value {stablecoin_decimals}")
+        try:
+            volatile_decimals = self.decimals_cache.get_decimals(volatile_token)
+        except RuntimeError:
+            logger.warning(f"Could not fetch decimals for volatile {volatile_token[:10]}..., using config value {volatile_decimals}")
 
         # Calculate how much of each token we need based on position range
         # For now, assume worst case: need all of stablecoin balance
@@ -832,9 +846,15 @@ class V4LiquidityProvider:
             base_token = pool_key.currency0
             base_decimals = config.token0_decimals if pool_key.currency0.lower() == config.token0.lower() else config.token1_decimals
 
-        # Use decimals cache
-        quote_decimals = self.decimals_cache.get_decimals(quote_token)
-        base_decimals = self.decimals_cache.get_decimals(base_token)
+        # Use decimals cache (fallback to config values on RPC failure)
+        try:
+            quote_decimals = self.decimals_cache.get_decimals(quote_token)
+        except RuntimeError:
+            logger.warning(f"Could not fetch decimals for quote {quote_token[:10]}..., using config value {quote_decimals}")
+        try:
+            base_decimals = self.decimals_cache.get_decimals(base_token)
+        except RuntimeError:
+            logger.warning(f"Could not fetch decimals for base {base_token[:10]}..., using config value {base_decimals}")
 
         total_quote = int(config.total_usd * (10 ** quote_decimals))
         user_price = config.actual_current_price if config.actual_current_price else config.current_price

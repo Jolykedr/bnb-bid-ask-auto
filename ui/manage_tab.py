@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QStyledItemDelegate, QCheckBox, QComboBox, QDoubleSpinBox,
     QScrollArea
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QRect
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QRect, QMutex, QMutexLocker
 from PyQt6.QtGui import QFont, QColor, QPainter, QBrush, QPen, QLinearGradient, QPainterPath
 
 import sys
@@ -24,7 +24,7 @@ import logging
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from web3 import Web3
-from config import V3_DEXES, is_stablecoin, STABLECOINS
+from config import V3_DEXES, is_stablecoin, STABLECOINS, STABLE_TOKENS
 from src.math.ticks import tick_to_price
 from src.math.liquidity import calculate_amounts
 from src.contracts.position_manager import UniswapV3PositionManager
@@ -33,7 +33,7 @@ from src.contracts.v4 import V4PositionManager, V4Protocol
 from src.contracts.v4.constants import get_v4_addresses, UNISWAP_V4_ADDRESSES, PANCAKESWAP_V4_ADDRESSES
 from src.contracts.v4.pool_manager import V4PoolManager
 from src.liquidity_provider import LiquidityProvider
-from src.dex_swap import DexSwap, STABLE_TOKENS
+from src.dex_swap import DexSwap
 
 logger = logging.getLogger(__name__)
 
@@ -1135,6 +1135,7 @@ class ManageTab(QWidget):
         self.provider = None
         self.pool_factory = None
         self.positions_data = {}  # token_id -> position data
+        self._positions_mutex = QMutex()  # Protects positions_data access
         self.worker = None
         self.load_workers = []
         self.scan_worker = None
@@ -1590,10 +1591,10 @@ class ManageTab(QWidget):
                         self.provider, token_id, self.pool_factory,
                         check_ownership=True, protocol=protocol
                     )
-                    worker.position_loaded.connect(self._on_position_loaded)
-                    worker.error.connect(self._on_position_error)
-                    worker.not_owned.connect(self._on_position_not_owned)
-                    worker.finished.connect(lambda w=worker: self._on_worker_finished(w))
+                    worker.position_loaded.connect(self._on_position_loaded, Qt.ConnectionType.QueuedConnection)
+                    worker.error.connect(self._on_position_error, Qt.ConnectionType.QueuedConnection)
+                    worker.not_owned.connect(self._on_position_not_owned, Qt.ConnectionType.QueuedConnection)
+                    worker.finished.connect(lambda w=worker: self._on_worker_finished(w), Qt.ConnectionType.QueuedConnection)
                     self.load_workers.append(worker)
                     worker.start()
                 except Exception as worker_err:
@@ -1607,7 +1608,8 @@ class ManageTab(QWidget):
         """Handle position loaded from blockchain."""
         try:
             logger.debug(f"_on_position_loaded: token_id={token_id}")
-            self.positions_data[token_id] = position
+            with QMutexLocker(self._positions_mutex):
+                self.positions_data[token_id] = position
             self._update_table_row(token_id, position)
             # NOTE: Don't save here - causes race condition when multiple workers finish
             # Save is done in _on_worker_finished when ALL workers complete
@@ -1622,8 +1624,9 @@ class ManageTab(QWidget):
         """Handle position load error."""
         self._log(f"❌ Position {token_id}: {error}")
         # Remove from positions if it doesn't exist
-        if token_id in self.positions_data:
-            del self.positions_data[token_id]
+        with QMutexLocker(self._positions_mutex):
+            if token_id in self.positions_data:
+                del self.positions_data[token_id]
         # Update input field to remove invalid IDs
         self._update_token_ids_input()
 
@@ -1649,8 +1652,9 @@ class ManageTab(QWidget):
         self._log(f"   Hint: {alt_protocol}")
 
         # Remove from positions
-        if token_id in self.positions_data:
-            del self.positions_data[token_id]
+        with QMutexLocker(self._positions_mutex):
+            if token_id in self.positions_data:
+                del self.positions_data[token_id]
         # Update input field
         self._update_token_ids_input()
 
@@ -1702,9 +1706,9 @@ class ManageTab(QWidget):
         self.refresh_btn.setEnabled(False)
 
         self.scan_worker = ScanWalletWorker(self.provider, self.pool_factory, protocol=selected_protocol)
-        self.scan_worker.progress.connect(self._on_scan_progress)
-        self.scan_worker.position_found.connect(self._on_scan_position_found)
-        self.scan_worker.finished.connect(self._on_scan_finished)
+        self.scan_worker.progress.connect(self._on_scan_progress, Qt.ConnectionType.QueuedConnection)
+        self.scan_worker.position_found.connect(self._on_scan_position_found, Qt.ConnectionType.QueuedConnection)
+        self.scan_worker.finished.connect(self._on_scan_finished, Qt.ConnectionType.QueuedConnection)
         self.scan_worker.start()
 
     def _on_scan_progress(self, message: str):
@@ -2457,8 +2461,8 @@ class ManageTab(QWidget):
             swap_slippage=swap_slippage,
             initial_investment=initial_investment
         )
-        self.worker.progress.connect(self._on_progress)
-        self.worker.finished.connect(self._on_batch_close_finished)
+        self.worker.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
+        self.worker.finished.connect(self._on_batch_close_finished, Qt.ConnectionType.QueuedConnection)
         self.worker.start()
 
     def _on_batch_close_finished(self, success: bool, message: str, data: dict):
@@ -2601,8 +2605,8 @@ class ManageTab(QWidget):
             chain_id=chain_id,
             initial_investment=initial_investment
         )
-        self.worker.progress.connect(self._on_progress)
-        self.worker.finished.connect(self._on_close_finished)
+        self.worker.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
+        self.worker.finished.connect(self._on_close_finished, Qt.ConnectionType.QueuedConnection)
         self.worker.start()
 
     def _on_progress(self, message: str):

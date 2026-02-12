@@ -1107,6 +1107,16 @@ class TestCheckAndApprove:
         swapper.check_and_approve(TOKEN_VOLATILE, 10**18, WALLET, PRIVATE_KEY)
         nm.release_nonce.assert_called_once_with(42)
 
+    def test_approve_nonce_confirm_on_send_then_timeout(self, _mock_from_key):
+        """If TX sent but wait_for_receipt times out, nonce should be confirmed (not released)."""
+        nm = _make_nonce_manager()
+        swapper, w3 = self._setup_approve(current_allowance=0, nm=nm)
+        w3.eth.wait_for_transaction_receipt.side_effect = Exception("timeout")
+
+        swapper.check_and_approve(TOKEN_VOLATILE, 10**18, WALLET, PRIVATE_KEY)
+        nm.confirm_transaction.assert_called_once_with(42)
+        nm.release_nonce.assert_not_called()
+
     def test_approve_no_nonce_manager_uses_w3(self, _mock_from_key):
         """Without nonce_manager, uses w3.eth.get_transaction_count."""
         swapper, w3 = self._setup_approve(current_allowance=0, nm=None)
@@ -1177,6 +1187,16 @@ class TestCheckAndApproveV3:
 
         swapper._check_and_approve_v3(TOKEN_VOLATILE, 10**18, WALLET, PRIVATE_KEY)
         nm.release_nonce.assert_called_once_with(42)
+
+    def test_approve_v3_nonce_confirm_on_send_then_timeout(self, _mock_from_key):
+        """V3 approve: if TX sent but receipt timeout, nonce confirmed (not released)."""
+        nm = _make_nonce_manager()
+        swapper, w3 = self._setup_approve_v3(current_allowance=0, nm=nm)
+        w3.eth.wait_for_transaction_receipt.side_effect = Exception("timeout")
+
+        swapper._check_and_approve_v3(TOKEN_VOLATILE, 10**18, WALLET, PRIVATE_KEY)
+        nm.confirm_transaction.assert_called_once_with(42)
+        nm.release_nonce.assert_not_called()
 
 
 # ============================================================

@@ -352,6 +352,12 @@ class UniswapV3PositionManager:
             if self.nonce_manager:
                 self.nonce_manager.confirm_transaction(nonce)
 
+            # Check receipt status — reverted TX should not return success
+            if receipt['status'] != 1:
+                raise Exception(
+                    f"Mint transaction reverted! TX: {tx_hash.hex()}, gas used: {receipt.get('gasUsed', 'N/A')}"
+                )
+
             # Парсим события для получения результатов
             event_data = self._parse_mint_events(receipt)
 
@@ -364,7 +370,8 @@ class UniswapV3PositionManager:
                     tx_hash=tx_hash.hex()
                 )
 
-            # Fallback если не удалось распарсить события
+            # Fallback: TX succeeded but no parseable events
+            logger.warning(f"Mint TX succeeded but no events parsed: {tx_hash.hex()}")
             return MintResult(
                 token_id=0,
                 liquidity=0,

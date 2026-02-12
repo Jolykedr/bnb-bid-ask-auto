@@ -37,14 +37,8 @@ class MockWeb3:
 
     @staticmethod
     def keccak(text: str = None, primitive: bytes = None) -> bytes:
-        import hashlib
-        if text:
-            data = text.encode()
-        elif primitive:
-            data = primitive
-        else:
-            data = b''
-        return hashlib.sha256(data).digest()
+        """Use real Web3.keccak for correct event signature hashes."""
+        return Web3.keccak(text=text, primitive=primitive)
 
 
 @pytest.fixture
