@@ -82,17 +82,11 @@ class Multicall3Batcher:
         self,
         w3: Web3,
         account: LocalAccount = None,
-        multicall_address: str = MULTICALL3_ADDRESS,
         nonce_manager: 'NonceManager' = None
     ):
         self.w3 = w3
         self.account = account
         self.nonce_manager = nonce_manager
-        self.multicall_address = Web3.to_checksum_address(multicall_address)
-        self.contract: Contract = w3.eth.contract(
-            address=self.multicall_address,
-            abi=MULTICALL3_ABI
-        )
         self.calls: List[Call3] = []
 
         # Position Manager контракт для кодирования

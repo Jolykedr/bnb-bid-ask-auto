@@ -337,6 +337,18 @@ class PoolFactory:
             initialized=initialized
         )
 
+    def _get_gas_params(self) -> dict:
+        """Получение параметров газа: EIP-1559 если поддерживается, иначе legacy."""
+        try:
+            max_priority_fee = self.w3.eth.max_priority_fee
+            base_fee = self.w3.eth.get_block('latest')['baseFeePerGas']
+            return {
+                'maxPriorityFeePerGas': max_priority_fee,
+                'maxFeePerGas': base_fee * 2 + max_priority_fee,
+            }
+        except Exception:
+            return {'gasPrice': self.w3.eth.gas_price}
+
     def _get_tick_spacing(self, fee: int) -> int:
         """Получение tick spacing для fee tier."""
         # Standard tick spacings
@@ -389,14 +401,15 @@ class PoolFactory:
 
         tx_sent = False
         try:
-            tx = self.factory.functions.createPool(
-                token0, token1, fee
-            ).build_transaction({
+            tx_params = {
                 'from': self.account.address,
                 'nonce': nonce,
                 'gas': 5000000,
-                'gasPrice': self.w3.eth.gas_price
-            })
+            }
+            tx_params.update(self._get_gas_params())
+            tx = self.factory.functions.createPool(
+                token0, token1, fee
+            ).build_transaction(tx_params)
 
             # Sign and send
             signed = self.account.sign_transaction(tx)
@@ -474,12 +487,13 @@ class PoolFactory:
 
         tx_sent = False
         try:
-            tx = pool.functions.initialize(sqrt_price_x96).build_transaction({
+            tx_params = {
                 'from': self.account.address,
                 'nonce': nonce,
                 'gas': 500000,
-                'gasPrice': self.w3.eth.gas_price
-            })
+            }
+            tx_params.update(self._get_gas_params())
+            tx = pool.functions.initialize(sqrt_price_x96).build_transaction(tx_params)
 
             # Sign and send
             signed = self.account.sign_transaction(tx)

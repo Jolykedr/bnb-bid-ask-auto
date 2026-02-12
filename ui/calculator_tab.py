@@ -15,10 +15,6 @@ from PyQt6.QtCore import Qt
 from .widgets.position_table import PositionTableWidget
 from .widgets.price_chart import PriceChartWidget
 
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from src.math.distribution import (
     calculate_bid_ask_from_percent,
     calculate_bid_ask_distribution

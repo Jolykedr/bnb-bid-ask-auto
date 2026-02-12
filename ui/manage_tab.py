@@ -16,12 +16,9 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QRect, QMutex, QMutexLocker
 from PyQt6.QtGui import QFont, QColor, QPainter, QBrush, QPen, QLinearGradient, QPainterPath
 
-import sys
-import os
 import json
 import time
 import logging
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from web3 import Web3
 from config import V3_DEXES, is_stablecoin, STABLECOINS, STABLE_TOKENS

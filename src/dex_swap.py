@@ -16,8 +16,6 @@ from .utils import NonceManager
 logger = logging.getLogger(__name__)
 
 # Import centralized STABLE_TOKENS from config (single source of truth)
-import sys as _sys, os as _os
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 from config import STABLE_TOKENS
 
 # Router адреса для разных сетей (V2)
