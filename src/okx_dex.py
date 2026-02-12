@@ -358,6 +358,7 @@ class OKXDexSwap:
             nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
                     w3.eth.get_transaction_count(Web3.to_checksum_address(wallet_address), 'pending')
 
+            tx_sent = False
             try:
                 tx = token_contract.functions.approve(
                     Web3.to_checksum_address(dex_address),
@@ -371,17 +372,16 @@ class OKXDexSwap:
 
                 signed_tx = w3.eth.account.sign_transaction(tx, private_key)
                 tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                tx_sent = True
 
                 logger.info(f"Approve TX sent: {tx_hash.hex()}")
 
                 # Ждём подтверждения
                 receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
 
+                # TX mined — nonce consumed (even if reverted)
                 if self.nonce_manager:
-                    if receipt.status == 1:
-                        self.nonce_manager.confirm_transaction(nonce)
-                    else:
-                        self.nonce_manager.release_nonce(nonce)
+                    self.nonce_manager.confirm_transaction(nonce)
 
                 if receipt.status == 1:
                     logger.info("Token approved successfully")
@@ -392,7 +392,10 @@ class OKXDexSwap:
 
             except Exception as e:
                 if self.nonce_manager:
-                    self.nonce_manager.release_nonce(nonce)
+                    if tx_sent:
+                        self.nonce_manager.confirm_transaction(nonce)
+                    else:
+                        self.nonce_manager.release_nonce(nonce)
                 raise
 
         except Exception as e:
@@ -505,6 +508,7 @@ class OKXDexSwap:
             nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
                     w3.eth.get_transaction_count(Web3.to_checksum_address(wallet_address), 'pending')
 
+            tx_sent = False
             try:
                 tx = {
                     'from': Web3.to_checksum_address(wallet_address),
@@ -519,20 +523,22 @@ class OKXDexSwap:
                 # Подписать и отправить
                 signed_tx = w3.eth.account.sign_transaction(tx, private_key)
                 tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                tx_sent = True
 
                 logger.info(f"Swap TX sent: {tx_hash.hex()}")
 
                 # Ждём подтверждения
                 receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
 
+                # TX mined — nonce consumed (even if reverted)
                 if self.nonce_manager:
-                    if receipt.status == 1:
+                    self.nonce_manager.confirm_transaction(nonce)
+            except Exception as e:
+                if self.nonce_manager:
+                    if tx_sent:
                         self.nonce_manager.confirm_transaction(nonce)
                     else:
                         self.nonce_manager.release_nonce(nonce)
-            except Exception as e:
-                if self.nonce_manager:
-                    self.nonce_manager.release_nonce(nonce)
                 raise
 
             if receipt.status == 1:

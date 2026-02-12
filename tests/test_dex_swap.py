@@ -53,6 +53,15 @@ TRANSFER_TOPIC = Web3.keccak(text="Transfer(address,address,uint256)")
 # Helpers
 # ============================================================
 
+def _make_mock_account():
+    """Create a mock Account object with sign_transaction support."""
+    mock_acct = MagicMock()
+    mock_acct.sign_transaction = MagicMock(
+        return_value=MagicMock(raw_transaction=b'\xaa' * 32)
+    )
+    return mock_acct
+
+
 def _make_mock_w3(chain_id=56):
     """Create a MagicMock Web3 instance suitable for DexSwap init."""
     w3 = MagicMock()
@@ -77,6 +86,8 @@ def _make_swapper(chain_id=56, nonce_manager=None):
     """Create a DexSwap instance with mocked Web3."""
     w3 = _make_mock_w3(chain_id)
     swapper = DexSwap(w3, chain_id=chain_id, nonce_manager=nonce_manager)
+    # Pre-set a mock account so _resolve_account(None) returns it
+    swapper.account = _make_mock_account()
     return swapper, w3
 
 
@@ -645,6 +656,7 @@ class TestGetQuoteV3:
 # swap_v3 tests
 # ============================================================
 
+@patch('src.dex_swap.Account.from_key', return_value=_make_mock_account())
 class TestSwapV3:
 
     def _setup_v3_swap(self, chain_id=56, nm=None):
@@ -676,20 +688,20 @@ class TestSwapV3:
 
         return swapper, w3
 
-    def test_v3_not_available_returns_error(self):
+    def test_v3_not_available_returns_error(self, _mock_from_key):
         swapper, w3 = _make_swapper(97)  # no V3
         result = swapper.swap_v3(TOKEN_VOLATILE, USDT_BSC, 10**18, WALLET, PRIVATE_KEY)
         assert result.success is False
         assert "V3 not available" in result.error
 
-    def test_no_liquidity_returns_error(self):
+    def test_no_liquidity_returns_error(self, _mock_from_key):
         swapper, w3 = _make_swapper(56)
         swapper.get_quote_v3 = MagicMock(return_value=(0, 0, 0))
         result = swapper.swap_v3(TOKEN_VOLATILE, USDT_BSC, 10**18, WALLET, PRIVATE_KEY)
         assert result.success is False
         assert "No V3 liquidity" in result.error
 
-    def test_approve_fails_returns_error(self):
+    def test_approve_fails_returns_error(self, _mock_from_key):
         swapper, w3 = _make_swapper(56)
         swapper.get_quote_v3 = MagicMock(return_value=(10**18, 500, 0))
         swapper._check_and_approve_v3 = MagicMock(return_value=False)
@@ -697,14 +709,14 @@ class TestSwapV3:
         assert result.success is False
         assert "Failed to approve" in result.error
 
-    def test_successful_direct_swap(self):
+    def test_successful_direct_swap(self, _mock_from_key):
         swapper, w3 = self._setup_v3_swap()
         result = swapper.swap_v3(TOKEN_VOLATILE, USDT_BSC, 10**18, WALLET, PRIVATE_KEY)
         assert result.success is True
         assert result.to_amount == 10**18
         assert result.gas_used == 250000
 
-    def test_successful_multi_hop_swap(self):
+    def test_successful_multi_hop_swap(self, _mock_from_key):
         """Multi-hop swap uses exactInput with encoded path."""
         swapper, w3 = self._setup_v3_swap()
         swapper.get_quote_v3 = MagicMock(return_value=(10**18, 500, 100))  # fee2 > 0
@@ -716,7 +728,7 @@ class TestSwapV3:
         call_args = swapper.router_v3.encodeABI.call_args
         assert call_args[1]['fn_name'] == 'exactInput' or call_args[0][0] if call_args[0] else True
 
-    def test_reverted_tx_returns_error(self):
+    def test_reverted_tx_returns_error(self, _mock_from_key):
         swapper, w3 = self._setup_v3_swap()
         receipt_mock = MagicMock()
         receipt_mock.status = 0
@@ -731,7 +743,7 @@ class TestSwapV3:
         assert "V3 swap transaction failed" in result.error
         assert result.gas_used == 350000
 
-    def test_build_tx_exception_returns_error(self):
+    def test_build_tx_exception_returns_error(self, _mock_from_key):
         swapper, w3 = self._setup_v3_swap()
         swapper.router_v3.functions.multicall.return_value.build_transaction.side_effect = \
             Exception("gas estimation failed")
@@ -740,7 +752,7 @@ class TestSwapV3:
         assert result.success is False
         assert "gas estimation failed" in result.error
 
-    def test_parse_output_none_uses_expected(self):
+    def test_parse_output_none_uses_expected(self, _mock_from_key):
         """When _parse_actual_output returns None, uses expected_out."""
         swapper, w3 = self._setup_v3_swap()
         swapper._parse_actual_output = MagicMock(return_value=None)
@@ -750,7 +762,7 @@ class TestSwapV3:
         assert result.success is True
         assert result.to_amount == 7777
 
-    def test_nonce_confirm_on_success(self):
+    def test_nonce_confirm_on_success(self, _mock_from_key):
         """Nonce is confirmed after successful TX."""
         nm = _make_nonce_manager()
         swapper, w3 = self._setup_v3_swap(nm=nm)
@@ -760,7 +772,7 @@ class TestSwapV3:
         nm.confirm_transaction.assert_called_once_with(42)
         nm.release_nonce.assert_not_called()
 
-    def test_nonce_release_on_build_error(self):
+    def test_nonce_release_on_build_error(self, _mock_from_key):
         """Nonce is released when TX build fails (not sent)."""
         nm = _make_nonce_manager()
         swapper, w3 = self._setup_v3_swap(nm=nm)
@@ -771,7 +783,7 @@ class TestSwapV3:
 
         nm.release_nonce.assert_called_once_with(42)
 
-    def test_nonce_confirm_on_send_error_after_broadcast(self):
+    def test_nonce_confirm_on_send_error_after_broadcast(self, _mock_from_key):
         """Nonce is confirmed when error happens after TX is broadcast."""
         nm = _make_nonce_manager()
         swapper, w3 = self._setup_v3_swap(nm=nm)
@@ -786,6 +798,7 @@ class TestSwapV3:
 # _swap_v2 tests
 # ============================================================
 
+@patch('src.dex_swap.Account.from_key', return_value=_make_mock_account())
 class TestSwapV2:
 
     def _setup_v2_swap(self, nm=None):
@@ -814,7 +827,7 @@ class TestSwapV2:
 
         return swapper, w3
 
-    def test_no_path_returns_error(self):
+    def test_no_path_returns_error(self, _mock_from_key):
         swapper, w3 = _make_swapper(56)
         swapper._build_path = MagicMock(return_value=[])
 
@@ -822,7 +835,7 @@ class TestSwapV2:
         assert result.success is False
         assert "No V2 swap path" in result.error
 
-    def test_zero_quote_returns_error(self):
+    def test_zero_quote_returns_error(self, _mock_from_key):
         swapper, w3 = _make_swapper(56)
         swapper._build_path = MagicMock(return_value=[TOKEN_VOLATILE, USDT_BSC])
         swapper.get_quote = MagicMock(return_value=0)
@@ -831,7 +844,7 @@ class TestSwapV2:
         assert result.success is False
         assert "Could not get V2 quote" in result.error
 
-    def test_approve_fails_returns_error(self):
+    def test_approve_fails_returns_error(self, _mock_from_key):
         swapper, w3 = self._setup_v2_swap()
         swapper.check_and_approve = MagicMock(return_value=False)
 
@@ -839,7 +852,7 @@ class TestSwapV2:
         assert result.success is False
         assert "Failed to approve" in result.error
 
-    def test_successful_swap_with_fee_on_transfer(self):
+    def test_successful_swap_with_fee_on_transfer(self, _mock_from_key):
         swapper, w3 = self._setup_v2_swap()
 
         result = swapper._swap_v2(
@@ -851,7 +864,7 @@ class TestSwapV2:
         swapper.router.functions.swapExactTokensForTokensSupportingFeeOnTransferTokens \
             .assert_called_once()
 
-    def test_successful_swap_without_fee_on_transfer(self):
+    def test_successful_swap_without_fee_on_transfer(self, _mock_from_key):
         swapper, w3 = self._setup_v2_swap()
 
         result = swapper._swap_v2(
@@ -861,7 +874,7 @@ class TestSwapV2:
         assert result.success is True
         swapper.router.functions.swapExactTokensForTokens.assert_called_once()
 
-    def test_reverted_tx_returns_error(self):
+    def test_reverted_tx_returns_error(self, _mock_from_key):
         swapper, w3 = self._setup_v2_swap()
         receipt_mock = MagicMock()
         receipt_mock.status = 0
@@ -875,7 +888,7 @@ class TestSwapV2:
         assert result.success is False
         assert "V2 swap transaction failed" in result.error
 
-    def test_exception_returns_swap_result_error(self):
+    def test_exception_returns_swap_result_error(self, _mock_from_key):
         swapper, w3 = self._setup_v2_swap()
         w3.eth.send_raw_transaction.side_effect = Exception("network error")
 
@@ -883,14 +896,14 @@ class TestSwapV2:
         assert result.success is False
         assert "network error" in result.error
 
-    def test_nonce_confirm_on_v2_success(self):
+    def test_nonce_confirm_on_v2_success(self, _mock_from_key):
         nm = _make_nonce_manager()
         swapper, w3 = self._setup_v2_swap(nm=nm)
 
         swapper._swap_v2(TOKEN_VOLATILE, USDT_BSC, 10**18, WALLET, PRIVATE_KEY)
         nm.confirm_transaction.assert_called_once_with(42)
 
-    def test_nonce_release_on_v2_build_error(self):
+    def test_nonce_release_on_v2_build_error(self, _mock_from_key):
         nm = _make_nonce_manager()
         swapper, w3 = self._setup_v2_swap(nm=nm)
         swapper.router.functions.swapExactTokensForTokensSupportingFeeOnTransferTokens \
@@ -899,7 +912,7 @@ class TestSwapV2:
         swapper._swap_v2(TOKEN_VOLATILE, USDT_BSC, 10**18, WALLET, PRIVATE_KEY)
         nm.release_nonce.assert_called_once_with(42)
 
-    def test_parse_output_none_uses_expected(self):
+    def test_parse_output_none_uses_expected(self, _mock_from_key):
         swapper, w3 = self._setup_v2_swap()
         swapper._parse_actual_output = MagicMock(return_value=None)
         swapper.get_quote = MagicMock(return_value=7777)
@@ -1027,6 +1040,7 @@ class TestSwap:
 # check_and_approve (V2) tests
 # ============================================================
 
+@patch('src.dex_swap.Account.from_key', return_value=_make_mock_account())
 class TestCheckAndApprove:
 
     def _setup_approve(self, current_allowance=0, nm=None):
@@ -1046,19 +1060,19 @@ class TestCheckAndApprove:
 
         return swapper, w3
 
-    def test_already_approved_no_tx(self):
+    def test_already_approved_no_tx(self, _mock_from_key):
         swapper, w3 = self._setup_approve(current_allowance=10**30)
         result = swapper.check_and_approve(TOKEN_VOLATILE, 10**18, WALLET, PRIVATE_KEY)
         assert result is True
         w3.eth.send_raw_transaction.assert_not_called()
 
-    def test_needs_approve_sends_tx(self):
+    def test_needs_approve_sends_tx(self, _mock_from_key):
         swapper, w3 = self._setup_approve(current_allowance=0)
         result = swapper.check_and_approve(TOKEN_VOLATILE, 10**18, WALLET, PRIVATE_KEY)
         assert result is True
         w3.eth.send_raw_transaction.assert_called_once()
 
-    def test_approve_reverted_returns_false(self):
+    def test_approve_reverted_returns_false(self, _mock_from_key):
         swapper, w3 = self._setup_approve(current_allowance=0)
         receipt_mock = MagicMock()
         receipt_mock.status = 0
@@ -1067,21 +1081,21 @@ class TestCheckAndApprove:
         result = swapper.check_and_approve(TOKEN_VOLATILE, 10**18, WALLET, PRIVATE_KEY)
         assert result is False
 
-    def test_approve_exception_returns_false(self):
+    def test_approve_exception_returns_false(self, _mock_from_key):
         swapper, w3 = self._setup_approve(current_allowance=0)
         w3.eth.send_raw_transaction.side_effect = Exception("rpc error")
 
         result = swapper.check_and_approve(TOKEN_VOLATILE, 10**18, WALLET, PRIVATE_KEY)
         assert result is False
 
-    def test_approve_nonce_confirm_on_success(self):
+    def test_approve_nonce_confirm_on_success(self, _mock_from_key):
         nm = _make_nonce_manager()
         swapper, w3 = self._setup_approve(current_allowance=0, nm=nm)
 
         swapper.check_and_approve(TOKEN_VOLATILE, 10**18, WALLET, PRIVATE_KEY)
         nm.confirm_transaction.assert_called_once_with(42)
 
-    def test_approve_nonce_release_on_build_error(self):
+    def test_approve_nonce_release_on_build_error(self, _mock_from_key):
         nm = _make_nonce_manager()
         swapper, w3 = self._setup_approve(current_allowance=0, nm=nm)
         mock_contract = MagicMock()
@@ -1093,7 +1107,7 @@ class TestCheckAndApprove:
         swapper.check_and_approve(TOKEN_VOLATILE, 10**18, WALLET, PRIVATE_KEY)
         nm.release_nonce.assert_called_once_with(42)
 
-    def test_approve_no_nonce_manager_uses_w3(self):
+    def test_approve_no_nonce_manager_uses_w3(self, _mock_from_key):
         """Without nonce_manager, uses w3.eth.get_transaction_count."""
         swapper, w3 = self._setup_approve(current_allowance=0, nm=None)
         swapper.check_and_approve(TOKEN_VOLATILE, 10**18, WALLET, PRIVATE_KEY)
@@ -1104,6 +1118,7 @@ class TestCheckAndApprove:
 # _check_and_approve_v3 tests
 # ============================================================
 
+@patch('src.dex_swap.Account.from_key', return_value=_make_mock_account())
 class TestCheckAndApproveV3:
 
     def _setup_approve_v3(self, current_allowance=0, nm=None):
@@ -1123,19 +1138,19 @@ class TestCheckAndApproveV3:
 
         return swapper, w3
 
-    def test_already_approved_v3(self):
+    def test_already_approved_v3(self, _mock_from_key):
         swapper, w3 = self._setup_approve_v3(current_allowance=10**30)
         result = swapper._check_and_approve_v3(TOKEN_VOLATILE, 10**18, WALLET, PRIVATE_KEY)
         assert result is True
         w3.eth.send_raw_transaction.assert_not_called()
 
-    def test_needs_approve_v3(self):
+    def test_needs_approve_v3(self, _mock_from_key):
         swapper, w3 = self._setup_approve_v3(current_allowance=0)
         result = swapper._check_and_approve_v3(TOKEN_VOLATILE, 10**18, WALLET, PRIVATE_KEY)
         assert result is True
         w3.eth.send_raw_transaction.assert_called_once()
 
-    def test_approve_v3_reverted_returns_false(self):
+    def test_approve_v3_reverted_returns_false(self, _mock_from_key):
         swapper, w3 = self._setup_approve_v3(current_allowance=0)
         receipt_mock = MagicMock()
         receipt_mock.status = 0
@@ -1144,14 +1159,14 @@ class TestCheckAndApproveV3:
         result = swapper._check_and_approve_v3(TOKEN_VOLATILE, 10**18, WALLET, PRIVATE_KEY)
         assert result is False
 
-    def test_approve_v3_exception_returns_false(self):
+    def test_approve_v3_exception_returns_false(self, _mock_from_key):
         swapper, w3 = self._setup_approve_v3(current_allowance=0)
         w3.eth.send_raw_transaction.side_effect = Exception("broadcast fail")
 
         result = swapper._check_and_approve_v3(TOKEN_VOLATILE, 10**18, WALLET, PRIVATE_KEY)
         assert result is False
 
-    def test_approve_v3_nonce_release_on_build_error(self):
+    def test_approve_v3_nonce_release_on_build_error(self, _mock_from_key):
         nm = _make_nonce_manager()
         swapper, w3 = self._setup_approve_v3(current_allowance=0, nm=nm)
         mock_contract = MagicMock()

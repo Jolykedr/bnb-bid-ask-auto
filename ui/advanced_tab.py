@@ -663,40 +663,50 @@ class AdvancedTab(QWidget):
 
     def _should_invert_price(self, token0: str, token1: str) -> bool:
         """
-        Determine if price inversion is needed based on stablecoin position.
+        Determine if price inversion is needed based on stablecoin position IN THE POOL.
 
-        In Uniswap, pool price = token1/token0.
+        IMPORTANT: In Uniswap V3/V4, pool tokens are sorted by address (lower = currency0).
+        The config's token0/token1 order may NOT match the pool's currency0/currency1 order.
+        We must check the stablecoin's position AFTER address sorting.
 
-        If stablecoin (USDT/USDC/etc) is token1:
+        Pool price = currency1/currency0 (sorted by address, NOT by config order).
+
+        If stablecoin is pool's currency1 (higher address):
             - Pool price = stablecoin/token = "price of token in USD"
-            - User enters price in USD → matches pool format
             - invert_price = False
 
-        If stablecoin is token0:
+        If stablecoin is pool's currency0 (lower address):
             - Pool price = token/stablecoin = "how many tokens per USD"
-            - User enters price in USD → inverse of pool format
             - invert_price = True
 
         Returns:
             True if inversion is needed, False otherwise
         """
-        from config import STABLECOIN_ADDRESSES
+        from config import is_stablecoin
 
         token0_lower = token0.lower()
         token1_lower = token1.lower()
 
-        token0_is_stable = token0_lower in STABLECOIN_ADDRESSES
-        token1_is_stable = token1_lower in STABLECOIN_ADDRESSES
+        token0_is_stable = is_stablecoin(token0)
+        token1_is_stable = is_stablecoin(token1)
 
-        if token1_is_stable and not token0_is_stable:
-            # Stablecoin is token1 → pool price is in USD → NO inversion
-            return False
-        elif token0_is_stable and not token1_is_stable:
-            # Stablecoin is token0 → pool price is inverse → NEED inversion
-            return True
+        if not token0_is_stable and not token1_is_stable:
+            return True  # Neither is stablecoin - default
+
+        if token0_is_stable and not token1_is_stable:
+            stablecoin_addr = token0_lower
+        elif token1_is_stable and not token0_is_stable:
+            stablecoin_addr = token1_lower
         else:
-            # Both or neither are stablecoins - default to True (old behavior)
-            return True
+            return True  # Both are stablecoins - default
+
+        # Sort by address to find pool ordering (lower = currency0)
+        addr0_int = int(token0_lower, 16)
+        addr1_int = int(token1_lower, 16)
+        pool_currency0 = token0_lower if addr0_int < addr1_int else token1_lower
+
+        # If stablecoin is pool's currency0 (lower address) → need inversion
+        return stablecoin_addr == pool_currency0
 
     def _update_invert_price_auto(self):
         """Auto-update invert_price checkbox based on token positions."""

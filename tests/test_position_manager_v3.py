@@ -483,7 +483,7 @@ class TestCheckAndApproveExtended:
         pm.nonce_manager.confirm_transaction.assert_not_called()
 
     def test_nonce_release_on_receipt_reverted(self, pm_with_nonce):
-        """On reverted receipt, both confirm and release are called (current behavior)."""
+        """On reverted receipt, confirm_transaction is called (TX was mined, nonce consumed)."""
         pm = pm_with_nonce
         pm.w3.eth.wait_for_transaction_receipt.return_value = {
             'status': 0, 'gasUsed': 50_000, 'logs': []
@@ -492,10 +492,10 @@ class TestCheckAndApproveExtended:
         with pytest.raises(Exception, match="Approve transaction reverted"):
             pm.check_and_approve("0xToken", amount=1000)
 
-        # confirm is called first (line 151), then exception raises,
-        # which triggers release in except block (line 160)
-        pm.nonce_manager.confirm_transaction.assert_called_once_with(42)
-        pm.nonce_manager.release_nonce.assert_called_once_with(42)
+        # confirm is called in try block (line 153), then exception raises,
+        # except block also calls confirm (tx_sent=True, line 163)
+        assert pm.nonce_manager.confirm_transaction.call_count == 2
+        pm.nonce_manager.release_nonce.assert_not_called()
 
     def test_no_nonce_manager_uses_get_transaction_count(self):
         """Without nonce_manager, uses w3.eth.get_transaction_count."""
@@ -730,7 +730,7 @@ class TestMintSingle:
         pm.nonce_manager.release_nonce.assert_not_called()
 
     def test_mint_single_nonce_release_on_revert(self, pm, mint_params):
-        """On status=0, nonce_manager.release_nonce is called."""
+        """On status=0, nonce_manager.confirm_transaction is called (TX mined, nonce consumed)."""
         pm.w3.eth.wait_for_transaction_receipt.return_value = {
             'status': 0, 'gasUsed': 300_000, 'logs': []
         }
@@ -738,9 +738,9 @@ class TestMintSingle:
 
         result = pm.mint_single(mint_params)
 
-        pm.nonce_manager.release_nonce.assert_called_once_with(10)
-        # confirm_transaction should NOT be called for reverted tx
-        pm.nonce_manager.confirm_transaction.assert_not_called()
+        # TX was mined (even though reverted), so nonce is consumed on-chain
+        pm.nonce_manager.confirm_transaction.assert_called_once_with(10)
+        pm.nonce_manager.release_nonce.assert_not_called()
 
     def test_mint_single_fallback_result_when_no_events(self, pm, mint_params):
         """When _parse_mint_events returns None, fallback MintResult is returned."""

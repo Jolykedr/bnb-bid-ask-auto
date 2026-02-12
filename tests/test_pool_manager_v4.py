@@ -325,11 +325,11 @@ class TestV4PoolManager:
 
     def test_price_to_sqrt_price_x96_different_decimals(self, pool_manager):
         """price_to_sqrt_price_x96 с разными decimals."""
-        # Adjusted: price * 10^(token0_dec - token1_dec)
+        # Adjusted: price * 10^(token1_dec - token0_dec)
         result = pool_manager.price_to_sqrt_price_x96(1.0, 18, 6)
-        # 1.0 * 10^(18-6) = 10^12, sqrt(10^12) * 2^96
+        # 1.0 * 10^(6-18) = 10^(-12), sqrt(10^(-12)) * 2^96
         import math
-        expected = int(math.sqrt(10**12) * (2**96))
+        expected = int(math.sqrt(10**(-12)) * (2**96))
         assert result == expected
 
     def test_sqrt_price_x96_to_price_roundtrip(self, pool_manager):

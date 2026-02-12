@@ -290,7 +290,7 @@ class TestCreatePool:
         provider.nonce_manager.release_nonce.assert_not_called()
 
     def test_create_pool_tx_reverted(self, provider, config):
-        """create_pool with reverted TX returns (hash, False) and releases nonce."""
+        """create_pool with reverted TX returns (hash, False) and confirms nonce (TX was mined)."""
         provider.pool_manager.is_pool_initialized.return_value = False
 
         mock_init_fn = Mock()
@@ -313,8 +313,9 @@ class TestCreatePool:
 
         assert success is False
         assert tx_hash is not None
-        # Reverted TX: nonce released in the original code (line 421)
-        provider.nonce_manager.release_nonce.assert_called_once_with(1)
+        # Reverted TX was mined — nonce consumed on-chain, so confirm (not release)
+        provider.nonce_manager.confirm_transaction.assert_called_once_with(1)
+        provider.nonce_manager.release_nonce.assert_not_called()
 
     def test_create_pool_exception_releases_nonce(self, provider, config):
         """create_pool exception before send_raw_transaction releases nonce."""
@@ -528,7 +529,7 @@ class TestCreatePoolOnly:
         provider.nonce_manager.confirm_transaction.assert_called_once_with(1)
 
     def test_create_pool_only_tx_reverted(self, provider):
-        """Reverted TX returns (hash, pool_id, False)."""
+        """Reverted TX returns (hash, pool_id, False) and confirms nonce (TX was mined)."""
         provider.pool_manager.is_pool_initialized.return_value = False
 
         mock_init_fn = Mock()
@@ -549,7 +550,9 @@ class TestCreatePoolOnly:
             )
 
         assert success is False
-        provider.nonce_manager.release_nonce.assert_called_once_with(1)
+        # Reverted TX was mined — nonce consumed on-chain, so confirm (not release)
+        provider.nonce_manager.confirm_transaction.assert_called_once_with(1)
+        provider.nonce_manager.release_nonce.assert_not_called()
 
     def test_create_pool_only_exception_returns_false(self, provider):
         """Exception during TX returns (None, pool_id, False)."""

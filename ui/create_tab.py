@@ -2076,8 +2076,15 @@ class CreateTab(QWidget):
             if not private_key:
                 return
 
+            # Skip re-encryption if already saved (don't ask master password every connect)
+            if self.settings.value("remember", False, type=bool) and self.settings.value("private_key"):
+                # Just update RPC and network in case they changed
+                self.settings.setValue("rpc_url", self.rpc_input.text().strip())
+                self.settings.setValue("network_index", self.network_combo.currentIndex())
+                return
+
             if is_crypto_available():
-                # Ask for master password to encrypt
+                # Ask for master password to encrypt (only on first save)
                 password = create_master_password(self)
                 if password:
                     try:

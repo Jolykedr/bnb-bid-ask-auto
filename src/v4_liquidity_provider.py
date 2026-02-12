@@ -14,19 +14,7 @@ from eth_account import Account
 from eth_account.signers.local import LocalAccount
 import time
 
-# Настройка логгера
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setLevel(logging.DEBUG)
-    formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
 
 from .math.distribution import (
     calculate_bid_ask_distribution,
@@ -397,6 +385,7 @@ class V4LiquidityProvider:
         nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
                 self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
+        tx_sent = False
         try:
             tx = self.position_manager.contract.functions.initializePool(
                 pool_key.to_tuple(),
@@ -410,15 +399,14 @@ class V4LiquidityProvider:
 
             signed = self.account.sign_transaction(tx)
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_sent = True
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
 
             success = receipt['status'] == 1
 
+            # TX mined — nonce consumed (even if reverted)
             if self.nonce_manager:
-                if success:
-                    self.nonce_manager.confirm_transaction(nonce)
-                else:
-                    self.nonce_manager.release_nonce(nonce)
+                self.nonce_manager.confirm_transaction(nonce)
 
             # Verify pool was created
             if success:
@@ -432,7 +420,10 @@ class V4LiquidityProvider:
 
         except Exception as e:
             if self.nonce_manager:
-                self.nonce_manager.release_nonce(nonce)
+                if tx_sent:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
             raise
 
     def create_pool_only(
@@ -528,6 +519,7 @@ class V4LiquidityProvider:
         nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
                 self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
+        tx_sent = False
         try:
             tx = self.position_manager.contract.functions.initializePool(
                 pool_key.to_tuple(),
@@ -541,16 +533,15 @@ class V4LiquidityProvider:
 
             signed = self.account.sign_transaction(tx)
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_sent = True
             logger.info(f"Pool creation TX sent: {tx_hash.hex()}")
 
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
             success = receipt['status'] == 1
 
+            # TX mined — nonce consumed (even if reverted)
             if self.nonce_manager:
-                if success:
-                    self.nonce_manager.confirm_transaction(nonce)
-                else:
-                    self.nonce_manager.release_nonce(nonce)
+                self.nonce_manager.confirm_transaction(nonce)
 
             if success:
                 # Verify pool was created
@@ -570,7 +561,10 @@ class V4LiquidityProvider:
 
         except Exception as e:
             if self.nonce_manager:
-                self.nonce_manager.release_nonce(nonce)
+                if tx_sent:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
             logger.error(f"Pool creation error: {e}")
             return None, pool_id, False
 

@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QStyledItemDelegate, QCheckBox, QComboBox, QDoubleSpinBox,
     QScrollArea
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QRect
 from PyQt6.QtGui import QFont, QColor, QPainter, QBrush, QPen, QLinearGradient, QPainterPath
 
 import sys
@@ -164,7 +164,6 @@ class PriceProgressDelegate(QStyledItemDelegate):
             gradient.setColorAt(1, QColor(255, 107, 53))
 
         painter.setBrush(QBrush(gradient))
-        from PyQt6.QtCore import QRect
         seg_rect = QRect(seg_left, bar_rect.top() + 1, seg_right - seg_left, bar_rect.height() - 2)
         painter.drawRoundedRect(seg_rect, 3, 3)
 

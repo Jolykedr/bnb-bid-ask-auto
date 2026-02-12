@@ -153,6 +153,7 @@ def encrypt_key(private_key: str, password: str) -> str:
     # Деривация ключа из пароля
     key = _derive_key(password, salt)
 
+    plaintext = None
     try:
         # Шифруем
         plaintext = bytearray(private_key.encode('utf-8'))
@@ -173,7 +174,7 @@ def encrypt_key(private_key: str, password: str) -> str:
         return base64.b64encode(encrypted_data).decode('ascii')
     finally:
         # Обнуление sensitive data
-        if 'plaintext' in dir():
+        if plaintext is not None:
             _secure_zero(plaintext)
         _secure_zero(key)
 
@@ -219,6 +220,7 @@ def decrypt_key(encrypted_data: str, password: str) -> str:
         # Деривация ключа
         key = _derive_key(password, salt)
 
+        plaintext_bytes = None
         try:
             # Расшифровываем
             if CRYPTO_BACKEND == "cryptography":
@@ -237,7 +239,7 @@ def decrypt_key(encrypted_data: str, password: str) -> str:
             return result
         finally:
             # Обнуление sensitive data
-            if 'plaintext_bytes' in dir():
+            if plaintext_bytes is not None:
                 _secure_zero(plaintext_bytes)
             _secure_zero(key)
 

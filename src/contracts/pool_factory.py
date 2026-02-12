@@ -387,6 +387,7 @@ class PoolFactory:
         nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
                 self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
+        tx_sent = False
         try:
             tx = self.factory.functions.createPool(
                 token0, token1, fee
@@ -400,15 +401,14 @@ class PoolFactory:
             # Sign and send
             signed = self.account.sign_transaction(tx)
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_sent = True
 
             # Wait for receipt
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
 
+            # TX mined — nonce consumed (even if reverted)
             if self.nonce_manager:
-                if receipt['status'] == 1:
-                    self.nonce_manager.confirm_transaction(nonce)
-                else:
-                    self.nonce_manager.release_nonce(nonce)
+                self.nonce_manager.confirm_transaction(nonce)
 
             # Parse PoolCreated event to get pool address
             pool_address = None
@@ -425,7 +425,10 @@ class PoolFactory:
 
         except Exception as e:
             if self.nonce_manager:
-                self.nonce_manager.release_nonce(nonce)
+                if tx_sent:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
             raise
 
     def initialize_pool(
@@ -458,7 +461,7 @@ class PoolFactory:
         # Calculate sqrtPriceX96 from price
         # sqrtPriceX96 = sqrt(price) * 2^96
         # price = token1/token0, adjusted for decimals
-        adjusted_price = initial_price * (10 ** (token0_decimals - token1_decimals))
+        adjusted_price = initial_price * (10 ** (token1_decimals - token0_decimals))
         sqrt_price = math.sqrt(adjusted_price)
         sqrt_price_x96 = int(sqrt_price * (2 ** 96))
 
@@ -466,6 +469,7 @@ class PoolFactory:
         nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
                 self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
+        tx_sent = False
         try:
             tx = pool.functions.initialize(sqrt_price_x96).build_transaction({
                 'from': self.account.address,
@@ -477,21 +481,23 @@ class PoolFactory:
             # Sign and send
             signed = self.account.sign_transaction(tx)
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_sent = True
 
             # Wait for receipt
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
 
+            # TX mined — nonce consumed (even if reverted)
             if self.nonce_manager:
-                if receipt['status'] == 1:
-                    self.nonce_manager.confirm_transaction(nonce)
-                else:
-                    self.nonce_manager.release_nonce(nonce)
+                self.nonce_manager.confirm_transaction(nonce)
 
             return tx_hash.hex()
 
         except Exception as e:
             if self.nonce_manager:
-                self.nonce_manager.release_nonce(nonce)
+                if tx_sent:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
             raise
 
     def create_and_initialize_pool(
@@ -553,7 +559,7 @@ class PoolFactory:
         Returns:
             sqrtPriceX96
         """
-        adjusted_price = price * (10 ** (token0_decimals - token1_decimals))
+        adjusted_price = price * (10 ** (token1_decimals - token0_decimals))
         sqrt_price = math.sqrt(adjusted_price)
         return int(sqrt_price * (2 ** 96))
 
@@ -576,4 +582,4 @@ class PoolFactory:
         """
         sqrt_price = sqrt_price_x96 / (2 ** 96)
         price = sqrt_price ** 2
-        return price / (10 ** (token0_decimals - token1_decimals))
+        return price / (10 ** (token1_decimals - token0_decimals))

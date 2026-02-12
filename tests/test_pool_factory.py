@@ -681,7 +681,7 @@ class TestPoolFactory:
 
     @patch('src.contracts.pool_factory.Web3.to_checksum_address', side_effect=lambda x: x)
     def test_initialize_pool_different_decimals_18_6(self, _mock_checksum, factory_with_account):
-        """price=1, decimals 18/6 -> adjusted_price = 1 * 10^12."""
+        """price=1, decimals 18/6 -> adjusted_price = 1 * 10^(6-18) = 1e-12."""
         f = factory_with_account
 
         mock_pool = Mock()
@@ -690,13 +690,13 @@ class TestPoolFactory:
 
         f.initialize_pool(ADDR_POOL, 1.0, token0_decimals=18, token1_decimals=6)
 
-        # adjusted_price = 1.0 * 10^(18-6) = 1e12
-        expected_sqrt_price_x96 = int(math.sqrt(1e12) * (2 ** 96))
+        # adjusted_price = 1.0 * 10^(6-18) = 1e-12
+        expected_sqrt_price_x96 = int(math.sqrt(1e-12) * (2 ** 96))
         mock_pool.functions.initialize.assert_called_once_with(expected_sqrt_price_x96)
 
     @patch('src.contracts.pool_factory.Web3.to_checksum_address', side_effect=lambda x: x)
     def test_initialize_pool_different_decimals_6_18(self, _mock_checksum, factory_with_account):
-        """price=1, decimals 6/18 -> adjusted_price = 1 * 10^(-12)."""
+        """price=1, decimals 6/18 -> adjusted_price = 1 * 10^(18-6) = 1e12."""
         f = factory_with_account
 
         mock_pool = Mock()
@@ -705,8 +705,8 @@ class TestPoolFactory:
 
         f.initialize_pool(ADDR_POOL, 1.0, token0_decimals=6, token1_decimals=18)
 
-        # adjusted_price = 1.0 * 10^(6-18) = 1e-12
-        expected_sqrt_price_x96 = int(math.sqrt(1e-12) * (2 ** 96))
+        # adjusted_price = 1.0 * 10^(18-6) = 1e12
+        expected_sqrt_price_x96 = int(math.sqrt(1e12) * (2 ** 96))
         mock_pool.functions.initialize.assert_called_once_with(expected_sqrt_price_x96)
 
     @patch('src.contracts.pool_factory.Web3.to_checksum_address', side_effect=lambda x: x)
@@ -820,18 +820,18 @@ class TestPoolFactory:
         assert result == 2 * (2 ** 96)
 
     def test_price_to_sqrt_price_x96_different_decimals_18_6(self, factory):
-        """price=1, token0=18dec, token1=6dec -> adjusted_price=10^12."""
+        """price=1, token0=18dec, token1=6dec -> adjusted_price=10^(6-18)=10^(-12)."""
         result = factory.price_to_sqrt_price_x96(1.0, 18, 6)
 
-        adjusted = 1.0 * (10 ** (18 - 6))
+        adjusted = 1.0 * (10 ** (6 - 18))
         expected = int(math.sqrt(adjusted) * (2 ** 96))
         assert result == expected
 
     def test_price_to_sqrt_price_x96_different_decimals_6_18(self, factory):
-        """price=1, token0=6dec, token1=18dec -> adjusted_price=10^(-12)."""
+        """price=1, token0=6dec, token1=18dec -> adjusted_price=10^(18-6)=10^12."""
         result = factory.price_to_sqrt_price_x96(1.0, 6, 18)
 
-        adjusted = 1.0 * (10 ** (6 - 18))
+        adjusted = 1.0 * (10 ** (18 - 6))
         expected = int(math.sqrt(adjusted) * (2 ** 96))
         assert result == expected
 

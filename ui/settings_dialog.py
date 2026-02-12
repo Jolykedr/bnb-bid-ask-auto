@@ -6,7 +6,7 @@ Dialog for configuring application settings.
 
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGroupBox,
-    QLabel, QLineEdit, QDoubleSpinBox, QComboBox,
+    QLabel, QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox,
     QPushButton, QCheckBox, QTabWidget, QWidget,
     QMessageBox
 )
@@ -159,10 +159,9 @@ class SettingsDialog(QDialog):
         # Default positions
         pos_row = QHBoxLayout()
         pos_row.addWidget(QLabel("Default Positions:"))
-        self.positions_spin = QDoubleSpinBox()
+        self.positions_spin = QSpinBox()
         self.positions_spin.setRange(1, 20)
         self.positions_spin.setValue(7)
-        self.positions_spin.setDecimals(0)
         pos_row.addWidget(self.positions_spin)
         pos_row.addStretch()
         calc_group_layout.addLayout(pos_row)

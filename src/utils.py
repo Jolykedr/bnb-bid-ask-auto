@@ -152,12 +152,15 @@ class NonceManager:
         """
         Release a nonce that wasn't used (transaction failed before sending).
 
-        Note: This doesn't decrement _current_nonce as the nonce gap
-        will be filled by the next sync or can be used for replacement tx.
+        Decrements _current_nonce if this was the most recently allocated nonce,
+        preventing nonce gaps from accumulating on rapid failures.
         """
         with self._lock:
             self._pending_nonces.discard(nonce)
-            logger.debug(f"Released nonce: {nonce}")
+            # If this was the last allocated nonce, reclaim it
+            if self._current_nonce is not None and nonce == self._current_nonce - 1:
+                self._current_nonce = nonce
+            logger.debug(f"Released nonce: {nonce}, current: {self._current_nonce}")
 
     def reset(self):
         """Reset the nonce manager (force re-sync on next call)."""

@@ -132,6 +132,7 @@ class UniswapV3PositionManager:
         nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
                 self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
+        tx_sent = False
         try:
             tx = token.functions.approve(spender, max_uint256).build_transaction({
                 'from': self.account.address,
@@ -142,6 +143,7 @@ class UniswapV3PositionManager:
 
             signed = self.account.sign_transaction(tx)
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_sent = True
 
             # Ждём подтверждения с таймаутом
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
@@ -157,7 +159,10 @@ class UniswapV3PositionManager:
 
         except Exception as e:
             if self.nonce_manager:
-                self.nonce_manager.release_nonce(nonce)
+                if tx_sent:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
             raise
 
     def encode_mint(self, params: MintParams, recipient: str, deadline: int = None) -> bytes:
@@ -214,7 +219,8 @@ class UniswapV3PositionManager:
         token1: str,
         fee: int,
         token0_decimals: int = 18,
-        token1_decimals: int = 18
+        token1_decimals: int = 18,
+        stablecoin_is_token0: bool = False
     ) -> List[MintParams]:
         """
         Создание MintParams из распределения BidAsk.
@@ -226,6 +232,7 @@ class UniswapV3PositionManager:
             fee: Fee tier (500, 3000, 10000)
             token0_decimals: Decimals token0
             token1_decimals: Decimals token1
+            stablecoin_is_token0: True если стейблкоин = token0 (по адресу пула)
 
         Returns:
             Список MintParams готовых для mint
@@ -234,9 +241,17 @@ class UniswapV3PositionManager:
 
         for pos in positions:
             # Для bid-ask стратегии ниже текущей цены:
-            # amount0 = 0 (не вносим token0)
-            # amount1 = usd_amount в wei (вносим стейблкоин)
-            amount1 = int(pos.usd_amount * (10 ** token1_decimals))
+            # Вносим только стейблкоин, другой токен = 0
+            if stablecoin_is_token0:
+                stable_decimals = token0_decimals
+                amount = int(pos.usd_amount * (10 ** stable_decimals))
+                amount0 = amount
+                amount1 = 0
+            else:
+                stable_decimals = token1_decimals
+                amount = int(pos.usd_amount * (10 ** stable_decimals))
+                amount0 = 0
+                amount1 = amount
 
             params = MintParams(
                 token0=token0,
@@ -244,7 +259,7 @@ class UniswapV3PositionManager:
                 fee=fee,
                 tick_lower=pos.tick_lower,
                 tick_upper=pos.tick_upper,
-                amount0_desired=0,
+                amount0_desired=amount0,
                 amount1_desired=amount1,
                 amount0_min=0,
                 amount1_min=0
@@ -312,6 +327,7 @@ class UniswapV3PositionManager:
         nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
                 self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
+        tx_sent = False
         try:
             tx = self.contract.functions.mint(
                 params.to_tuple(self.account.address, deadline)
@@ -324,15 +340,14 @@ class UniswapV3PositionManager:
 
             signed = self.account.sign_transaction(tx)
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_sent = True
 
             # Ждём подтверждения с таймаутом
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
 
+            # TX mined — nonce consumed (even if reverted)
             if self.nonce_manager:
-                if receipt['status'] == 1:
-                    self.nonce_manager.confirm_transaction(nonce)
-                else:
-                    self.nonce_manager.release_nonce(nonce)
+                self.nonce_manager.confirm_transaction(nonce)
 
             # Парсим события для получения результатов
             event_data = self._parse_mint_events(receipt)
@@ -357,7 +372,10 @@ class UniswapV3PositionManager:
 
         except Exception as e:
             if self.nonce_manager:
-                self.nonce_manager.release_nonce(nonce)
+                if tx_sent:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
             raise
 
     def get_position(self, token_id: int) -> dict:

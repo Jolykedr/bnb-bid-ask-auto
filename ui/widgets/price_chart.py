@@ -43,6 +43,21 @@ class PriceChartWidget(QWidget):
         self.current_price = None
         self.update()
 
+    @staticmethod
+    def _format_price(price: float) -> str:
+        """Format price without scientific notation, handling sub-dollar prices."""
+        if price == 0:
+            return "0"
+        abs_price = abs(price)
+        if abs_price >= 1000:
+            return f"{price:,.0f}"
+        elif abs_price >= 1:
+            return f"{price:,.2f}"
+        elif abs_price >= 0.0001:
+            return f"{price:.6f}".rstrip('0').rstrip('.')
+        else:
+            return f"{price:.10f}".rstrip('0').rstrip('.')
+
     def paintEvent(self, event):
         """Custom paint event for drawing the chart."""
         painter = QPainter(self)
@@ -106,8 +121,8 @@ class PriceChartWidget(QWidget):
             price = max_price - (i / (num_labels - 1)) * price_range
             y = margin_top + (i / (num_labels - 1)) * chart_height
 
-            # Price label
-            painter.drawText(5, int(y + 4), f"${price:,.0f}")
+            # Price label (smart formatting for sub-dollar prices)
+            painter.drawText(5, int(y + 4), f"${self._format_price(price)}")
 
             # Grid line
             painter.setPen(QPen(QColor("#0f3460"), 1, Qt.PenStyle.DotLine))
@@ -126,7 +141,7 @@ class PriceChartWidget(QWidget):
             painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
             painter.drawText(
                 self.width() - margin_right - 100, int(y_current - 5),
-                f"Current: ${self.current_price:,.2f}"
+                f"Current: ${self._format_price(self.current_price)}"
             )
 
         # Draw position bars

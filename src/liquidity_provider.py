@@ -13,20 +13,7 @@ from eth_account import Account
 from eth_account.signers.local import LocalAccount
 import time
 
-# Настройка логгера
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-
-# Создаём handler для консоли если его нет
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setLevel(logging.DEBUG)
-    formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
 
 from .math.distribution import (
     calculate_bid_ask_distribution,

@@ -10,6 +10,7 @@ from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
 from decimal import Decimal
 from web3 import Web3
+from eth_account import Account
 from .utils import NonceManager
 
 logger = logging.getLogger(__name__)
@@ -313,10 +314,11 @@ class DexSwap:
         )
     """
 
-    def __init__(self, w3: Web3, chain_id: int = 56, nonce_manager: 'NonceManager' = None):
+    def __init__(self, w3: Web3, chain_id: int = 56, nonce_manager: 'NonceManager' = None, private_key: str = None):
         self.w3 = w3
         self.chain_id = chain_id
         self.nonce_manager = nonce_manager
+        self.account = Account.from_key(private_key) if private_key else None
 
         if chain_id not in ROUTER_V2_ADDRESSES:
             raise ValueError(f"Unsupported chain ID: {chain_id}")
@@ -340,6 +342,12 @@ class DexSwap:
             self.router_v3 = w3.eth.contract(address=self.router_v3_address, abi=ROUTER_V3_ABI)
             self.quoter_v3 = w3.eth.contract(address=self.quoter_v3_address, abi=QUOTER_V3_ABI)
             logger.info(f"V3 router available: {self.dex_name_v3}")
+
+    def _resolve_account(self, private_key: str = None):
+        """Resolve account from private_key arg or stored self.account."""
+        if private_key:
+            return Account.from_key(private_key)
+        return self.account
 
     def is_stable_token(self, token_address: str) -> bool:
         """Проверить, является ли токен стейблкоином или нативным токеном."""
@@ -459,12 +467,16 @@ class DexSwap:
         from_token = Web3.to_checksum_address(from_token)
         to_token = Web3.to_checksum_address(to_token)
 
+        # Use a small test amount based on token decimals to avoid liquidity overflow
+        from_decimals = self.get_token_decimals(from_token)
+        test_amount = 10 ** from_decimals  # 1 token in smallest units
+
         # Прямой путь
         direct_path = [from_token, to_token]
 
         try:
             # Проверить прямой путь
-            self.router.functions.getAmountsOut(10**18, direct_path).call()
+            self.router.functions.getAmountsOut(test_amount, direct_path).call()
             return direct_path
         except Exception:
             pass
@@ -473,7 +485,7 @@ class DexSwap:
         if from_token.lower() != self.weth_address.lower() and to_token.lower() != self.weth_address.lower():
             weth_path = [from_token, self.weth_address, to_token]
             try:
-                self.router.functions.getAmountsOut(10**18, weth_path).call()
+                self.router.functions.getAmountsOut(test_amount, weth_path).call()
                 return weth_path
             except Exception:
                 pass
@@ -562,7 +574,7 @@ class DexSwap:
         to_token: str,
         amount_in: int,
         wallet_address: str,
-        private_key: str,
+        private_key: str = None,
         slippage: float = 1.0,
         deadline_minutes: int = 20,
         fee: int = None
@@ -575,7 +587,7 @@ class DexSwap:
             to_token: Адрес токена для покупки
             amount_in: Количество в минимальных единицах
             wallet_address: Адрес кошелька
-            private_key: Приватный ключ
+            private_key: Приватный ключ (deprecated, use constructor)
             slippage: Проскальзывание в % (1.0 = 1%)
             deadline_minutes: Дедлайн в минутах
             fee: Fee tier (если None - выбирается лучший)
@@ -583,6 +595,14 @@ class DexSwap:
         Returns:
             SwapResult с результатом операции
         """
+        # Use stored account if private_key not passed directly
+        account = Account.from_key(private_key) if private_key else self.account
+        if account is None:
+            return SwapResult(
+                success=False, tx_hash=None, from_token=from_token, to_token=to_token,
+                from_amount=amount_in, to_amount=0, to_amount_usd=0, gas_used=0,
+                error="No private key provided"
+            )
         if not self.v3_available:
             return SwapResult(
                 success=False, tx_hash=None, from_token=from_token, to_token=to_token,
@@ -678,8 +698,8 @@ class DexSwap:
                     'value': 0
                 })
 
-                # Подписать и отправить
-                signed_tx = self.w3.eth.account.sign_transaction(tx, private_key)
+                # Подписать и отправить (используем account объект, не сырой ключ)
+                signed_tx = account.sign_transaction(tx)
                 tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
                 tx_sent = True
 
@@ -708,9 +728,12 @@ class DexSwap:
                     if actual_out != expected_out:
                         logger.info(f"Actual output differs: expected={expected_out}, actual={actual_out}")
 
-                # USD: для стейблкоинов amount/10^decimals ≈ USD, для остальных конвертируем
+                # USD: только для стейблкоинов amount/10^decimals ≈ USD
                 to_decimals = self.get_token_decimals(to_token)
-                to_amount_usd = actual_out / (10 ** to_decimals)
+                if self.is_stable_token(to_token):
+                    to_amount_usd = actual_out / (10 ** to_decimals)
+                else:
+                    to_amount_usd = 0  # Non-stablecoin, can't assume 1:1
 
                 return SwapResult(
                     success=True,
@@ -748,10 +771,11 @@ class DexSwap:
         token_address: str,
         amount: int,
         wallet_address: str,
-        private_key: str
+        private_key: str = None
     ) -> bool:
         """Проверить и при необходимости одобрить токен для V3 Router."""
         try:
+            account = self._resolve_account(private_key)
             token_address = Web3.to_checksum_address(token_address)
             wallet_address = Web3.to_checksum_address(wallet_address)
 
@@ -781,7 +805,7 @@ class DexSwap:
                     'gasPrice': self.w3.eth.gas_price
                 })
 
-                signed_tx = self.w3.eth.account.sign_transaction(tx, private_key)
+                signed_tx = account.sign_transaction(tx)
                 tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
 
                 logger.info(f"V3 Approve TX: {tx_hash.hex()}")
@@ -807,12 +831,13 @@ class DexSwap:
         token_address: str,
         amount: int,
         wallet_address: str,
-        private_key: str
+        private_key: str = None
     ) -> bool:
         """
         Проверить и при необходимости одобрить токен для свопа.
         """
         try:
+            account = self._resolve_account(private_key)
             token_address = Web3.to_checksum_address(token_address)
             wallet_address = Web3.to_checksum_address(wallet_address)
 
@@ -844,7 +869,7 @@ class DexSwap:
                     'gasPrice': self.w3.eth.gas_price
                 })
 
-                signed_tx = self.w3.eth.account.sign_transaction(tx, private_key)
+                signed_tx = account.sign_transaction(tx)
                 tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
 
                 logger.info(f"Approve TX: {tx_hash.hex()}")
@@ -989,13 +1014,14 @@ class DexSwap:
         to_token: str,
         amount_in: int,
         wallet_address: str,
-        private_key: str,
+        private_key: str = None,
         slippage: float = 1.0,
         deadline_minutes: int = 20,
         use_fee_on_transfer: bool = True
     ) -> SwapResult:
         """Выполнить своп через V2 Router."""
         try:
+            account = self._resolve_account(private_key)
             # Построить путь
             path = self._build_path(from_token, to_token)
             if not path:
@@ -1082,8 +1108,8 @@ class DexSwap:
                         'gasPrice': self.w3.eth.gas_price
                     })
 
-                # Подписать и отправить
-                signed_tx = self.w3.eth.account.sign_transaction(tx, private_key)
+                # Подписать и отправить (используем account объект, не сырой ключ)
+                signed_tx = account.sign_transaction(tx)
                 tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
                 tx_sent = True
 
@@ -1113,7 +1139,10 @@ class DexSwap:
                         logger.info(f"V2 actual output differs: expected={expected_out}, actual={actual_out}")
 
                 to_decimals = self.get_token_decimals(to_token)
-                to_amount_usd = actual_out / (10 ** to_decimals)
+                if self.is_stable_token(to_token):
+                    to_amount_usd = actual_out / (10 ** to_decimals)
+                else:
+                    to_amount_usd = 0  # Non-stablecoin, can't assume 1:1
 
                 return SwapResult(
                     success=True,

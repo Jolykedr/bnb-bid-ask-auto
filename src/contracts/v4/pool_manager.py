@@ -5,7 +5,7 @@ Handles pool initialization and state queries for V4.
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Tuple
 from web3 import Web3
 from eth_abi import encode, decode
@@ -22,6 +22,7 @@ class PoolKey:
     fee: int        # Fee in hundredths of a bip (0-1,000,000)
     tick_spacing: int  # Tick spacing
     hooks: str = "0x0000000000000000000000000000000000000000"  # Hooks address
+    _truncated_pool_id: Optional[bytes] = field(default=None, repr=False)  # Set when reconstructed from truncated ID
 
     def to_tuple(self) -> tuple:
         """Convert to tuple for contract calls."""
@@ -256,7 +257,7 @@ class V4PoolManager:
             sqrtPriceX96
         """
         # Adjust for decimals
-        adjusted_price = price * (10 ** (token0_decimals - token1_decimals))
+        adjusted_price = price * (10 ** (token1_decimals - token0_decimals))
         sqrt_price = math.sqrt(adjusted_price)
         return int(sqrt_price * (2 ** 96))
 
@@ -279,7 +280,7 @@ class V4PoolManager:
         """
         sqrt_price = sqrt_price_x96 / (2 ** 96)
         price = sqrt_price ** 2
-        return price / (10 ** (token0_decimals - token1_decimals))
+        return price / (10 ** (token1_decimals - token0_decimals))
 
     def get_current_price(
         self,
