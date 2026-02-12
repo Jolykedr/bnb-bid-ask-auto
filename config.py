@@ -223,7 +223,8 @@ TOKENS_BASE: Dict[str, TokenConfig] = {
 FEE_TIERS = {
     "LOWEST": 100,    # 0.01% - стейблкоины
     "LOW": 500,       # 0.05% - стабильные пары
-    "MEDIUM": 2500,   # 0.25% - большинство пар (PancakeSwap specific)
+    "MEDIUM_PSC": 2500,   # 0.25% - большинство пар (PancakeSwap specific)
+    "MEDIUM_UNI": 3000,   # 0.30% - стандартный Uniswap tier
     "HIGH": 10000,    # 1.00% - экзотические пары
 }
 

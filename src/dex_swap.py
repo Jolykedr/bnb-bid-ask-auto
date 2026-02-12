@@ -356,7 +356,7 @@ class DexSwap:
             return 0
 
     def get_token_decimals(self, token_address: str) -> int:
-        """Получить decimals токена."""
+        """Получить decimals токена. Raises RuntimeError on failure."""
         try:
             contract = self.w3.eth.contract(
                 address=Web3.to_checksum_address(token_address),
@@ -364,8 +364,10 @@ class DexSwap:
             )
             return contract.functions.decimals().call()
         except Exception as e:
-            logger.warning(f"Failed to get decimals for {token_address}: {e}, defaulting to 18")
-            return 18
+            raise RuntimeError(
+                f"Failed to get decimals for {token_address}: {e}. "
+                f"Cannot safely default to 18 — wrong decimals cause catastrophic amount errors."
+            ) from e
 
     # ERC20 Transfer(address,address,uint256) event topic
     TRANSFER_TOPIC = Web3.keccak(text="Transfer(address,address,uint256)")
@@ -1204,7 +1206,8 @@ def sell_tokens_after_close(
             "skipped": [token_address]
         }
     """
-    swapper = DexSwap(w3, chain_id)
+    nonce_mgr = NonceManager(w3, Account.from_key(private_key).address)
+    swapper = DexSwap(w3, chain_id, nonce_manager=nonce_mgr, private_key=private_key)
     output_token = swapper.get_output_token()
 
     results = {

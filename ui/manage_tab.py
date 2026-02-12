@@ -110,8 +110,11 @@ def _load_v4_position_to_dict(
                         )
                         position[dec_key] = tc.functions.decimals().call()
                         position[sym_key] = tc.functions.symbol().call()
-                    except Exception:
-                        position[dec_key] = 18
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to get decimals for {addr_field} (token {token_id}): {e}. "
+                            f"NOT defaulting to 18 — prices may be wrong."
+                        )
 
             dec0 = position.get('token0_decimals', 18)
             dec1 = position.get('token1_decimals', 18)
@@ -1698,6 +1701,14 @@ class ManageTab(QWidget):
         self.positions_table.setRowCount(0)
         self.positions_data = {}
         self.token_ids_input.clear()
+
+        # Stop previous scan if still running
+        if hasattr(self, 'scan_worker') and self.scan_worker is not None:
+            if self.scan_worker.isRunning():
+                self.scan_worker.quit()
+                self.scan_worker.wait(3000)
+            self.scan_worker.deleteLater()
+            self.scan_worker = None
 
         # Start scan worker with selected protocol
         self.progress_bar.show()

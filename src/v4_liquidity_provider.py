@@ -749,6 +749,8 @@ class V4LiquidityProvider:
 
     def get_token_balance(self, token_address: str) -> int:
         """Get token balance."""
+        if not self.account:
+            raise ValueError("Account not configured — cannot check balance")
         token = self.w3.eth.contract(
             address=Web3.to_checksum_address(token_address),
             abi=ERC20_ABI
@@ -1340,7 +1342,7 @@ class V4LiquidityProvider:
 
             logger.info("Creating new pool...")
             try:
-                tx_hash, success = self.create_pool(config, timeout)
+                tx_hash, success = self.create_pool(config, timeout=timeout)
                 if not success:
                     return V4LadderResult(
                         positions=positions,
@@ -1862,8 +1864,8 @@ class V4LiquidityProvider:
                 logger.error(f"Error processing position {token_id}: {e}")
 
         if not positions_to_close:
-            logger.warning("No positions to close (all have zero liquidity or errored)")
-            return None, False, None
+            logger.info("No positions to close (all have zero liquidity or already closed)")
+            return None, True, None
 
         logger.info(f"Closing {len(positions_to_close)} positions via batch...")
 
@@ -1875,19 +1877,23 @@ class V4LiquidityProvider:
             burn=burn
         )
 
-        tx_hash, _ = self.position_manager.execute_modify_liquidities(
-            unlock_data=unlock_data,
-            deadline=deadline,
-            timeout=timeout
-        )
+        try:
+            tx_hash, _ = self.position_manager.execute_modify_liquidities(
+                unlock_data=unlock_data,
+                deadline=deadline,
+                timeout=timeout
+            )
 
-        receipt = self.w3.eth.get_transaction_receipt(tx_hash)
-        gas_used = receipt.get('gasUsed', 0)
+            receipt = self.w3.eth.get_transaction_receipt(tx_hash)
+            gas_used = receipt.get('gasUsed', 0)
 
-        success = receipt['status'] == 1
-        if success:
-            logger.info(f"Positions closed successfully! TX: {tx_hash}")
-        else:
-            logger.error(f"Transaction failed! TX: {tx_hash}")
+            success = receipt['status'] == 1
+            if success:
+                logger.info(f"Positions closed successfully! TX: {tx_hash}")
+            else:
+                logger.error(f"Transaction failed (reverted)! TX: {tx_hash}")
 
-        return tx_hash, success, gas_used
+            return tx_hash, success, gas_used
+        except Exception as e:
+            logger.error(f"close_positions failed: {e}")
+            return None, False, None

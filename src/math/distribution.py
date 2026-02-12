@@ -208,11 +208,23 @@ def calculate_bid_ask_distribution(
     # Диапазон тиков
     total_ticks = tick_upper_aligned - tick_lower_aligned
 
+    # Ограничиваем число позиций по доступному диапазону тиков
+    max_positions = total_ticks // tick_spacing
+    if max_positions < 1:
+        max_positions = 1
+    if n_positions > max_positions:
+        logger.warning(
+            f"n_positions={n_positions} exceeds available range "
+            f"({total_ticks} ticks / {tick_spacing} spacing = {max_positions} max). "
+            f"Clamping to {max_positions}."
+        )
+        n_positions = max_positions
+
     # Рассчитываем ширину каждой позиции
     # Делим total_ticks на n_positions и округляем к tick_spacing
-    # Используем ceiling division чтобы гарантированно покрыть весь диапазон
+    # Используем floor division чтобы позиции не выходили за указанный диапазон
     raw_ticks_per_position = total_ticks / n_positions
-    ticks_per_position = int(math.ceil(raw_ticks_per_position / tick_spacing)) * tick_spacing
+    ticks_per_position = int(raw_ticks_per_position // tick_spacing) * tick_spacing
 
     if ticks_per_position < tick_spacing:
         ticks_per_position = tick_spacing

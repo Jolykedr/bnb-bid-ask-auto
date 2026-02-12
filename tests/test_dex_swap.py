@@ -348,12 +348,12 @@ class TestGetTokenDecimals:
         decimals = swapper.get_token_decimals(TOKEN_VOLATILE)
         assert decimals == 6
 
-    def test_error_returns_18_default(self):
+    def test_error_raises_runtime_error(self):
         swapper, w3 = _make_swapper(56)
         w3.eth.contract.side_effect = Exception("no decimals method")
 
-        decimals = swapper.get_token_decimals(TOKEN_VOLATILE)
-        assert decimals == 18
+        with pytest.raises(RuntimeError, match="Failed to get decimals"):
+            swapper.get_token_decimals(TOKEN_VOLATILE)
 
 
 # ============================================================

@@ -288,16 +288,20 @@ class TestFeeTiers:
         assert "LOW" in FEE_TIERS
         assert FEE_TIERS["LOW"] == 500
 
-    def test_has_medium(self):
-        assert "MEDIUM" in FEE_TIERS
-        assert FEE_TIERS["MEDIUM"] == 2500
+    def test_has_medium_psc(self):
+        assert "MEDIUM_PSC" in FEE_TIERS
+        assert FEE_TIERS["MEDIUM_PSC"] == 2500
+
+    def test_has_medium_uni(self):
+        assert "MEDIUM_UNI" in FEE_TIERS
+        assert FEE_TIERS["MEDIUM_UNI"] == 3000
 
     def test_has_high(self):
         assert "HIGH" in FEE_TIERS
         assert FEE_TIERS["HIGH"] == 10000
 
-    def test_exactly_four_tiers(self):
-        assert len(FEE_TIERS) == 4
+    def test_exactly_five_tiers(self):
+        assert len(FEE_TIERS) == 5
 
     def test_all_values_positive_ints(self):
         for name, fee in FEE_TIERS.items():

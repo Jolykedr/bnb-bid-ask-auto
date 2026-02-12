@@ -110,6 +110,8 @@ class CreateLadderWorkerV4(QThread):
         except Exception as e:
             self.finished.emit(False, str(e), {})
         finally:
+            # Zero private key from memory
+            self.private_key = None
             # Cleanup provider resources (Web3 connections)
             if provider is not None:
                 try:

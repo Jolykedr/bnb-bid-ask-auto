@@ -410,6 +410,9 @@ class PoolFactory:
             if self.nonce_manager:
                 self.nonce_manager.confirm_transaction(nonce)
 
+            if receipt['status'] != 1:
+                raise Exception(f"create_pool transaction reverted! TX: {tx_hash.hex()}")
+
             # Parse PoolCreated event to get pool address
             pool_address = None
             try:
@@ -489,6 +492,9 @@ class PoolFactory:
             # TX mined — nonce consumed (even if reverted)
             if self.nonce_manager:
                 self.nonce_manager.confirm_transaction(nonce)
+
+            if receipt['status'] != 1:
+                raise Exception(f"initialize_pool transaction reverted! TX: {tx_hash.hex()}")
 
             return tx_hash.hex()
 
