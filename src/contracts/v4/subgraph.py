@@ -4,10 +4,13 @@ V4 Pool Info Query - Lightweight version
 Queries Uniswap interface API to get pool info from pool_id.
 """
 
+import logging
 import requests
 from dataclasses import dataclass
 from typing import Optional
 from web3 import Web3
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -58,7 +61,7 @@ query GetV4Pool {
 '''
 
     try:
-        print(f"[API] Querying Uniswap API for pool: {pool_id_lower[:20]}...")
+        logger.debug(f"[API] Querying Uniswap API for pool: {pool_id_lower[:20]}...")
         response = requests.post(
             api_url,
             json={"query": query},
@@ -69,22 +72,22 @@ query GetV4Pool {
             timeout=10
         )
 
-        print(f"[API] Response status: {response.status_code}")
+        logger.debug(f"[API] Response status: {response.status_code}")
 
         if response.status_code == 200:
             data = response.json()
-            print(f"[API] Response data keys: {data.keys() if data else 'None'}")
+            logger.debug(f"[API] Response data keys: {data.keys() if data else 'None'}")
 
             # Check for errors in response
             if data and "errors" in data:
-                print(f"[API] GraphQL errors: {data['errors']}")
+                logger.warning(f"[API] GraphQL errors: {data['errors']}")
 
             if data:
                 pool = data.get("data", {}).get("v4Pool")
-                print(f"[API] Pool found: {pool is not None}")
+                logger.debug(f"[API] Pool found: {pool is not None}")
 
                 if pool:
-                    print(f"[API] Pool tokens: {pool.get('token0', {}).get('symbol')}/{pool.get('token1', {}).get('symbol')}")
+                    logger.info(f"[API] Pool tokens: {pool.get('token0', {}).get('symbol')}/{pool.get('token1', {}).get('symbol')}")
                     return V4PoolInfo(
                         pool_id=pool["poolId"],
                         token0_address=pool["token0"]["address"],
@@ -100,16 +103,16 @@ query GetV4Pool {
                         liquidity="0"
                     )
                 else:
-                    print(f"[API] Pool not found in response. Full data: {data.get('data', {})}")
+                    logger.warning(f"[API] Pool not found in response. Full data: {data.get('data', {})}")
         else:
-            print(f"[API] Non-200 response: {response.text[:200]}")
+            logger.warning(f"[API] Non-200 response: {response.text[:200]}")
     except Exception as e:
-        print(f"[API] Uniswap API error: {e}")
+        logger.error(f"[API] Uniswap API error: {e}")
 
     # If direct lookup failed and this looks like a zero-padded truncated ID,
     # try prefix search
     if pool_id_lower.endswith('00000000000000'):
-        print(f"[API] Trying prefix search for truncated pool ID...")
+        logger.debug(f"[API] Trying prefix search for truncated pool ID...")
         prefix = pool_id_lower[:52]  # 0x + 50 hex chars (25 bytes)
         return query_pools_by_prefix(prefix, chain_id)
 
@@ -160,7 +163,7 @@ query GetV4Pools {
                 prefix_lower = prefix.lower()
                 for pool in pools:
                     if pool["poolId"].lower().startswith(prefix_lower):
-                        print(f"[API] Found pool by prefix: {pool['poolId']}")
+                        logger.info(f"[API] Found pool by prefix: {pool['poolId']}")
                         return V4PoolInfo(
                             pool_id=pool["poolId"],
                             token0_address=pool["token0"]["address"],
@@ -176,9 +179,9 @@ query GetV4Pools {
                             liquidity="0"
                         )
 
-                print(f"[API] No pool found matching prefix {prefix_lower[:20]}...")
+                logger.warning(f"[API] No pool found matching prefix {prefix_lower[:20]}...")
     except Exception as e:
-        print(f"[API] Prefix search error: {e}")
+        logger.error(f"[API] Prefix search error: {e}")
 
     return None
 
@@ -210,7 +213,7 @@ def try_all_sources_with_web3(
         # Strip trailing zeros to get the meaningful part
         stripped = pool_id_lower.rstrip('0')
         if len(stripped) >= 10:  # At least some meaningful prefix
-            print(f"[API] Last resort: prefix search with {stripped[:20]}...")
+            logger.debug(f"[API] Last resort: prefix search with {stripped[:20]}...")
             result = query_pools_by_prefix(stripped, chain_id)
             if result:
                 return result

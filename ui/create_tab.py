@@ -13,8 +13,12 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
 from PyQt6.QtGui import QFont
 
+import logging
+
 from .widgets.position_table import PositionTableWidget
 from .password_dialog import ask_master_password, create_master_password
+
+logger = logging.getLogger(__name__)
 
 # Note: run_ui.py adds bnb/ to sys.path, so these imports work
 from src.liquidity_provider import LiquidityProvider, LiquidityLadderConfig
@@ -2067,7 +2071,7 @@ class CreateTab(QWidget):
                 self.network_combo.setCurrentIndex(int(saved_network))
 
         except Exception as e:
-            print(f"Error loading saved wallet: {e}")
+            logger.warning(f"Error loading saved wallet: {e}")
 
     def _save_wallet(self):
         """Save wallet to settings with AES-256 encryption."""

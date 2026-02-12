@@ -161,8 +161,8 @@ class LiquidityProvider:
 
     # Создание позиций
     result = provider.create_ladder(config)
-    print(f"Token IDs: {result.token_ids}")
-    print(f"Gas used: {result.gas_used}")
+    logger.info(f"Token IDs: {result.token_ids}")
+    logger.info(f"Gas used: {result.gas_used}")
     ```
     """
 

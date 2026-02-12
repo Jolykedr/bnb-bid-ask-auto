@@ -117,9 +117,9 @@ class V4PositionManager:
             # Get liquidity separately
             try:
                 liquidity = self.contract.functions.getPositionLiquidity(token_id).call()
-                print(f"[V4] getPositionLiquidity returned: {liquidity}")
+                logger.debug(f"[V4] getPositionLiquidity returned: {liquidity}")
             except Exception as liq_e:
-                print(f"[V4] getPositionLiquidity failed: {liq_e}")
+                logger.warning(f"[V4] getPositionLiquidity failed: {liq_e}")
                 liquidity = self._get_position_liquidity(token_id)
 
             pool_key = PoolKey(
@@ -130,10 +130,10 @@ class V4PositionManager:
                 hooks=pool_key_tuple[4]
             )
 
-            print(f"[V4] getPoolAndPositionInfo success for {token_id}")
-            print(f"[V4] Position {token_id}: {pool_key.currency0}/{pool_key.currency1}")
-            print(f"[V4] Fee: {pool_key.fee}, TickSpacing: {pool_key.tick_spacing}")
-            print(f"[V4] Ticks: {tick_lower}/{tick_upper}, Liquidity: {liquidity}")
+            logger.debug(f"[V4] getPoolAndPositionInfo success for {token_id}")
+            logger.debug(f"[V4] Position {token_id}: {pool_key.currency0}/{pool_key.currency1}")
+            logger.debug(f"[V4] Fee: {pool_key.fee}, TickSpacing: {pool_key.tick_spacing}")
+            logger.debug(f"[V4] Ticks: {tick_lower}/{tick_upper}, Liquidity: {liquidity}")
 
             return V4Position(
                 token_id=token_id,
@@ -144,9 +144,9 @@ class V4PositionManager:
             )
         except Exception as e:
             import traceback
-            print(f"[V4] getPoolAndPositionInfo failed for {token_id}: {e}")
-            traceback.print_exc()
-            print(f"[V4] Trying legacy getPositionInfo...")
+            logger.warning(f"[V4] getPoolAndPositionInfo failed for {token_id}: {e}")
+            logger.debug(traceback.format_exc())
+            logger.debug(f"[V4] Trying legacy getPositionInfo...")
 
         # Try PancakeSwap-specific positions() function
         try:
@@ -165,7 +165,7 @@ class V4PositionManager:
                 hooks=pool_key_tuple[4]
             )
 
-            print(f"[V4] positions() success: {pool_key.currency0[:10]}.../{pool_key.currency1[:10]}..., liq={liquidity}")
+            logger.debug(f"[V4] positions() success: {pool_key.currency0[:10]}.../{pool_key.currency1[:10]}..., liq={liquidity}")
 
             return V4Position(
                 token_id=token_id,
@@ -175,7 +175,7 @@ class V4PositionManager:
                 liquidity=liquidity
             )
         except Exception as e:
-            print(f"[V4] positions() failed for {token_id}: {e}")
+            logger.warning(f"[V4] positions() failed for {token_id}: {e}")
 
         # Try legacy getPositionInfo
         try:
@@ -193,7 +193,7 @@ class V4PositionManager:
                 hooks=pool_key_tuple[4]
             )
 
-            print(f"[V4] getPositionInfo success: {pool_key.currency0[:10]}.../{pool_key.currency1[:10]}..., liq={liquidity}")
+            logger.debug(f"[V4] getPositionInfo success: {pool_key.currency0[:10]}.../{pool_key.currency1[:10]}..., liq={liquidity}")
 
             return V4Position(
                 token_id=token_id,
@@ -203,8 +203,8 @@ class V4PositionManager:
                 liquidity=liquidity
             )
         except Exception as e:
-            print(f"[V4] getPositionInfo also failed for {token_id}: {e}")
-            print(f"[V4] Trying raw positionInfo...")
+            logger.warning(f"[V4] getPositionInfo also failed for {token_id}: {e}")
+            logger.debug(f"[V4] Trying raw positionInfo...")
 
         # Fallback to positionInfo (packed data)
         try:
@@ -247,7 +247,7 @@ class V4PositionManager:
             full_pool_id = pool_id_truncated + b'\x00' * (32 - len(pool_id_truncated))
             pool_id_hex = '0x' + full_pool_id.hex()
 
-            print(f"[V4] Position {token_id}: truncated poolId = {pool_id_hex[:20]}...")
+            logger.debug(f"[V4] Position {token_id}: truncated poolId = {pool_id_hex[:20]}...")
 
             # Try to get pool info from Uniswap API
             pool_key = None
@@ -255,7 +255,7 @@ class V4PositionManager:
                 from .subgraph import query_uniswap_api
                 pool_info = query_uniswap_api(pool_id_hex, chain_id=self.chain_id)
                 if pool_info:
-                    print(f"[V4] Found pool via API: {pool_info.token0_symbol}/{pool_info.token1_symbol}")
+                    logger.debug(f"[V4] Found pool via API: {pool_info.token0_symbol}/{pool_info.token1_symbol}")
                     pool_key = PoolKey(
                         currency0=pool_info.token0_address,
                         currency1=pool_info.token1_address,
@@ -264,7 +264,7 @@ class V4PositionManager:
                         hooks="0x0000000000000000000000000000000000000000"
                     )
             except Exception as api_error:
-                print(f"[V4] API lookup failed: {api_error}")
+                logger.warning(f"[V4] API lookup failed: {api_error}")
 
             # Fallback to empty pool key if API lookup failed
             if pool_key is None:
@@ -278,7 +278,7 @@ class V4PositionManager:
                 # Store truncated poolId for reference
                 pool_key._truncated_pool_id = pool_id_truncated
 
-            print(f"[V4] Position {token_id}: {pool_key.currency0[:10]}.../{pool_key.currency1[:10]}..., ticks={tick_lower}/{tick_upper}, liq={liquidity}")
+            logger.debug(f"[V4] Position {token_id}: {pool_key.currency0[:10]}.../{pool_key.currency1[:10]}..., ticks={tick_lower}/{tick_upper}, liq={liquidity}")
 
             return V4Position(
                 token_id=token_id,
@@ -379,10 +379,10 @@ class V4PositionManager:
         try:
             # First try contract method
             liquidity = self.contract.functions.getPositionLiquidity(token_id).call()
-            print(f"[V4] _get_position_liquidity via contract: {liquidity}")
+            logger.debug(f"[V4] _get_position_liquidity via contract: {liquidity}")
             return liquidity
         except Exception as e:
-            print(f"[V4] contract.getPositionLiquidity failed: {e}")
+            logger.warning(f"[V4] contract.getPositionLiquidity failed: {e}")
 
         try:
             # Fallback to raw call
@@ -394,22 +394,22 @@ class V4PositionManager:
                 'data': call_data
             })
 
-            print(f"[V4] Raw getPositionLiquidity result: {len(result)} bytes, hex={result.hex()[:64]}...")
+            logger.debug(f"[V4] Raw getPositionLiquidity result: {len(result)} bytes, hex={result.hex()[:64]}...")
 
             # ABI-encoded uint128 is padded to 32 bytes (uint256)
             # The value is right-aligned, so we read the full 32 bytes as int
             if len(result) >= 32:
                 liquidity = int.from_bytes(result[:32], 'big')
-                print(f"[V4] Parsed liquidity from 32 bytes: {liquidity}")
+                logger.debug(f"[V4] Parsed liquidity from 32 bytes: {liquidity}")
                 return liquidity
             elif len(result) >= 16:
                 # Fallback for raw uint128 (unlikely but handle it)
                 liquidity = int.from_bytes(result, 'big')
-                print(f"[V4] Parsed liquidity from {len(result)} bytes: {liquidity}")
+                logger.debug(f"[V4] Parsed liquidity from {len(result)} bytes: {liquidity}")
                 return liquidity
             return 0
         except Exception as e:
-            print(f"[V4] Raw getPositionLiquidity failed: {e}")
+            logger.warning(f"[V4] Raw getPositionLiquidity failed: {e}")
             return 0
 
     def encode_mint_position(
@@ -433,12 +433,12 @@ class V4PositionManager:
         action = self.actions.MINT_POSITION
 
         # Debug logging (pool_id NOT logged — PoolKey.get_pool_id() is Uniswap-only, wrong for PancakeSwap)
-        print(f"[V4 MINT] Action code: 0x{action:02x}")
-        print(f"[V4 MINT] PoolKey: {pool_key.currency0}/{pool_key.currency1} fee={pool_key.fee} ts={pool_key.tick_spacing}")
-        print(f"[V4 MINT] tick_lower={tick_lower}, tick_upper={tick_upper}")
-        print(f"[V4 MINT] liquidity={liquidity}")
-        print(f"[V4 MINT] amount0_max={amount0_max}, amount1_max={amount1_max}")
-        print(f"[V4 MINT] recipient={recipient}")
+        logger.debug(f"[V4 MINT] Action code: 0x{action:02x}")
+        logger.debug(f"[V4 MINT] PoolKey: {pool_key.currency0}/{pool_key.currency1} fee={pool_key.fee} ts={pool_key.tick_spacing}")
+        logger.debug(f"[V4 MINT] tick_lower={tick_lower}, tick_upper={tick_upper}")
+        logger.debug(f"[V4 MINT] liquidity={liquidity}")
+        logger.debug(f"[V4 MINT] amount0_max={amount0_max}, amount1_max={amount1_max}")
+        logger.debug(f"[V4 MINT] recipient={recipient}")
 
         # Encode parameters
         # V4 MINT_POSITION expects PositionConfig as first param:
@@ -471,8 +471,8 @@ class V4PositionManager:
     def encode_settle_pair(self, currency0: str, currency1: str) -> bytes:
         """Encode settle pair action."""
         action = self.actions.SETTLE_PAIR
-        print(f"[V4 SETTLE_PAIR] Action code: 0x{action:02x}")
-        print(f"[V4 SETTLE_PAIR] currency0={currency0}, currency1={currency1}")
+        logger.debug(f"[V4 SETTLE_PAIR] Action code: 0x{action:02x}")
+        logger.debug(f"[V4 SETTLE_PAIR] currency0={currency0}, currency1={currency1}")
         params = encode(
             ['address', 'address'],
             [Web3.to_checksum_address(currency0), Web3.to_checksum_address(currency1)]
@@ -702,7 +702,7 @@ class V4PositionManager:
         for c0, c1 in token_pairs:
             all_actions.append(self.encode_take_pair(c0, c1, recipient))
 
-        print(f"[V4] Batch close: {len(positions)} positions, {len(token_pairs)} unique pairs, {len(all_actions)} total actions")
+        logger.info(f"[V4] Batch close: {len(positions)} positions, {len(token_pairs)} unique pairs, {len(all_actions)} total actions")
 
         return self._encode_actions(all_actions)
 
@@ -969,10 +969,10 @@ class V4PositionManager:
         currency0 = Web3.to_checksum_address(currency0)
         currency1 = Web3.to_checksum_address(currency1)
 
-        print(f"[V4] Closing position {token_id} with explicit tokens:")
-        print(f"[V4]   currency0: {currency0}")
-        print(f"[V4]   currency1: {currency1}")
-        print(f"[V4]   liquidity: {liquidity}")
+        logger.info(f"[V4] Closing position {token_id} with explicit tokens:")
+        logger.debug(f"[V4]   currency0: {currency0}")
+        logger.debug(f"[V4]   currency1: {currency1}")
+        logger.debug(f"[V4]   liquidity: {liquidity}")
 
         # Build close payload
         payload = self.build_close_position_payload(
@@ -1083,9 +1083,9 @@ class V4PositionManager:
 
             normalized_positions.append(normalized)
 
-        print(f"[V4] Batch closing {len(normalized_positions)} positions in 1 transaction")
+        logger.info(f"[V4] Batch closing {len(normalized_positions)} positions in 1 transaction")
         for pos in normalized_positions:
-            print(f"[V4]   #{pos['token_id']}: {pos['currency0'][:10]}.../{pos['currency1'][:10]}..., liq={pos['liquidity']}")
+            logger.debug(f"[V4]   #{pos['token_id']}: {pos['currency0'][:10]}.../{pos['currency1'][:10]}..., liq={pos['liquidity']}")
 
         # Build batch payload
         payload = self.build_batch_close_payload(normalized_positions, recipient)
@@ -1106,14 +1106,14 @@ class V4PositionManager:
                 'gasPrice': self.w3.eth.gas_price
             })
 
-            print(f"[V4] Sending batch close TX, gas limit: {gas_limit}")
+            logger.debug(f"[V4] Sending batch close TX, gas limit: {gas_limit}")
 
             # Sign and send
             signed = self.account.sign_transaction(tx)
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
             tx_sent = True
 
-            print(f"[V4] TX sent: {tx_hash.hex()}")
+            logger.info(f"[V4] TX sent: {tx_hash.hex()}")
 
             # Wait for receipt
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
@@ -1125,7 +1125,10 @@ class V4PositionManager:
             if self.nonce_manager:
                 self.nonce_manager.confirm_transaction(nonce)
 
-            print(f"[V4] Batch close {'SUCCESS' if success else 'FAILED'}, gas used: {gas_used}")
+            if success:
+                logger.info(f"[V4] Batch close SUCCESS, gas used: {gas_used}")
+            else:
+                logger.error(f"[V4] Batch close FAILED, gas used: {gas_used}")
 
             return tx_hash.hex(), success, gas_used
 
@@ -1170,11 +1173,11 @@ class V4PositionManager:
         for action_list in payloads:
             all_actions.extend(action_list)
 
-        print(f"[V4] modifyLiquidities with {len(payloads)} positions, {len(all_actions)} total actions")
+        logger.info(f"[V4] modifyLiquidities with {len(payloads)} positions, {len(all_actions)} total actions")
 
         # Encode combined actions into unlockData
         unlock_data = self._encode_actions(all_actions)
-        print(f"[V4] unlockData size: {len(unlock_data)} bytes")
+        logger.debug(f"[V4] unlockData size: {len(unlock_data)} bytes")
 
         # Estimate gas if not provided
         if gas_limit is None:
@@ -1186,10 +1189,10 @@ class V4PositionManager:
                     'from': self.account.address
                 })
                 gas_limit = int(estimated * 1.3)
-                print(f"[V4] Estimated gas: {estimated}, using {gas_limit}")
+                logger.debug(f"[V4] Estimated gas: {estimated}, using {gas_limit}")
             except Exception as e:
                 error_msg = str(e)
-                print(f"[V4] ❌ Gas estimation failed: {error_msg}")
+                logger.error(f"[V4] Gas estimation failed: {error_msg}")
                 raise Exception(f"Gas estimation failed (tx would revert): {error_msg}")
 
         # Build transaction using modifyLiquidities
@@ -1214,7 +1217,7 @@ class V4PositionManager:
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
             tx_sent = True
 
-            print(f"[V4] TX sent: {tx_hash.hex()}")
+            logger.info(f"[V4] TX sent: {tx_hash.hex()}")
 
             # Wait for receipt
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
@@ -1229,7 +1232,7 @@ class V4PositionManager:
                     f"Check https://bscscan.com/tx/{tx_hash.hex()} for details."
                 )
 
-            print(f"[V4] TX confirmed, gas used: {receipt.get('gasUsed', 'unknown')}")
+            logger.info(f"[V4] TX confirmed, gas used: {receipt.get('gasUsed', 'unknown')}")
 
             return tx_hash.hex(), []
 
@@ -1268,7 +1271,7 @@ class V4PositionManager:
         if deadline is None:
             deadline = int(time.time()) + 3600
 
-        print(f"[V4] execute_modify_liquidities: unlockData size = {len(unlock_data)} bytes")
+        logger.debug(f"[V4] execute_modify_liquidities: unlockData size = {len(unlock_data)} bytes")
 
         # Estimate gas if not provided
         if gas_limit is None:
@@ -1280,11 +1283,11 @@ class V4PositionManager:
                     'from': self.account.address
                 })
                 gas_limit = int(estimated * 1.3)
-                print(f"[V4] Estimated gas: {estimated}, using {gas_limit}")
+                logger.debug(f"[V4] Estimated gas: {estimated}, using {gas_limit}")
             except Exception as e:
                 # Gas estimation failure means transaction WILL revert
                 error_msg = str(e)
-                print(f"[V4] ❌ Gas estimation failed (tx would revert): {error_msg}")
+                logger.error(f"[V4] Gas estimation failed (tx would revert): {error_msg}")
                 # Don't proceed if gas estimation fails - it means something is wrong
                 raise Exception(f"Gas estimation failed (tx would revert): {error_msg}")
 
@@ -1310,7 +1313,7 @@ class V4PositionManager:
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
             tx_sent = True
 
-            print(f"[V4] TX sent: {tx_hash.hex()}")
+            logger.info(f"[V4] TX sent: {tx_hash.hex()}")
 
             # Wait for receipt
             receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
@@ -1325,7 +1328,7 @@ class V4PositionManager:
                     f"Check https://bscscan.com/tx/{tx_hash.hex()} for details."
                 )
 
-            print(f"[V4] TX confirmed, gas used: {receipt.get('gasUsed', 'unknown')}")
+            logger.info(f"[V4] TX confirmed, gas used: {receipt.get('gasUsed', 'unknown')}")
 
             return tx_hash.hex(), []
 
@@ -1406,42 +1409,42 @@ class V4PositionManager:
         try:
             # Get balance first
             balance = self.contract.functions.balanceOf(address_checksum).call()
-            print(f"[V4] Wallet {address_checksum[:8]}... has {balance} NFTs")
+            logger.debug(f"[V4] Wallet {address_checksum[:8]}... has {balance} NFTs")
 
             if balance == 0:
                 return []
 
             # Try ERC721Enumerable first (faster if supported)
             try:
-                print(f"[V4] Trying tokenOfOwnerByIndex for {balance} NFTs...")
+                logger.debug(f"[V4] Trying tokenOfOwnerByIndex for {balance} NFTs...")
                 for i in range(balance):
                     token_id = self.contract.functions.tokenOfOwnerByIndex(
                         address_checksum, i
                     ).call()
                     token_ids.append(token_id)
                     if i < 5 or i == balance - 1:  # Log first 5 and last
-                        print(f"[V4]   Index {i}: token_id = {token_id}")
-                print(f"[V4] Found {len(token_ids)} positions via ERC721Enumerable")
+                        logger.debug(f"[V4]   Index {i}: token_id = {token_id}")
+                logger.debug(f"[V4] Found {len(token_ids)} positions via ERC721Enumerable")
                 return token_ids
             except Exception as enum_error:
-                print(f"[V4] tokenOfOwnerByIndex FAILED at index {len(token_ids)}: {enum_error}")
-                print(f"[V4] Falling back to Transfer event scanning...")
+                logger.warning(f"[V4] tokenOfOwnerByIndex FAILED at index {len(token_ids)}: {enum_error}")
+                logger.debug(f"[V4] Falling back to Transfer event scanning...")
                 token_ids = []  # Reset in case partial success
 
             # Fallback 1: Try BSCScan API (fast, reliable)
             token_ids = self._get_tokens_via_bscscan(address_checksum)
             if token_ids:
-                print(f"[V4] Found {len(token_ids)} positions via BSCScan API")
+                logger.debug(f"[V4] Found {len(token_ids)} positions via BSCScan API")
                 return token_ids
 
             # Fallback 2: Scan Transfer events (slow, may hit RPC limits)
-            print(f"[V4] BSCScan failed, trying Transfer event scanning...")
+            logger.debug(f"[V4] BSCScan failed, trying Transfer event scanning...")
             token_ids = self._scan_transfer_events(address_checksum, balance)
 
         except Exception as e:
-            print(f"[V4] Error scanning wallet positions: {e}")
+            logger.error(f"[V4] Error scanning wallet positions: {e}")
             import traceback
-            traceback.print_exc()
+            logger.debug(traceback.format_exc())
 
         return token_ids
 
@@ -1475,13 +1478,13 @@ class V4PositionManager:
                 'sort': 'asc'  # Oldest first — so last write per token_id = newest transfer
             }
 
-            print(f"[V4] Querying BSCScan API for NFTs...")
+            logger.debug(f"[V4] Querying BSCScan API for NFTs...")
             response = requests.get(api_url, params=params, timeout=10)
             data = response.json()
 
             if data.get('status') == '1' and data.get('result'):
                 transfers = data['result']
-                print(f"[V4] BSCScan returned {len(transfers)} transfer records")
+                logger.debug(f"[V4] BSCScan returned {len(transfers)} transfer records")
 
                 # Get unique token IDs where we are the current owner
                 # (received but not sent away)
@@ -1503,13 +1506,13 @@ class V4PositionManager:
                     if direction == 'in':
                         token_ids.append(token_id)
 
-                print(f"[V4] Found {len(token_ids)} NFTs currently owned")
+                logger.debug(f"[V4] Found {len(token_ids)} NFTs currently owned")
             else:
                 msg = data.get('message', 'Unknown error')
-                print(f"[V4] BSCScan API returned no results: {msg}")
+                logger.warning(f"[V4] BSCScan API returned no results: {msg}")
 
         except Exception as e:
-            print(f"[V4] BSCScan API error: {e}")
+            logger.warning(f"[V4] BSCScan API error: {e}")
 
         return token_ids
 
@@ -1542,8 +1545,8 @@ class V4PositionManager:
             chunk_size = 1000    # BSC public RPC is very restrictive
             from_block = current_block - total_range
 
-            print(f"[V4] Scanning Transfer events in chunks of {chunk_size} blocks...")
-            print(f"[V4] Total range: {from_block} to {current_block}")
+            logger.debug(f"[V4] Scanning Transfer events in chunks of {chunk_size} blocks...")
+            logger.debug(f"[V4] Total range: {from_block} to {current_block}")
 
             # Get transfers TO this address in chunks
             logs = []
@@ -1562,11 +1565,11 @@ class V4PositionManager:
                     })
                     logs.extend(chunk_logs)
                     if chunk_logs:
-                        print(f"[V4]   Blocks {chunk_start}-{chunk_end}: found {len(chunk_logs)} events")
+                        logger.debug(f"[V4]   Blocks {chunk_start}-{chunk_end}: found {len(chunk_logs)} events")
                 except Exception as chunk_err:
                     # Try even smaller chunks if limit exceeded
                     if 'limit exceeded' in str(chunk_err).lower():
-                        print(f"[V4]   Blocks {chunk_start}-{chunk_end}: limit exceeded, trying smaller chunks...")
+                        logger.debug(f"[V4]   Blocks {chunk_start}-{chunk_end}: limit exceeded, trying smaller chunks...")
                         for mini_start in range(chunk_start, chunk_end, 200):
                             mini_end = min(mini_start + 199, chunk_end)
                             try:
@@ -1582,13 +1585,13 @@ class V4PositionManager:
                                 })
                                 logs.extend(mini_logs)
                                 if mini_logs:
-                                    print(f"[V4]     Mini {mini_start}-{mini_end}: found {len(mini_logs)} events")
+                                    logger.debug(f"[V4]     Mini {mini_start}-{mini_end}: found {len(mini_logs)} events")
                             except Exception as mini_err:
-                                print(f"[V4]     Mini {mini_start}-{mini_end}: ERROR {mini_err}")
+                                logger.warning(f"[V4]     Mini {mini_start}-{mini_end}: ERROR {mini_err}")
                     else:
-                        print(f"[V4]   Blocks {chunk_start}-{chunk_end}: ERROR {chunk_err}")
+                        logger.warning(f"[V4]   Blocks {chunk_start}-{chunk_end}: ERROR {chunk_err}")
 
-            print(f"[V4] Found {len(logs)} Transfer events TO address")
+            logger.debug(f"[V4] Found {len(logs)} Transfer events TO address")
 
             # Extract candidate token IDs
             candidate_ids = set()
@@ -1598,20 +1601,20 @@ class V4PositionManager:
                     if len(log['topics']) >= 4:
                         token_id = int(log['topics'][3].hex(), 16)
                         if idx < 3:
-                            print(f"[V4]   Log {idx}: tokenId from topics[3] = {token_id}")
+                            logger.debug(f"[V4]   Log {idx}: tokenId from topics[3] = {token_id}")
                     else:
                         # tokenId might be in data
                         data_hex = log['data'].hex() if hasattr(log['data'], 'hex') else log['data']
                         token_id = int(data_hex, 16)
                         if idx < 3:
-                            print(f"[V4]   Log {idx}: tokenId from data = {token_id}")
+                            logger.debug(f"[V4]   Log {idx}: tokenId from data = {token_id}")
                     candidate_ids.add(token_id)
                 except Exception as parse_err:
-                    print(f"[V4]   Log {idx}: PARSE ERROR: {parse_err}")
-                    print(f"[V4]     topics: {[t.hex() if hasattr(t, 'hex') else t for t in log['topics']]}")
-                    print(f"[V4]     data: {log['data']}")
+                    logger.warning(f"[V4]   Log {idx}: PARSE ERROR: {parse_err}")
+                    logger.debug(f"[V4]     topics: {[t.hex() if hasattr(t, 'hex') else t for t in log['topics']]}")
+                    logger.debug(f"[V4]     data: {log['data']}")
 
-            print(f"[V4] Found {len(candidate_ids)} candidate token IDs")
+            logger.debug(f"[V4] Found {len(candidate_ids)} candidate token IDs")
 
             # Verify current ownership for each candidate
             for token_id in candidate_ids:
@@ -1623,17 +1626,17 @@ class V4PositionManager:
                     # Token was burned or transferred away
                     pass
 
-            print(f"[V4] Verified {len(token_ids)} tokens still owned (expected {expected_count})")
+            logger.debug(f"[V4] Verified {len(token_ids)} tokens still owned (expected {expected_count})")
 
             # If we didn't find all expected tokens, try extending the block range
             if len(token_ids) < expected_count:
-                print(f"[V4] Warning: Found only {len(token_ids)} of {expected_count} expected tokens")
-                print(f"[V4] Some tokens may have been minted before block {from_block}")
+                logger.warning(f"[V4] Warning: Found only {len(token_ids)} of {expected_count} expected tokens")
+                logger.warning(f"[V4] Some tokens may have been minted before block {from_block}")
 
         except Exception as e:
-            print(f"[V4] Error scanning Transfer events: {e}")
+            logger.error(f"[V4] Error scanning Transfer events: {e}")
             import traceback
-            traceback.print_exc()
+            logger.debug(traceback.format_exc())
 
         return token_ids
 
@@ -1669,6 +1672,6 @@ class V4PositionManager:
                 }
                 positions.append(position_dict)
             except Exception as e:
-                print(f"[V4] Error getting position {token_id}: {e}")
+                logger.error(f"[V4] Error getting position {token_id}: {e}")
 
         return positions

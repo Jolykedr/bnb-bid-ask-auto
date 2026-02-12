@@ -4,6 +4,7 @@ Uniswap V3 Position Manager Integration
 Работа с NonfungiblePositionManager для создания и управления позициями.
 """
 
+import logging
 from dataclasses import dataclass
 from typing import List, Optional
 from web3 import Web3
@@ -14,6 +15,8 @@ import time
 from .abis import POSITION_MANAGER_ABI, ERC20_ABI, ERC721_ENUMERABLE_ABI
 from ..math.distribution import BidAskPosition
 from ..utils import NonceManager
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -480,7 +483,7 @@ class UniswapV3PositionManager:
 
             # Получаем количество NFT
             balance = erc721_contract.functions.balanceOf(address_checksum).call()
-            print(f"[V3] Wallet {address_checksum[:8]}... has {balance} NFTs")
+            logger.info(f"[V3] Wallet {address_checksum[:8]}... has {balance} NFTs")
 
             if balance == 0:
                 return []
@@ -492,19 +495,17 @@ class UniswapV3PositionManager:
                         address_checksum, i
                     ).call()
                     token_ids.append(token_id)
-                print(f"[V3] Found {len(token_ids)} positions via ERC721Enumerable")
+                logger.info(f"[V3] Found {len(token_ids)} positions via ERC721Enumerable")
                 return token_ids
             except Exception as enum_error:
-                print(f"[V3] tokenOfOwnerByIndex not supported: {enum_error}")
-                print(f"[V3] Falling back to Transfer event scanning...")
+                logger.warning(f"[V3] tokenOfOwnerByIndex not supported: {enum_error}")
+                logger.info(f"[V3] Falling back to Transfer event scanning...")
 
             # Fallback: Scan Transfer events
             token_ids = self._scan_transfer_events(address_checksum, balance)
 
         except Exception as e:
-            print(f"[V3] Error scanning wallet positions: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"[V3] Error scanning wallet positions: {e}", exc_info=True)
 
         return token_ids
 
@@ -534,7 +535,7 @@ class UniswapV3PositionManager:
             current_block = self.w3.eth.block_number
             from_block = max(0, current_block - 100000)
 
-            print(f"[V3] Scanning Transfer events from block {from_block} to {current_block}...")
+            logger.debug(f"[V3] Scanning Transfer events from block {from_block} to {current_block}...")
 
             logs = self.w3.eth.get_logs({
                 'address': self.position_manager_address,
@@ -547,7 +548,7 @@ class UniswapV3PositionManager:
                 'toBlock': 'latest'
             })
 
-            print(f"[V3] Found {len(logs)} Transfer events TO address")
+            logger.debug(f"[V3] Found {len(logs)} Transfer events TO address")
 
             # Extract candidate token IDs
             candidate_ids = set()
@@ -558,7 +559,7 @@ class UniswapV3PositionManager:
                     token_id = int(log['data'].hex(), 16)
                 candidate_ids.add(token_id)
 
-            print(f"[V3] Found {len(candidate_ids)} candidate token IDs")
+            logger.debug(f"[V3] Found {len(candidate_ids)} candidate token IDs")
 
             # Verify current ownership
             erc721_contract = self.w3.eth.contract(
@@ -574,12 +575,10 @@ class UniswapV3PositionManager:
                 except Exception:
                     pass
 
-            print(f"[V3] Verified {len(token_ids)} tokens still owned (expected {expected_count})")
+            logger.info(f"[V3] Verified {len(token_ids)} tokens still owned (expected {expected_count})")
 
         except Exception as e:
-            print(f"[V3] Error scanning Transfer events: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"[V3] Error scanning Transfer events: {e}", exc_info=True)
 
         return token_ids
 
@@ -602,6 +601,6 @@ class UniswapV3PositionManager:
                 position_data['token_id'] = token_id
                 positions.append(position_data)
             except Exception as e:
-                print(f"Error getting position {token_id}: {e}")
+                logger.error(f"Error getting position {token_id}: {e}")
 
         return positions

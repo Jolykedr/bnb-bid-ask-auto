@@ -300,6 +300,17 @@ def get_chain_config(chain_id: int) -> ChainConfig:
     return configs[chain_id]
 
 
+def get_tokens_for_chain(chain_id: int) -> Dict[str, TokenConfig]:
+    """Получение словаря токенов для сети."""
+    tokens_map = {
+        56: TOKENS_BNB,
+        97: TOKENS_BNB,
+        1: TOKENS_BNB,   # Ethereum — используем BNB tokens пока нет TOKENS_ETH
+        8453: TOKENS_BASE,
+    }
+    return tokens_map.get(chain_id, TOKENS_BNB)
+
+
 def get_token(symbol: str, chain_id: int = 56) -> TokenConfig:
     """Получение токена по символу."""
     if chain_id == 56:
@@ -365,4 +376,4 @@ def get_v3_dex_config(dex_name: str, chain_id: int = 56) -> V3DexConfig:
     elif "pancake" in dex_name_lower:
         return V3_DEXES[chain_id].get("pancakeswap")
 
-    raise ValueError(f"Unknown DEX: {dex_name} for chain_id: {chain_id}")
+    raise ValueError(f"Unknown DEX name: {dex_name}")

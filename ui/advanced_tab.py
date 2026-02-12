@@ -18,8 +18,13 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import logging
+
 from src.contracts.pool_factory import PoolFactory, TokenInfo, PoolInfo
 from src.contracts.v4 import V4Protocol
+from config import get_tokens_for_chain, is_stablecoin, get_chain_config
+
+logger = logging.getLogger(__name__)
 
 
 class LoadTokenWorker(QThread):
@@ -136,8 +141,7 @@ class CreateV4PoolWorker(QThread):
                 })
 
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            logger.exception(f"Error in LoadPoolWorker: {e}")
             self.finished.emit(False, str(e), {})
 
 
@@ -162,6 +166,7 @@ class AdvancedTab(QWidget):
         self.v4_provider = None  # V4LiquidityProvider for V4 pool operations
         self.custom_tokens = {}  # address -> TokenInfo
         self.worker = None
+        self.chain_id = 56  # Default BNB, updated by set_provider()
         self.settings = QSettings("BNBLiquidityLadder", "CustomTokens")
         self.setup_ui()
         self.load_saved_tokens()
@@ -682,8 +687,6 @@ class AdvancedTab(QWidget):
         Returns:
             True if inversion is needed, False otherwise
         """
-        from config import is_stablecoin
-
         token0_lower = token0.lower()
         token1_lower = token1.lower()
 
@@ -743,8 +746,7 @@ class AdvancedTab(QWidget):
             if address.lower() in self.custom_tokens:
                 decimals_spin.setValue(self.custom_tokens[address.lower()].decimals)
             else:
-                from config import TOKENS_BNB
-                for symbol, token in TOKENS_BNB.items():
+                for symbol, token in get_tokens_for_chain(self.chain_id).items():
                     if token.address.lower() == address.lower():
                         decimals_spin.setValue(token.decimals)
                         break
@@ -871,8 +873,7 @@ class AdvancedTab(QWidget):
             combo.addItem("Custom address")
 
             # Add standard tokens
-            from config import TOKENS_BNB
-            for symbol, token in TOKENS_BNB.items():
+            for symbol, token in get_tokens_for_chain(self.chain_id).items():
                 combo.addItem(f"{symbol} ({token.address[:8]}...)", token.address)
 
             # Add custom tokens
@@ -892,8 +893,8 @@ class AdvancedTab(QWidget):
 
     def set_provider(self, provider):
         """Set provider and create factory from it."""
-        from config import get_chain_config
         chain_id = getattr(provider, 'chain_id', 56)
+        self.chain_id = chain_id
         chain_config = get_chain_config(chain_id)
         self.factory = PoolFactory(
             provider.w3,
@@ -1078,8 +1079,7 @@ class AdvancedTab(QWidget):
             combo.addItem("Custom address")
 
             # Add standard tokens
-            from config import TOKENS_BNB
-            for symbol, token in TOKENS_BNB.items():
+            for symbol, token in get_tokens_for_chain(self.chain_id).items():
                 combo.addItem(f"{symbol} ({token.address[:8]}...)", token.address)
 
             # Add custom tokens
@@ -1123,8 +1123,7 @@ class AdvancedTab(QWidget):
             if address.lower() in self.custom_tokens:
                 decimals_spin.setValue(self.custom_tokens[address.lower()].decimals)
             else:
-                from config import TOKENS_BNB
-                for symbol, token in TOKENS_BNB.items():
+                for symbol, token in get_tokens_for_chain(self.chain_id).items():
                     if token.address.lower() == address.lower():
                         decimals_spin.setValue(token.decimals)
                         break

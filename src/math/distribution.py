@@ -15,11 +15,14 @@ Bid-Ask Distribution Module
 Чем ниже цена - тем больше покупаем.
 """
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import List, Literal
 from .ticks import price_to_tick, tick_to_price, align_tick_to_spacing, get_tick_spacing
 from .liquidity import calculate_liquidity_from_usd
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -525,20 +528,20 @@ def print_distribution(positions: List[BidAskPosition], current_price: float = N
         positions: Список позиций
         current_price: Текущая цена (для расчёта % от текущей)
     """
-    print("\n" + "=" * 75)
-    print("BID-ASK LADDER DISTRIBUTION")
-    print("=" * 75)
+    logger.info("\n" + "=" * 75)
+    logger.info("BID-ASK LADDER DISTRIBUTION")
+    logger.info("=" * 75)
 
     total_usd = sum(p.usd_amount for p in positions)
 
     # Заголовок таблицы
     if current_price:
-        print(f"\nCurrent price: ${current_price:,.2f}")
-        print(f"\n{'#':<3} {'Price Range':<25} {'% from current':<18} {'Amount':<15} {'Share'}")
-        print("-" * 75)
+        logger.info(f"\nCurrent price: ${current_price:,.2f}")
+        logger.info(f"\n{'#':<3} {'Price Range':<25} {'% from current':<18} {'Amount':<15} {'Share'}")
+        logger.info("-" * 75)
     else:
-        print(f"\n{'#':<3} {'Price Range':<25} {'Width %':<12} {'Amount':<15} {'Share'}")
-        print("-" * 75)
+        logger.info(f"\n{'#':<3} {'Price Range':<25} {'Width %':<12} {'Amount':<15} {'Share'}")
+        logger.info("-" * 75)
 
     for pos in positions:
         width_pct = (pos.price_upper - pos.price_lower) / pos.price_upper * 100
@@ -549,30 +552,30 @@ def print_distribution(positions: List[BidAskPosition], current_price: float = N
             pct_upper = (pos.price_upper / current_price - 1) * 100
             pct_lower = (pos.price_lower / current_price - 1) * 100
             pct_str = f"{pct_lower:+.1f}% to {pct_upper:+.1f}%"
-            print(f"{pos.index + 1:<3} ${pos.price_lower:>8.2f} - ${pos.price_upper:<8.2f}  {pct_str:<18} ${pos.usd_amount:>8,.0f}       {pos.percentage:>5.1f}% {bar}")
+            logger.info(f"{pos.index + 1:<3} ${pos.price_lower:>8.2f} - ${pos.price_upper:<8.2f}  {pct_str:<18} ${pos.usd_amount:>8,.0f}       {pos.percentage:>5.1f}% {bar}")
         else:
-            print(f"{pos.index + 1:<3} ${pos.price_lower:>8.2f} - ${pos.price_upper:<8.2f}  {width_pct:>5.2f}%      ${pos.usd_amount:>8,.0f}       {pos.percentage:>5.1f}% {bar}")
+            logger.info(f"{pos.index + 1:<3} ${pos.price_lower:>8.2f} - ${pos.price_upper:<8.2f}  {width_pct:>5.2f}%      ${pos.usd_amount:>8,.0f}       {pos.percentage:>5.1f}% {bar}")
 
-    print("-" * 75)
-    print(f"TOTAL: ${total_usd:,.2f} across {len(positions)} positions")
+    logger.info("-" * 75)
+    logger.info(f"TOTAL: ${total_usd:,.2f} across {len(positions)} positions")
 
     if positions:
         coverage = f"${positions[-1].price_lower:.2f} - ${positions[0].price_upper:.2f}"
         if current_price:
             pct_coverage_lower = (positions[-1].price_lower / current_price - 1) * 100
             pct_coverage_upper = (positions[0].price_upper / current_price - 1) * 100
-            print(f"Coverage: {coverage} ({pct_coverage_lower:+.1f}% to {pct_coverage_upper:+.1f}%)")
+            logger.info(f"Coverage: {coverage} ({pct_coverage_lower:+.1f}% to {pct_coverage_upper:+.1f}%)")
         else:
-            print(f"Coverage: {coverage}")
+            logger.info(f"Coverage: {coverage}")
 
-    print("=" * 75)
+    logger.info("=" * 75)
 
 
 # Быстрый пример использования
 if __name__ == "__main__":
     current = 600.0
 
-    print("\n>>> Example: BNB $600, range -5% to -40%, 7 positions")
+    logger.info("\n>>> Example: BNB $600, range -5% to -40%, 7 positions")
     positions = calculate_bid_ask_from_percent(
         current_price=current,
         percent_from=-5,

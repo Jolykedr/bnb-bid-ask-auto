@@ -4,6 +4,7 @@ V4 PoolManager Wrapper
 Handles pool initialization and state queries for V4.
 """
 
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
@@ -12,6 +13,8 @@ from eth_abi import encode, decode
 
 from .abis import V4_POOL_MANAGER_ABI, V4_STATE_VIEW_ABI
 from .constants import V4Protocol, get_v4_addresses, suggest_tick_spacing
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -203,7 +206,7 @@ class V4PoolManager:
                 initialized=sqrt_price_x96 > 0
             )
         except Exception as e:
-            print(f"[V4 PoolManager] getSlot0 failed: {e}")
+            logger.error(f"[V4 PoolManager] getSlot0 failed: {e}")
             return V4PoolState(
                 pool_id=pool_id,
                 sqrt_price_x96=0,
@@ -338,17 +341,17 @@ class V4PoolManager:
         try:
             # Use StateView if available (Uniswap V4)
             if self.state_view_contract:
-                print(f"[V4] Using StateView at {self.state_view_address}")
-                print(f"[V4] Pool ID: 0x{pool_id.hex()}")
+                logger.debug(f"[V4] Using StateView at {self.state_view_address}")
+                logger.debug(f"[V4] Pool ID: 0x{pool_id.hex()}")
                 # StateView already knows PoolManager address (via ImmutableState)
                 # so we only pass poolId
                 slot0 = self.state_view_contract.functions.getSlot0(pool_id).call()
-                print(f"[V4] slot0 result: {slot0}")
+                logger.debug(f"[V4] slot0 result: {slot0}")
                 liquidity = self.state_view_contract.functions.getLiquidity(pool_id).call()
-                print(f"[V4] liquidity: {liquidity}")
+                logger.debug(f"[V4] liquidity: {liquidity}")
             else:
                 # Direct query to PoolManager (PancakeSwap V4)
-                print(f"[V4] Direct query to PoolManager: {self.pool_manager_address}")
+                logger.debug(f"[V4] Direct query to PoolManager: {self.pool_manager_address}")
                 slot0 = self.contract.functions.getSlot0(pool_id).call()
                 liquidity = self.contract.functions.getLiquidity(pool_id).call()
 
@@ -367,9 +370,7 @@ class V4PoolManager:
                 initialized=sqrt_price_x96 > 0
             )
         except Exception as e:
-            print(f"[V4] ERROR querying pool state: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"[V4] ERROR querying pool state: {e}", exc_info=True)
             return V4PoolState(
                 pool_id=pool_id,
                 sqrt_price_x96=0,

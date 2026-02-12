@@ -19,11 +19,109 @@ from PyQt6.QtGui import QFont, QColor, QPainter, QBrush, QPen, QLinearGradient, 
 import sys
 import os
 import json
+import time
+import logging
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from web3 import Web3
+from config import V3_DEXES, is_stablecoin, STABLECOINS
 from src.math.ticks import tick_to_price
 from src.math.liquidity import calculate_amounts
+from src.contracts.position_manager import UniswapV3PositionManager
+from src.contracts.pool_factory import PoolFactory
+from src.contracts.v4 import V4PositionManager, V4Protocol
+from src.contracts.v4.constants import get_v4_addresses, UNISWAP_V4_ADDRESSES, PANCAKESWAP_V4_ADDRESSES
+from src.contracts.v4.pool_manager import V4PoolManager
+from src.liquidity_provider import LiquidityProvider
+from src.dex_swap import DexSwap, STABLE_TOKENS
+
+logger = logging.getLogger(__name__)
+
+
+def _resolve_v4_protocol(protocol_str: str) -> V4Protocol:
+    """Convert protocol string to V4Protocol enum."""
+    if protocol_str == "v4_pancake":
+        return V4Protocol.PANCAKESWAP
+    return V4Protocol.UNISWAP
+
+
+def _create_v4_position_manager(w3, account, protocol_str: str, chain_id: int = 56) -> V4PositionManager:
+    """Create V4PositionManager for the given protocol."""
+    target_protocol = _resolve_v4_protocol(protocol_str)
+    return V4PositionManager(
+        w3,
+        account=account,
+        protocol=target_protocol,
+        chain_id=chain_id
+    )
+
+
+def _load_v4_position_to_dict(
+    w3, account, token_id: int, protocol_str: str, chain_id: int = 56,
+    v4_pm: V4PositionManager = None
+) -> dict:
+    """
+    Load a V4 position and return a dict with all fields.
+
+    Creates V4PositionManager if not provided.
+    Gets pool state, token decimals, current price.
+    """
+    target_protocol = _resolve_v4_protocol(protocol_str)
+
+    if v4_pm is None:
+        v4_pm = _create_v4_position_manager(w3, account, protocol_str, chain_id)
+
+    v4_pos = v4_pm.get_position(token_id)
+
+    position = {
+        'token_id': token_id,
+        'token0': v4_pos.pool_key.currency0,
+        'token1': v4_pos.pool_key.currency1,
+        'fee': v4_pos.pool_key.fee,
+        'tick_spacing': v4_pos.pool_key.tick_spacing,
+        'tick_lower': v4_pos.tick_lower,
+        'tick_upper': v4_pos.tick_upper,
+        'liquidity': v4_pos.liquidity,
+        'tokens_owed0': 0,
+        'tokens_owed1': 0,
+        'protocol': protocol_str,
+    }
+
+    # Get pool state and token info
+    try:
+        pool_mgr = V4PoolManager(w3, protocol=target_protocol, chain_id=chain_id)
+        pool_state = pool_mgr.get_pool_state(v4_pos.pool_key)
+        if pool_state.initialized:
+            position['current_tick'] = pool_state.tick
+            for addr_field, dec_key, sym_key in [
+                (v4_pos.pool_key.currency0, 'token0_decimals', 'token0_symbol'),
+                (v4_pos.pool_key.currency1, 'token1_decimals', 'token1_symbol'),
+            ]:
+                if addr_field and addr_field != "0x0000000000000000000000000000000000000000":
+                    try:
+                        tc = w3.eth.contract(
+                            address=Web3.to_checksum_address(addr_field),
+                            abi=[
+                                {"constant": True, "inputs": [], "name": "decimals",
+                                 "outputs": [{"name": "", "type": "uint8"}], "type": "function"},
+                                {"constant": True, "inputs": [], "name": "symbol",
+                                 "outputs": [{"name": "", "type": "string"}], "type": "function"},
+                            ]
+                        )
+                        position[dec_key] = tc.functions.decimals().call()
+                        position[sym_key] = tc.functions.symbol().call()
+                    except Exception:
+                        position[dec_key] = 18
+
+            dec0 = position.get('token0_decimals', 18)
+            dec1 = position.get('token1_decimals', 18)
+            position['current_price'] = pool_mgr.sqrt_price_x96_to_price(
+                pool_state.sqrt_price_x96, dec0, dec1
+            )
+    except Exception as e:
+        logger.debug(f"Could not get V4 pool state for token {token_id}: {e}")
+
+    return position
 
 
 class NumericTableWidgetItem(QTableWidgetItem):
@@ -263,19 +361,17 @@ class LoadPositionWorker(QThread):
             if self.protocol == "v3_uniswap":
                 # Use Uniswap V3 position manager
                 try:
-                    from config import V3_DEXES
                     chain_id = getattr(self.provider, 'chain_id', 56)
                     if chain_id in V3_DEXES and "uniswap" in V3_DEXES[chain_id]:
                         uniswap_config = V3_DEXES[chain_id]["uniswap"]
-                        from src.contracts.position_manager import PositionManager
-                        position_manager = PositionManager(
+                        position_manager = UniswapV3PositionManager(
                             self.provider.w3,
                             uniswap_config.position_manager,
                             self.provider.account
                         )
-                        print(f"[V3 Load] Using Uniswap V3 Position Manager: {uniswap_config.position_manager}")
+                        logger.debug(f"[V3 Load] Using Uniswap V3 Position Manager: {uniswap_config.position_manager}")
                 except Exception as pm_err:
-                    print(f"[V3 Load] Error creating Uniswap V3 position manager: {pm_err}")
+                    logger.warning(f"[V3 Load] Error creating Uniswap V3 position manager: {pm_err}")
                     # Fall back to provider's position manager
 
             # First check if position exists and is owned by current wallet
@@ -297,8 +393,6 @@ class LoadPositionWorker(QThread):
             current_price = None
             if self.pool_factory and position['liquidity'] > 0:
                 try:
-                    from src.contracts.pool_factory import PoolFactory
-
                     # Get pool address for this position
                     pool_addr = self.pool_factory.get_pool_address(
                         position['token0'],
@@ -323,7 +417,7 @@ class LoadPositionWorker(QThread):
                         position['token0_decimals'] = token0_info.decimals
                         position['token1_decimals'] = token1_info.decimals
                 except Exception as e:
-                    print(f"Error fetching pool info: {e}")
+                    logger.warning(f"Error fetching pool info: {e}")
 
             self.position_loaded.emit(self.token_id, position)
 
@@ -331,11 +425,8 @@ class LoadPositionWorker(QThread):
             self.error.emit(self.token_id, str(e))
 
     def _load_v4_position(self):
-        """Load a V4 position."""
+        """Load a V4 position using shared helper."""
         try:
-            print(f"[V4 Load] Loading position {self.token_id} with protocol={self.protocol}")
-
-            # Validate provider
             if not self.provider:
                 self.error.emit(self.token_id, "No provider available")
                 return
@@ -344,49 +435,16 @@ class LoadPositionWorker(QThread):
                 self.error.emit(self.token_id, "Provider has no Web3 connection")
                 return
 
-            from src.contracts.v4 import V4PositionManager, V4Protocol
-
-            # Determine which V4 protocol to use based on self.protocol
-            if self.protocol == "v4_pancake":
-                target_protocol = V4Protocol.PANCAKESWAP
-                print(f"[V4 Load] Target protocol: PancakeSwap V4")
-            else:
-                target_protocol = V4Protocol.UNISWAP
-                print(f"[V4 Load] Target protocol: Uniswap V4")
-
-            # Check if provider's position_manager matches the target protocol
-            provider_protocol = getattr(self.provider, 'protocol', None)
-            print(f"[V4 Load] Provider protocol: {provider_protocol}")
-
-            if (hasattr(self.provider, 'position_manager') and
-                hasattr(self.provider.position_manager, 'get_position') and
-                provider_protocol == target_protocol):
-                v4_pm = self.provider.position_manager
-                print(f"[V4 Load] Using provider's existing position_manager")
-            else:
-                # Create V4PositionManager for the correct protocol
-                chain_id = getattr(self.provider, 'chain_id', 56)
-                print(f"[V4 Load] Creating new V4PositionManager for chain {chain_id}")
-
-                v4_pm = V4PositionManager(
-                    self.provider.w3,
-                    account=self.provider.account,
-                    protocol=target_protocol,
-                    chain_id=chain_id
-                )
-
-            # Log which Position Manager we're using
-            pm_addr = getattr(v4_pm, 'position_manager_address', 'unknown')
-            print(f"[V4 Load] Using Position Manager: {pm_addr}")
-            print(f"[V4 Load] Protocol: {target_protocol}")
+            chain_id = getattr(self.provider, 'chain_id', 56)
+            v4_pm = _create_v4_position_manager(
+                self.provider.w3, self.provider.account, self.protocol, chain_id
+            )
 
             # Check ownership
             if self.check_ownership:
-                print(f"[V4 Load] Checking ownership for token {self.token_id}")
                 try:
                     owner = v4_pm.get_owner_of(self.token_id)
                 except Exception as owner_err:
-                    print(f"[V4 Load] get_owner_of failed: {owner_err}")
                     self.error.emit(self.token_id, f"Failed to check ownership: {str(owner_err)}")
                     return
 
@@ -403,91 +461,16 @@ class LoadPositionWorker(QThread):
                     self.not_owned.emit(self.token_id, owner)
                     return
 
-            # Get position info
-            print(f"[V4 Load] Getting position info for token {self.token_id}")
-            try:
-                v4_pos = v4_pm.get_position(self.token_id)
-            except Exception as pos_err:
-                print(f"[V4 Load] get_position failed: {pos_err}")
-                import traceback
-                traceback.print_exc()
-                self.error.emit(self.token_id, f"Failed to get position info: {str(pos_err)}")
-                return
+            # Load position data using helper
+            position = _load_v4_position_to_dict(
+                self.provider.w3, self.provider.account,
+                self.token_id, self.protocol, chain_id, v4_pm
+            )
 
-            print(f"[V4 Load] Position loaded: {v4_pos.pool_key.currency0[:10]}.../{v4_pos.pool_key.currency1[:10]}...")
-
-            # Convert to dict format
-            position = {
-                'token_id': self.token_id,
-                'token0': v4_pos.pool_key.currency0,
-                'token1': v4_pos.pool_key.currency1,
-                'fee': v4_pos.pool_key.fee,
-                'tick_spacing': v4_pos.pool_key.tick_spacing,
-                'tick_lower': v4_pos.tick_lower,
-                'tick_upper': v4_pos.tick_upper,
-                'liquidity': v4_pos.liquidity,
-                'tokens_owed0': 0,
-                'tokens_owed1': 0,
-                'protocol': self.protocol  # v4 or v4_pancake
-            }
-
-            # Get current pool state (price, tick) and token info for V4
-            try:
-                from src.contracts.v4.pool_manager import V4PoolManager
-
-                # Create V4PoolManager directly — provider may be V3 and lack pool_manager
-                chain_id = getattr(self.provider, 'chain_id', 56)
-                pool_mgr = V4PoolManager(
-                    self.provider.w3,
-                    protocol=target_protocol,
-                    chain_id=chain_id
-                )
-
-                pool_state = pool_mgr.get_pool_state(v4_pos.pool_key)
-                if pool_state.initialized:
-                    position['current_tick'] = pool_state.tick
-
-                    # Get token decimals
-                    for addr_field, dec_key, sym_key in [
-                        (v4_pos.pool_key.currency0, 'token0_decimals', 'token0_symbol'),
-                        (v4_pos.pool_key.currency1, 'token1_decimals', 'token1_symbol'),
-                    ]:
-                        if addr_field and addr_field != "0x0000000000000000000000000000000000000000":
-                            try:
-                                token_contract = self.provider.w3.eth.contract(
-                                    address=Web3.to_checksum_address(addr_field),
-                                    abi=[
-                                        {"constant":True,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"},
-                                        {"constant":True,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"type":"function"},
-                                    ]
-                                )
-                                position[dec_key] = token_contract.functions.decimals().call()
-                                position[sym_key] = token_contract.functions.symbol().call()
-                            except Exception:
-                                position[dec_key] = 18
-
-                    dec0 = position.get('token0_decimals', 18)
-                    dec1 = position.get('token1_decimals', 18)
-                    current_price = pool_mgr.sqrt_price_x96_to_price(
-                        pool_state.sqrt_price_x96, dec0, dec1
-                    )
-                    position['current_price'] = current_price
-                    print(f"[V4 Load] Pool state: tick={pool_state.tick}, price={current_price:.10f}")
-                else:
-                    print(f"[V4 Load] Pool not initialized for this pool key")
-            except Exception as e:
-                import traceback
-                print(f"[V4 Load] Could not get pool state: {e}")
-                traceback.print_exc()
-
-            print(f"[V4 Load] Emitting position_loaded signal")
             self.position_loaded.emit(self.token_id, position)
-            print(f"[V4 Load] Done loading position {self.token_id}")
 
         except Exception as e:
-            import traceback
-            print(f"[V4 Load] EXCEPTION: {e}")
-            traceback.print_exc()
+            logger.error(f"[V4 Load] Failed to load position {self.token_id}: {e}", exc_info=True)
             self.error.emit(self.token_id, f"V4 Error: {str(e)}")
 
 
@@ -506,57 +489,27 @@ class ScanWalletWorker(QThread):
 
     def run(self):
         try:
-            from src.contracts.v4 import V4PositionManager, V4Protocol
-
             # Determine protocol type
             is_v4 = self.protocol in ("v4", "v4_pancake")
 
             if self.protocol == "v4_pancake":
                 protocol_name = "PancakeSwap V4"
-                target_protocol = V4Protocol.PANCAKESWAP
             elif self.protocol == "v4":
                 protocol_name = "Uniswap V4"
-                target_protocol = V4Protocol.UNISWAP
             else:
                 protocol_name = "PancakeSwap V3"
-                target_protocol = None
 
             self.progress.emit(f"Scanning wallet for {protocol_name} positions...")
             address = self.provider.account.address
+            chain_id = getattr(self.provider, 'chain_id', 56)
 
             if is_v4:
-                # Check if provider's position_manager matches target protocol
-                provider_protocol = getattr(self.provider, 'protocol', None)
-                if (hasattr(self.provider, 'position_manager') and
-                    hasattr(self.provider.position_manager, 'get_position_token_ids') and
-                    provider_protocol == target_protocol):
-                    v4_pm = self.provider.position_manager
-                    self.progress.emit(f"Using provider's V4 Position Manager")
-                else:
-                    # Create V4PositionManager for the correct protocol
-                    chain_id = getattr(self.provider, 'chain_id', 56)
+                v4_pm = _create_v4_position_manager(
+                    self.provider.w3, self.provider.account, self.protocol, chain_id
+                )
 
-                    v4_pm = V4PositionManager(
-                        self.provider.w3,
-                        account=self.provider.account,
-                        protocol=target_protocol,
-                        chain_id=chain_id
-                    )
-
-                # Log Position Manager address for debugging
                 pm_addr = getattr(v4_pm, 'position_manager_address', 'unknown')
                 self.progress.emit(f"V4 Position Manager: {pm_addr}")
-                self.progress.emit(f"Wallet address: {address}")
-                self.progress.emit(f"Scanning for {protocol_name} positions...")
-
-                # Check balance first
-                try:
-                    balance = v4_pm.contract.functions.balanceOf(
-                        Web3.to_checksum_address(address)
-                    ).call()
-                    self.progress.emit(f"balanceOf() returned: {balance} NFTs")
-                except Exception as bal_err:
-                    self.progress.emit(f"balanceOf() FAILED: {bal_err}")
 
                 token_ids = v4_pm.get_position_token_ids(address)
                 self.progress.emit(f"Found {len(token_ids)} V4 positions")
@@ -564,82 +517,10 @@ class ScanWalletWorker(QThread):
                 for i, token_id in enumerate(token_ids):
                     self.progress.emit(f"Loading V4 position {i+1}/{len(token_ids)} (ID: {token_id})...")
                     try:
-                        v4_pos = v4_pm.get_position(token_id)
-
-                        # Try to get token symbols from ERC20 contracts
-                        token0_symbol = v4_pos.pool_key.currency0[:6]
-                        token1_symbol = v4_pos.pool_key.currency1[:6]
-
-                        if v4_pos.pool_key.currency0 != "0x0000000000000000000000000000000000000000":
-                            try:
-                                from src.contracts.abis import ERC20_ABI
-                                token0_contract = self.provider.w3.eth.contract(
-                                    address=Web3.to_checksum_address(v4_pos.pool_key.currency0),
-                                    abi=ERC20_ABI + [{"inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}], "stateMutability": "view", "type": "function"}]
-                                )
-                                token0_symbol = token0_contract.functions.symbol().call()
-                            except Exception:
-                                pass
-                            try:
-                                token1_contract = self.provider.w3.eth.contract(
-                                    address=Web3.to_checksum_address(v4_pos.pool_key.currency1),
-                                    abi=ERC20_ABI + [{"inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}], "stateMutability": "view", "type": "function"}]
-                                )
-                                token1_symbol = token1_contract.functions.symbol().call()
-                            except Exception:
-                                pass
-
-                        # Convert V4Position to dict format compatible with table
-                        position = {
-                            'token_id': token_id,
-                            'token0': v4_pos.pool_key.currency0,
-                            'token1': v4_pos.pool_key.currency1,
-                            'token0_symbol': token0_symbol,
-                            'token1_symbol': token1_symbol,
-                            'fee': v4_pos.pool_key.fee,
-                            'tick_spacing': v4_pos.pool_key.tick_spacing,
-                            'tick_lower': v4_pos.tick_lower,
-                            'tick_upper': v4_pos.tick_upper,
-                            'liquidity': v4_pos.liquidity,
-                            'tokens_owed0': 0,
-                            'tokens_owed1': 0,
-                            'protocol': self.protocol  # v4_uniswap or v4_pancake
-                        }
-
-                        # Load pool state (current tick/price) and token decimals
-                        try:
-                            from src.contracts.v4.pool_manager import V4PoolManager
-                            chain_id = getattr(self.provider, 'chain_id', 56)
-                            pool_mgr = V4PoolManager(
-                                self.provider.w3,
-                                protocol=target_protocol,
-                                chain_id=chain_id
-                            )
-                            pool_state = pool_mgr.get_pool_state(v4_pos.pool_key)
-                            if pool_state.initialized:
-                                position['current_tick'] = pool_state.tick
-                                # Get token decimals
-                                for addr_field, dec_key in [
-                                    (v4_pos.pool_key.currency0, 'token0_decimals'),
-                                    (v4_pos.pool_key.currency1, 'token1_decimals'),
-                                ]:
-                                    if addr_field and addr_field != "0x0000000000000000000000000000000000000000":
-                                        try:
-                                            tc = self.provider.w3.eth.contract(
-                                                address=Web3.to_checksum_address(addr_field),
-                                                abi=[{"constant":True,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"type":"function"}]
-                                            )
-                                            position[dec_key] = tc.functions.decimals().call()
-                                        except Exception:
-                                            position[dec_key] = 18
-                                dec0 = position.get('token0_decimals', 18)
-                                dec1 = position.get('token1_decimals', 18)
-                                position['current_price'] = pool_mgr.sqrt_price_x96_to_price(
-                                    pool_state.sqrt_price_x96, dec0, dec1
-                                )
-                        except Exception as pool_err:
-                            self.progress.emit(f"Could not get pool state for {token_id}: {pool_err}")
-
+                        position = _load_v4_position_to_dict(
+                            self.provider.w3, self.provider.account,
+                            token_id, self.protocol, chain_id, v4_pm
+                        )
                         self.position_found.emit(token_id, position)
                     except Exception as e:
                         self.progress.emit(f"Error loading V4 position {token_id}: {e}")
@@ -651,8 +532,6 @@ class ScanWalletWorker(QThread):
                 # Check if we need a different position manager for Uniswap V3
                 if self.protocol == "v3_uniswap":
                     try:
-                        from config import V3_DEXES
-                        from src.contracts.position_manager import UniswapV3PositionManager
                         chain_id = getattr(self.provider, 'chain_id', 56)
                         if chain_id in V3_DEXES and "uniswap" in V3_DEXES[chain_id]:
                             uniswap_config = V3_DEXES[chain_id]["uniswap"]
@@ -706,7 +585,7 @@ class ScanWalletWorker(QThread):
                                     position['token0_decimals'] = token0_info.decimals
                                     position['token1_decimals'] = token1_info.decimals
                             except Exception as e:
-                                print(f"Error fetching pool info for {token_id}: {e}")
+                                logger.warning(f"Error fetching pool info for {token_id}: {e}")
 
                         self.position_found.emit(token_id, position)
 
@@ -774,9 +653,6 @@ class ClosePositionsWorker(QThread):
             if v3_uniswap_ids:
                 self.progress.emit(f"Closing {len(v3_uniswap_ids)} Uniswap V3 positions...")
                 try:
-                    from config import V3_DEXES
-                    from src.liquidity_provider import LiquidityProvider
-
                     chain_id = getattr(self.provider, 'chain_id', 56)
                     if chain_id in V3_DEXES and "uniswap" in V3_DEXES[chain_id]:
                         uniswap_config = V3_DEXES[chain_id]["uniswap"]
@@ -802,61 +678,57 @@ class ClosePositionsWorker(QThread):
                     self.progress.emit(f"Uniswap V3 close failed: {e}")
                     results.append(('Uniswap V3', None, False, 0))
 
-            # Close V4 positions
+            # Close V4 positions (protocol-aware)
             if v4_ids:
                 self.progress.emit(f"Closing {len(v4_ids)} V4 positions...")
-                try:
-                    from src.contracts.v4 import V4PositionManager, V4Protocol
-                    from src.contracts.v4.constants import UNISWAP_V4_ADDRESSES
+                chain_id = getattr(self.provider, 'chain_id', 56)
 
-                    chain_id = getattr(self.provider, 'chain_id', 56)
-                    v4_addresses = UNISWAP_V4_ADDRESSES.get(chain_id, UNISWAP_V4_ADDRESSES[56])
-                    v4_pm = V4PositionManager(
-                        self.provider.w3,
-                        account=self.provider.account,
-                        protocol=V4Protocol.UNISWAP,
-                        chain_id=chain_id,
-                        position_manager_address=v4_addresses.position_manager
-                    )
+                # Group by protocol to create separate PMs
+                v4_by_protocol = {}
+                for tid in v4_ids:
+                    pos = self.positions_data.get(tid, {})
+                    proto = pos.get('protocol', 'v4')
+                    v4_by_protocol.setdefault(proto, []).append(tid)
 
-                    # Close each V4 position
-                    for tid in v4_ids:
-                        self.progress.emit(f"Closing V4 position {tid}...")
-                        try:
-                            # Get stored position data
-                            pos_data = self.positions_data.get(tid, {})
-                            token0 = pos_data.get('token0', '')
-                            token1 = pos_data.get('token1', '')
-                            liquidity = pos_data.get('liquidity', 0)
+                for proto_str, tids in v4_by_protocol.items():
+                    try:
+                        v4_pm = _create_v4_position_manager(
+                            self.provider.w3, self.provider.account, proto_str, chain_id
+                        )
 
-                            null_addr = "0x0000000000000000000000000000000000000000"
+                        for tid in tids:
+                            self.progress.emit(f"Closing V4 position {tid} ({proto_str})...")
+                            try:
+                                pos_data = self.positions_data.get(tid, {})
+                                token0 = pos_data.get('token0', '')
+                                token1 = pos_data.get('token1', '')
+                                liquidity = pos_data.get('liquidity', 0)
 
-                            # Use stored tokens if available and valid
-                            if token0 and token1 and token0 != null_addr and token1 != null_addr:
-                                self.progress.emit(f"  Using stored token addresses: {token0[:10]}.../{token1[:10]}...")
-                                tx_hash, _, _ = v4_pm.close_position_with_tokens(
-                                    tid,
-                                    currency0=token0,
-                                    currency1=token1,
-                                    liquidity=liquidity,
-                                    recipient=self.provider.account.address,
-                                    timeout=300
-                                )
-                            else:
-                                # Fall back to automatic lookup
-                                tx_hash, _, _ = v4_pm.close_position(
-                                    tid,
-                                    recipient=self.provider.account.address,
-                                    timeout=300
-                                )
-                            results.append(('V4', tx_hash, True, 0))
-                        except Exception as e:
-                            self.progress.emit(f"V4 position {tid} close failed: {e}")
-                            results.append(('V4', None, False, 0))
+                                null_addr = "0x0000000000000000000000000000000000000000"
 
-                except Exception as e:
-                    self.progress.emit(f"V4 close failed: {e}")
-                    results.append(('V4', None, False, 0))
+                                if token0 and token1 and token0 != null_addr and token1 != null_addr:
+                                    tx_hash, _, _ = v4_pm.close_position_with_tokens(
+                                        tid,
+                                        currency0=token0,
+                                        currency1=token1,
+                                        liquidity=liquidity,
+                                        recipient=self.provider.account.address,
+                                        timeout=300
+                                    )
+                                else:
+                                    tx_hash, _, _ = v4_pm.close_position(
+                                        tid,
+                                        recipient=self.provider.account.address,
+                                        timeout=300
+                                    )
+                                results.append(('V4', tx_hash, True, 0))
+                            except Exception as e:
+                                self.progress.emit(f"V4 position {tid} close failed: {e}")
+                                results.append(('V4', None, False, 0))
+
+                    except Exception as e:
+                        self.progress.emit(f"V4 close failed ({proto_str}): {e}")
+                        results.append(('V4', None, False, 0))
 
             # Check overall success
             all_success = all(r[2] for r in results) if results else False
@@ -866,7 +738,6 @@ class ClosePositionsWorker(QThread):
             sell_results = None
             if all_success and self.auto_sell and self.private_key:
                 # Wait for tokens to arrive
-                import time
                 self.progress.emit("Waiting for tokens to settle (5 sec)...")
                 time.sleep(5)
                 self.progress.emit("Auto-selling received tokens...")
@@ -902,18 +773,12 @@ class ClosePositionsWorker(QThread):
     def _auto_sell_tokens(self) -> dict:
         """Sell received tokens via DEX (Uniswap/PancakeSwap)."""
         try:
-            from src.dex_swap import DexSwap, STABLE_TOKENS
-
-            self.progress.emit(f"DEBUG: positions_data keys = {list(self.positions_data.keys())}")
-            self.progress.emit(f"DEBUG: token_ids = {self.token_ids}")
-
             # Get wallet balance of tokens from closed positions
             tokens_to_sell = []
             for tid in self.token_ids:
                 pos = self.positions_data.get(tid, {})
-                self.progress.emit(f"DEBUG: Position {tid} data: token0={pos.get('token0', 'N/A')}, token1={pos.get('token1', 'N/A')}")
                 if not pos:
-                    self.progress.emit(f"DEBUG: Position {tid} has no data!")
+                    logger.debug(f"Position {tid} has no data, skipping")
                     continue
 
                 token0 = pos.get('token0', '')
@@ -923,14 +788,9 @@ class ClosePositionsWorker(QThread):
                 sym0 = pos.get('token0_symbol', 'TOKEN0')
                 sym1 = pos.get('token1_symbol', 'TOKEN1')
 
-                self.progress.emit(f"DEBUG: Checking token0={sym0} ({token0[:20] if token0 else 'empty'}...)")
-                self.progress.emit(f"DEBUG: Checking token1={sym1} ({token1[:20] if token1 else 'empty'}...)")
-
                 # Check if token0 is NOT stable
                 token0_is_stable = token0 and token0.lower() in [t.lower() for t in STABLE_TOKENS]
                 token1_is_stable = token1 and token1.lower() in [t.lower() for t in STABLE_TOKENS]
-
-                self.progress.emit(f"DEBUG: token0_is_stable={token0_is_stable}, token1_is_stable={token1_is_stable}")
 
                 if token0 and not token0_is_stable:
                     tokens_to_sell.append({
@@ -944,8 +804,6 @@ class ClosePositionsWorker(QThread):
                         'decimals': dec1,
                         'symbol': sym1
                     })
-
-            self.progress.emit(f"DEBUG: tokens_to_sell count = {len(tokens_to_sell)}")
 
             if not tokens_to_sell:
                 self.progress.emit("No tokens to sell (all are stablecoins)")
@@ -1062,9 +920,6 @@ class BatchCloseWorker(QThread):
 
     def run(self):
         try:
-            from src.contracts.v4 import V4PositionManager, V4Protocol
-            from src.contracts.v4.constants import UNISWAP_V4_ADDRESSES
-
             self.progress.emit(f"Preparing batch close for {len(self.positions)} positions...")
 
             w3 = self.provider.w3
@@ -1076,14 +931,9 @@ class BatchCloseWorker(QThread):
                 self.progress.emit("Recording balances before close...")
                 balances_before = self._get_token_balances()
 
-            v4_addresses = UNISWAP_V4_ADDRESSES.get(self.chain_id, UNISWAP_V4_ADDRESSES[56])
-            v4_pm = V4PositionManager(
-                w3,
-                account=self.provider.account,
-                protocol=V4Protocol.UNISWAP,
-                chain_id=self.chain_id,
-                position_manager_address=v4_addresses.position_manager
-            )
+            # Detect protocol from positions data (all positions in batch must be same protocol)
+            proto_str = self.positions[0].get('protocol', 'v4') if self.positions else 'v4'
+            v4_pm = _create_v4_position_manager(w3, self.provider.account, proto_str, self.chain_id)
 
             self.progress.emit("Building batch transaction...")
 
@@ -1103,7 +953,6 @@ class BatchCloseWorker(QThread):
             if success:
                 # Auto-sell if enabled
                 if self.auto_sell and self.private_key:
-                    import time
                     self.progress.emit("Waiting for tokens to settle (5 sec)...")
                     time.sleep(5)
                     self.progress.emit("Auto-selling received tokens...")
@@ -1161,8 +1010,6 @@ class BatchCloseWorker(QThread):
     def _auto_sell_tokens(self, balances_before: dict) -> dict:
         """Sell only RECEIVED tokens via DEX (difference between before and after)."""
         try:
-            from src.dex_swap import DexSwap, STABLE_TOKENS
-
             w3 = self.provider.w3
             wallet = self.provider.account.address
 
@@ -1537,7 +1384,6 @@ class ManageTab(QWidget):
             # Detect V4 provider and its specific protocol
             is_v4 = hasattr(provider, 'create_pool_only')
             if is_v4:
-                from src.contracts.v4 import V4Protocol
                 provider_protocol = getattr(provider, 'protocol', V4Protocol.UNISWAP)
 
                 if provider_protocol == V4Protocol.PANCAKESWAP:
@@ -1557,7 +1403,6 @@ class ManageTab(QWidget):
                 v3_protocol_data = "v3"  # default to PancakeSwap V3
 
                 try:
-                    from config import V3_DEXES
                     chain_id = getattr(provider, 'chain_id', 56)
                     pm_address = getattr(provider, 'position_manager_address', None)
 
@@ -1570,7 +1415,7 @@ class ManageTab(QWidget):
                                     v3_protocol_data = "v3_uniswap"
                                 break
                 except Exception as detect_err:
-                    print(f"Could not detect V3 DEX: {detect_err}")
+                    logger.warning(f"Could not detect V3 DEX: {detect_err}")
 
                 self.status_label.setText(f"Ready to manage {v3_dex_name} positions")
                 self._log(f"{v3_dex_name} Provider connected")
@@ -1582,7 +1427,6 @@ class ManageTab(QWidget):
 
             # Create pool factory for fetching current prices (V3 only, but harmless for V4)
             try:
-                from src.contracts.pool_factory import PoolFactory
                 self.pool_factory = PoolFactory(
                     provider.w3,
                     provider.account,
@@ -1755,15 +1599,14 @@ class ManageTab(QWidget):
                 except Exception as worker_err:
                     self._log(f"❌ Failed to start worker for {token_id}: {worker_err}")
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            logger.exception(f"Error loading positions: {e}")
             self._log(f"❌ Error loading positions: {e}")
             self.progress_bar.hide()
 
     def _on_position_loaded(self, token_id: int, position: dict):
         """Handle position loaded from blockchain."""
         try:
-            print(f"[UI] _on_position_loaded: token_id={token_id}")
+            logger.debug(f"_on_position_loaded: token_id={token_id}")
             self.positions_data[token_id] = position
             self._update_table_row(token_id, position)
             # NOTE: Don't save here - causes race condition when multiple workers finish
@@ -1772,8 +1615,7 @@ class ManageTab(QWidget):
             protocol = position.get('protocol', 'unknown')
             self._log(f"✅ Loaded position #{token_id} ({protocol})")
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            logger.exception(f"Error displaying position {token_id}: {e}")
             self._log(f"❌ Error displaying position {token_id}: {e}")
 
     def _on_position_error(self, token_id: int, error: str):
@@ -2029,7 +1871,6 @@ class ManageTab(QWidget):
         token1_sym = position.get('token1_symbol', '')
 
         # Use centralized stablecoin detection (supports BNB, BASE, ETH)
-        from config import is_stablecoin
         token0_is_stable = bool(token0_addr) and is_stablecoin(token0_addr)
         token1_is_stable = bool(token1_addr) and is_stablecoin(token1_addr)
 
@@ -2040,7 +1881,7 @@ class ManageTab(QWidget):
             token1_sym = token1_addr[:8] if token1_addr else '???'
 
         if is_v4:
-            print(f"[UI] V4 Position {token_id}: token0={token0_sym} (stable={token0_is_stable}), token1={token1_sym} (stable={token1_is_stable})")
+            logger.debug(f"V4 Position {token_id}: token0={token0_sym} (stable={token0_is_stable}), token1={token1_sym} (stable={token1_is_stable})")
 
         # Pair - show as volatile/stablecoin
         if token0_is_stable and not token1_is_stable:
@@ -2060,14 +1901,14 @@ class ManageTab(QWidget):
 
         # Debug logging for V4 positions
         if is_v4:
-            print(f"[UI] V4 Position {token_id}: tick_lower={tick_lower}, tick_upper={tick_upper}, liquidity={position.get('liquidity', 0)}")
+            logger.debug(f"V4 Position {token_id}: tick_lower={tick_lower}, tick_upper={tick_upper}, liquidity={position.get('liquidity', 0)}")
 
         # Validate tick values are in valid range
         MIN_TICK, MAX_TICK = -887272, 887272
         ticks_valid = (MIN_TICK <= tick_lower <= MAX_TICK and MIN_TICK <= tick_upper <= MAX_TICK)
 
         if not ticks_valid:
-            print(f"[UI] WARNING: Invalid tick values for position {token_id}: {tick_lower}/{tick_upper}")
+            logger.warning(f"Invalid tick values for position {token_id}: {tick_lower}/{tick_upper}")
             raw_price_lower = 0
             raw_price_upper = float('inf')
         else:
@@ -2077,10 +1918,10 @@ class ManageTab(QWidget):
                 raw_price_lower = tick_to_price(tick_lower)
                 raw_price_upper = tick_to_price(tick_upper)
                 if is_v4:
-                    print(f"[UI] V4 Position {token_id}: raw prices = {raw_price_lower:.10f} - {raw_price_upper:.10f}")
+                    logger.debug(f"V4 Position {token_id}: raw prices = {raw_price_lower:.10f} - {raw_price_upper:.10f}")
             except (OverflowError, ValueError) as e:
                 # Extreme tick values - display raw ticks instead
-                print(f"[UI] tick_to_price overflow for ticks {tick_lower}/{tick_upper}: {e}")
+                logger.warning(f"tick_to_price overflow for ticks {tick_lower}/{tick_upper}: {e}")
                 raw_price_lower = 0
                 raw_price_upper = float('inf')
 
@@ -2102,7 +1943,7 @@ class ManageTab(QWidget):
         if token0_is_stable and not token1_is_stable:
             # Invert prices (and swap lower/upper since inverting flips the range)
             if is_v4:
-                print(f"[UI] V4 Position {token_id}: Inverting prices (token0 is stablecoin)")
+                logger.debug(f"V4 Position {token_id}: Inverting prices (token0 is stablecoin)")
             if raw_price_lower > 0 and raw_price_upper > 0 and raw_price_upper != float('inf'):
                 try:
                     price_lower = 1 / raw_price_upper
@@ -2118,7 +1959,7 @@ class ManageTab(QWidget):
             price_upper = raw_price_upper
 
         if is_v4:
-            print(f"[UI] V4 Position {token_id}: final prices = ${price_lower:.10f} - ${price_upper:.10f}")
+            logger.debug(f"V4 Position {token_id}: final prices = ${price_lower:.10f} - ${price_upper:.10f}")
 
         # Format price range (handle infinity and extreme values)
         # Check for invalid/extreme values that indicate bad tick extraction
@@ -2355,7 +2196,6 @@ class ManageTab(QWidget):
         total_value = 0.0
         total_fees = 0.0
         active_count = 0
-        from config import STABLECOINS
 
         for token_id, position in self.positions_data.items():
             if not isinstance(position, dict):
