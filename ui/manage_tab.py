@@ -479,7 +479,7 @@ class ScanWalletWorker(QThread):
 
     progress = pyqtSignal(str)  # progress message
     position_found = pyqtSignal(int, dict)  # token_id, position_data
-    finished = pyqtSignal(int, list, str)  # total found, list of token_ids, protocol
+    scan_result = pyqtSignal(int, list, str)  # total found, list of token_ids, protocol
 
     def __init__(self, provider, pool_factory=None, protocol="v3"):
         super().__init__()
@@ -525,7 +525,7 @@ class ScanWalletWorker(QThread):
                     except Exception as e:
                         self.progress.emit(f"Error loading V4 position {token_id}: {e}")
 
-                self.finished.emit(len(token_ids), token_ids, self.protocol)
+                self.scan_result.emit(len(token_ids), token_ids, self.protocol)
 
             else:
                 # Use V3 position manager
@@ -592,18 +592,18 @@ class ScanWalletWorker(QThread):
                     except Exception as e:
                         self.progress.emit(f"Error loading position {token_id}: {e}")
 
-                self.finished.emit(len(token_ids), token_ids, self.protocol)
+                self.scan_result.emit(len(token_ids), token_ids, self.protocol)
 
         except Exception as e:
             self.progress.emit(f"Scan failed: {e}")
-            self.finished.emit(0, [], self.protocol)
+            self.scan_result.emit(0, [], self.protocol)
 
 
 class ClosePositionsWorker(QThread):
     """Worker thread for closing positions with optional auto-sell."""
 
     progress = pyqtSignal(str)
-    finished = pyqtSignal(bool, str, dict)
+    close_result = pyqtSignal(bool, str, dict)
 
     def __init__(self, provider, token_ids, positions_data=None, auto_sell=False,
                  private_key=None, swap_slippage=3.0, chain_id=56, initial_investment=0):
@@ -763,12 +763,12 @@ class ClosePositionsWorker(QThread):
                     result_data['pnl_percent'] = pnl_percent
 
             if all_success:
-                self.finished.emit(True, "Positions closed successfully", result_data)
+                self.close_result.emit(True, "Positions closed successfully", result_data)
             else:
-                self.finished.emit(False, "Some positions failed to close", result_data)
+                self.close_result.emit(False, "Some positions failed to close", result_data)
 
         except Exception as e:
-            self.finished.emit(False, str(e), {})
+            self.close_result.emit(False, str(e), {})
 
     def _auto_sell_tokens(self) -> dict:
         """Sell received tokens via DEX (Uniswap/PancakeSwap)."""
@@ -905,7 +905,7 @@ class BatchCloseWorker(QThread):
     """Worker thread for batch closing ALL V4 positions in ONE transaction."""
 
     progress = pyqtSignal(str)
-    finished = pyqtSignal(bool, str, dict)
+    close_result = pyqtSignal(bool, str, dict)
 
     def __init__(self, provider, positions: list, auto_sell=False, private_key=None,
                  swap_slippage=3.0, initial_investment=0):
@@ -968,13 +968,13 @@ class BatchCloseWorker(QThread):
                             result_data['pnl'] = pnl
                             result_data['pnl_percent'] = pnl_percent
 
-                self.finished.emit(True, f"Closed {len(self.positions)} positions", result_data)
+                self.close_result.emit(True, f"Closed {len(self.positions)} positions", result_data)
             else:
-                self.finished.emit(False, f"Transaction reverted. TX: {tx_hash}", result_data)
+                self.close_result.emit(False, f"Transaction reverted. TX: {tx_hash}", result_data)
 
         except Exception as e:
             self.progress.emit(f"Batch close failed: {e}")
-            self.finished.emit(False, str(e), {})
+            self.close_result.emit(False, str(e), {})
 
     def _get_token_balances(self) -> dict:
         """Get current balances of tokens from positions."""
@@ -1555,9 +1555,8 @@ class ManageTab(QWidget):
 
         self._load_positions_by_ids(token_ids)
 
-    def _load_positions_by_ids(self, token_ids: list, protocol: str = None):
-        """Load specific positions by their IDs."""
-        # Cancel existing workers to prevent duplicates
+    def _cancel_load_workers(self):
+        """Cancel all running load workers safely."""
         if self.load_workers:
             for w in self.load_workers:
                 if w.isRunning():
@@ -1565,6 +1564,12 @@ class ManageTab(QWidget):
                     w.wait(1000)
                 w.deleteLater()
             self.load_workers.clear()
+
+    def _load_positions_by_ids(self, token_ids: list, protocol: str = None, cancel_existing: bool = True):
+        """Load specific positions by their IDs."""
+        # Cancel existing workers to prevent duplicates
+        if cancel_existing:
+            self._cancel_load_workers()
 
         try:
             self.progress_bar.show()
@@ -1716,7 +1721,7 @@ class ManageTab(QWidget):
         self.scan_worker = ScanWalletWorker(self.provider, self.pool_factory, protocol=selected_protocol)
         self.scan_worker.progress.connect(self._on_scan_progress, Qt.ConnectionType.QueuedConnection)
         self.scan_worker.position_found.connect(self._on_scan_position_found, Qt.ConnectionType.QueuedConnection)
-        self.scan_worker.finished.connect(self._on_scan_finished, Qt.ConnectionType.QueuedConnection)
+        self.scan_worker.scan_result.connect(self._on_scan_finished, Qt.ConnectionType.QueuedConnection)
         self.scan_worker.start()
 
     def _on_scan_progress(self, message: str):
@@ -2189,11 +2194,14 @@ class ManageTab(QWidget):
                 positions_by_protocol[stored_protocol] = []
             positions_by_protocol[stored_protocol].append(token_id)
 
-        # Load each protocol group separately
+        # Cancel existing workers ONCE before creating new ones
+        self._cancel_load_workers()
+
+        # Load all protocol groups (append mode — don't cancel between groups)
         for protocol, ids in positions_by_protocol.items():
             if ids:
                 self._log(f"Refreshing {len(ids)} {protocol} positions...")
-                self._load_positions_by_ids(ids, protocol=protocol)
+                self._load_positions_by_ids(ids, protocol=protocol, cancel_existing=False)
 
     def _refresh_pnl(self):
         """Refresh PnL — reload all positions and update PnL summary."""
@@ -2470,76 +2478,80 @@ class ManageTab(QWidget):
             initial_investment=initial_investment
         )
         self.worker.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
-        self.worker.finished.connect(self._on_batch_close_finished, Qt.ConnectionType.QueuedConnection)
+        self.worker.close_result.connect(self._on_batch_close_finished, Qt.ConnectionType.QueuedConnection)
         self.worker.start()
 
     def _on_batch_close_finished(self, success: bool, message: str, data: dict):
         """Handle batch close completion."""
-        if self.worker is not None:
-            self.worker.deleteLater()
-            self.worker = None
-        self.progress_bar.hide()
-        self.close_selected_btn.setEnabled(True)
-        self.close_all_btn.setEnabled(True)
-        self.batch_close_btn.setEnabled(True)
+        try:
+            if self.worker is not None:
+                self.worker.deleteLater()
+                self.worker = None
+            self.progress_bar.hide()
+            self.close_selected_btn.setEnabled(True)
+            self.close_all_btn.setEnabled(True)
+            self.batch_close_btn.setEnabled(True)
 
-        if success:
-            self._log(f"SUCCESS: {message}")
-            self._log(f"TX Hash: {data.get('tx_hash', 'N/A')}")
-            self._log(f"Gas Used: {data.get('gas_used', 'N/A')}")
+            if success:
+                self._log(f"SUCCESS: {message}")
+                self._log(f"TX Hash: {data.get('tx_hash', 'N/A')}")
+                self._log(f"Gas Used: {data.get('gas_used', 'N/A')}")
 
-            # Build result message
-            result_msg = (
-                f"All positions closed successfully in 1 transaction!\n\n"
-                f"TX: {data.get('tx_hash', 'N/A')}\n"
-                f"Gas Used: {data.get('gas_used', 'N/A')}"
-            )
+                # Build result message
+                result_msg = (
+                    f"All positions closed successfully in 1 transaction!\n\n"
+                    f"TX: {data.get('tx_hash', 'N/A')}\n"
+                    f"Gas Used: {data.get('gas_used', 'N/A')}"
+                )
 
-            # Add auto-sell results if present
-            sell_results = data.get('sell_results')
-            if sell_results:
-                total_usd = sell_results.get('total_usd', 0)
-                swaps = sell_results.get('swaps', [])
-                skipped = sell_results.get('skipped', [])
-                initial = data.get('initial_investment', 0)
-                pnl = data.get('pnl')
-                pnl_percent = data.get('pnl_percent')
+                # Add auto-sell results if present
+                sell_results = data.get('sell_results')
+                if sell_results:
+                    total_usd = sell_results.get('total_usd', 0)
+                    swaps = sell_results.get('swaps', [])
+                    skipped = sell_results.get('skipped', [])
+                    initial = data.get('initial_investment', 0)
+                    pnl = data.get('pnl')
+                    pnl_percent = data.get('pnl_percent')
 
-                result_msg += f"\n\n{'='*40}\n"
-                result_msg += f"💰 AUTO-SELL RESULTS\n"
-                result_msg += f"{'='*40}\n"
-                result_msg += f"\nTotal received: ${total_usd:.2f}\n"
+                    result_msg += f"\n\n{'='*40}\n"
+                    result_msg += f"💰 AUTO-SELL RESULTS\n"
+                    result_msg += f"{'='*40}\n"
+                    result_msg += f"\nTotal received: ${total_usd:.2f}\n"
 
-                # Show PnL if initial investment was provided
-                if initial > 0 and pnl is not None:
-                    pnl_sign = "+" if pnl >= 0 else ""
-                    pnl_emoji = "📈" if pnl >= 0 else "📉"
-                    result_msg += f"\n{pnl_emoji} PnL SUMMARY:\n"
-                    result_msg += f"  Initial investment: ${initial:.2f}\n"
-                    result_msg += f"  Final amount: ${total_usd:.2f}\n"
-                    result_msg += f"  Profit/Loss: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_percent:.1f}%)\n"
-                    self._log(f"PnL: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_percent:.1f}%)")
+                    # Show PnL if initial investment was provided
+                    if initial > 0 and pnl is not None:
+                        pnl_sign = "+" if pnl >= 0 else ""
+                        pnl_emoji = "📈" if pnl >= 0 else "📉"
+                        result_msg += f"\n{pnl_emoji} PnL SUMMARY:\n"
+                        result_msg += f"  Initial investment: ${initial:.2f}\n"
+                        result_msg += f"  Final amount: ${total_usd:.2f}\n"
+                        result_msg += f"  Profit/Loss: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_percent:.1f}%)\n"
+                        self._log(f"PnL: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_percent:.1f}%)")
 
-                if swaps:
-                    result_msg += f"\nSwaps executed: {len(swaps)}\n"
-                    for swap in swaps:
-                        if swap.get('success'):
-                            result_msg += f"  ✅ {swap.get('token', '?')}: ${swap.get('usd', 0):.2f}\n"
-                        else:
-                            result_msg += f"  ❌ {swap.get('token', '?')}: {swap.get('error', 'Failed')}\n"
+                    if swaps:
+                        result_msg += f"\nSwaps executed: {len(swaps)}\n"
+                        for swap in swaps:
+                            if swap.get('success'):
+                                result_msg += f"  ✅ {swap.get('token', '?')}: ${swap.get('usd', 0):.2f}\n"
+                            else:
+                                result_msg += f"  ❌ {swap.get('token', '?')}: {swap.get('error', 'Failed')}\n"
 
-                if skipped:
-                    result_msg += f"\nSkipped (stablecoins): {len(skipped)}\n"
+                    if skipped:
+                        result_msg += f"\nSkipped (stablecoins): {len(skipped)}\n"
 
-                self._log(f"Auto-sell total: ${total_usd:.2f}")
+                    self._log(f"Auto-sell total: ${total_usd:.2f}")
 
-            QMessageBox.information(self, "Batch Close Success", result_msg)
+                QMessageBox.information(self, "Batch Close Success", result_msg)
 
-            # Reload positions
-            self._refresh_all_positions()
-        else:
-            self._log(f"FAILED: {message}")
-            QMessageBox.critical(self, "Batch Close Failed", f"Failed:\n{message}")
+                # Reload positions
+                self._refresh_all_positions()
+            else:
+                self._log(f"FAILED: {message}")
+                QMessageBox.critical(self, "Batch Close Failed", f"Failed:\n{message}")
+        except Exception as e:
+            logger.exception(f"Error in _on_batch_close_finished: {e}")
+            self._log(f"❌ Error in batch close handler: {e}")
 
     def _close_positions(self, token_ids: list):
         """Close specified positions."""
@@ -2558,7 +2570,7 @@ class ManageTab(QWidget):
             "This will:\n"
             "1. Remove all liquidity\n"
             "2. Collect tokens and fees\n"
-            "3. Burn the position NFTs"
+            "(NFT positions are kept, not burned)"
         )
 
         if auto_sell:
@@ -2614,7 +2626,7 @@ class ManageTab(QWidget):
             initial_investment=initial_investment
         )
         self.worker.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
-        self.worker.finished.connect(self._on_close_finished, Qt.ConnectionType.QueuedConnection)
+        self.worker.close_result.connect(self._on_close_finished, Qt.ConnectionType.QueuedConnection)
         self.worker.start()
 
     def _on_progress(self, message: str):
@@ -2623,73 +2635,77 @@ class ManageTab(QWidget):
 
     def _on_close_finished(self, success: bool, message: str, data: dict):
         """Handle close completion."""
-        if self.worker is not None:
-            self.worker.deleteLater()
-            self.worker = None
-        self.progress_bar.hide()
-        self.close_selected_btn.setEnabled(True)
-        self.close_all_btn.setEnabled(True)
-        self.batch_close_btn.setEnabled(True)
+        try:
+            if self.worker is not None:
+                self.worker.deleteLater()
+                self.worker = None
+            self.progress_bar.hide()
+            self.close_selected_btn.setEnabled(True)
+            self.close_all_btn.setEnabled(True)
+            self.batch_close_btn.setEnabled(True)
 
-        if success:
-            self._log(f"SUCCESS: {message}")
-            self._log(f"TX Hash: {data.get('tx_hash', 'N/A')}")
-            self._log(f"Gas Used: {data.get('gas_used', 'N/A')}")
+            if success:
+                self._log(f"SUCCESS: {message}")
+                self._log(f"TX Hash: {data.get('tx_hash', 'N/A')}")
+                self._log(f"Gas Used: {data.get('gas_used', 'N/A')}")
 
-            # Build result message
-            result_msg = f"Positions closed successfully!\n\nTX: {data.get('tx_hash', 'N/A')}"
+                # Build result message
+                result_msg = f"Positions closed successfully!\n\nTX: {data.get('tx_hash', 'N/A')}"
 
-            # Add auto-sell results if present
-            sell_results = data.get('sell_results')
-            if sell_results:
-                total_usd = sell_results.get('total_usd', 0)
-                swaps = sell_results.get('swaps', [])
-                skipped = sell_results.get('skipped', [])
-                initial = data.get('initial_investment', 0)
-                pnl = data.get('pnl')
-                pnl_percent = data.get('pnl_percent')
+                # Add auto-sell results if present
+                sell_results = data.get('sell_results')
+                if sell_results:
+                    total_usd = sell_results.get('total_usd', 0)
+                    swaps = sell_results.get('swaps', [])
+                    skipped = sell_results.get('skipped', [])
+                    initial = data.get('initial_investment', 0)
+                    pnl = data.get('pnl')
+                    pnl_percent = data.get('pnl_percent')
 
-                result_msg += f"\n\n{'='*40}\n"
-                result_msg += f"💰 AUTO-SELL RESULTS\n"
-                result_msg += f"{'='*40}\n"
-                result_msg += f"\nTotal received: ${total_usd:.2f}\n"
+                    result_msg += f"\n\n{'='*40}\n"
+                    result_msg += f"💰 AUTO-SELL RESULTS\n"
+                    result_msg += f"{'='*40}\n"
+                    result_msg += f"\nTotal received: ${total_usd:.2f}\n"
 
-                # Show PnL if initial investment was provided
-                if initial > 0 and pnl is not None:
-                    pnl_sign = "+" if pnl >= 0 else ""
-                    pnl_emoji = "📈" if pnl >= 0 else "📉"
-                    result_msg += f"\n{pnl_emoji} PnL SUMMARY:\n"
-                    result_msg += f"  Initial investment: ${initial:.2f}\n"
-                    result_msg += f"  Final amount: ${total_usd:.2f}\n"
-                    result_msg += f"  Profit/Loss: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_percent:.1f}%)\n"
-                    self._log(f"PnL: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_percent:.1f}%)")
+                    # Show PnL if initial investment was provided
+                    if initial > 0 and pnl is not None:
+                        pnl_sign = "+" if pnl >= 0 else ""
+                        pnl_emoji = "📈" if pnl >= 0 else "📉"
+                        result_msg += f"\n{pnl_emoji} PnL SUMMARY:\n"
+                        result_msg += f"  Initial investment: ${initial:.2f}\n"
+                        result_msg += f"  Final amount: ${total_usd:.2f}\n"
+                        result_msg += f"  Profit/Loss: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_percent:.1f}%)\n"
+                        self._log(f"PnL: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_percent:.1f}%)")
 
-                if swaps:
-                    result_msg += f"\nSwaps executed: {len(swaps)}\n"
-                    for swap in swaps:
-                        if swap.get('success'):
-                            result_msg += f"  ✅ {swap.get('token', '?')}: ${swap.get('usd', 0):.2f}\n"
-                        else:
-                            result_msg += f"  ❌ {swap.get('token', '?')}: {swap.get('error', 'Failed')}\n"
+                    if swaps:
+                        result_msg += f"\nSwaps executed: {len(swaps)}\n"
+                        for swap in swaps:
+                            if swap.get('success'):
+                                result_msg += f"  ✅ {swap.get('token', '?')}: ${swap.get('usd', 0):.2f}\n"
+                            else:
+                                result_msg += f"  ❌ {swap.get('token', '?')}: {swap.get('error', 'Failed')}\n"
 
-                if skipped:
-                    result_msg += f"\nSkipped (stablecoins): {len(skipped)}\n"
+                    if skipped:
+                        result_msg += f"\nSkipped (stablecoins): {len(skipped)}\n"
 
-                self._log(f"Auto-sell total: ${total_usd:.2f}")
+                    self._log(f"Auto-sell total: ${total_usd:.2f}")
 
-                # Show PnL summary
-                QMessageBox.information(
-                    self, "Close & Sell Complete",
-                    result_msg
-                )
+                    # Show PnL summary
+                    QMessageBox.information(
+                        self, "Close & Sell Complete",
+                        result_msg
+                    )
+                else:
+                    QMessageBox.information(self, "Success", result_msg)
+
+                # Reload positions
+                self._refresh_all_positions()
             else:
-                QMessageBox.information(self, "Success", result_msg)
-
-            # Reload positions
-            self._refresh_all_positions()
-        else:
-            self._log(f"FAILED: {message}")
-            QMessageBox.critical(self, "Error", f"Failed to close positions:\n{message}")
+                self._log(f"FAILED: {message}")
+                QMessageBox.critical(self, "Error", f"Failed to close positions:\n{message}")
+        except Exception as e:
+            logger.exception(f"Error in _on_close_finished: {e}")
+            self._log(f"❌ Error in close handler: {e}")
 
     def _clear_list(self):
         """Clear the positions list."""

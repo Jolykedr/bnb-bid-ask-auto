@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 class LoadTokenWorker(QThread):
     """Worker thread for loading token info."""
-    finished = pyqtSignal(bool, str, object)
+    load_result = pyqtSignal(bool, str, object)
 
     def __init__(self, factory, address):
         super().__init__()
@@ -35,15 +35,15 @@ class LoadTokenWorker(QThread):
     def run(self):
         try:
             info = self.factory.get_token_info(self.address)
-            self.finished.emit(True, "Success", info)
+            self.load_result.emit(True, "Success", info)
         except Exception as e:
-            self.finished.emit(False, str(e), None)
+            self.load_result.emit(False, str(e), None)
 
 
 class CreatePoolWorker(QThread):
     """Worker thread for creating pools."""
     progress = pyqtSignal(str)
-    finished = pyqtSignal(bool, str, dict)
+    create_result = pyqtSignal(bool, str, dict)
 
     def __init__(self, factory, token0, token1, fee, initial_price=None,
                  token0_decimals=18, token1_decimals=18):
@@ -64,7 +64,7 @@ class CreatePoolWorker(QThread):
                     self.token0, self.token1, self.fee, self.initial_price,
                     self.token0_decimals, self.token1_decimals
                 )
-                self.finished.emit(True, "Pool created and initialized!", {
+                self.create_result.emit(True, "Pool created and initialized!", {
                     'create_tx': create_tx,
                     'init_tx': init_tx,
                     'pool_address': pool_address
@@ -74,18 +74,18 @@ class CreatePoolWorker(QThread):
                 tx_hash, pool_address = self.factory.create_pool(
                     self.token0, self.token1, self.fee
                 )
-                self.finished.emit(True, "Pool created!", {
+                self.create_result.emit(True, "Pool created!", {
                     'create_tx': tx_hash,
                     'pool_address': pool_address
                 })
         except Exception as e:
-            self.finished.emit(False, str(e), {})
+            self.create_result.emit(False, str(e), {})
 
 
 class CreateV4PoolWorker(QThread):
     """Worker thread for creating Uniswap V4 pools."""
     progress = pyqtSignal(str)
-    finished = pyqtSignal(bool, str, dict)
+    create_result = pyqtSignal(bool, str, dict)
 
     def __init__(self, provider, token0, token1, fee_percent, initial_price,
                  tick_spacing=None, token0_decimals=18, token1_decimals=18,
@@ -125,20 +125,20 @@ class CreateV4PoolWorker(QThread):
 
             if success:
                 pool_id_hex = f"0x{pool_id.hex()}" if pool_id else "N/A"
-                self.finished.emit(True, "V4 Pool created successfully!", {
+                self.create_result.emit(True, "V4 Pool created successfully!", {
                     'tx_hash': tx_hash,
                     'pool_id': pool_id_hex,
                     'protocol': self.protocol.value
                 })
             else:
-                self.finished.emit(False, "Pool creation failed (transaction reverted)", {
+                self.create_result.emit(False, "Pool creation failed (transaction reverted)", {
                     'tx_hash': tx_hash,
                     'pool_id': f"0x{pool_id.hex()}" if pool_id else "N/A"
                 })
 
         except Exception as e:
             logger.exception(f"Error in LoadPoolWorker: {e}")
-            self.finished.emit(False, str(e), {})
+            self.create_result.emit(False, str(e), {})
 
 
 class AdvancedTab(QWidget):
@@ -824,7 +824,7 @@ class AdvancedTab(QWidget):
             protocol=protocol
         )
         self.worker.progress.connect(self._log)
-        self.worker.finished.connect(self._on_v4_pool_created)
+        self.worker.create_result.connect(self._on_v4_pool_created)
         self.worker.start()
 
     def _on_v4_pool_created(self, success: bool, message: str, data: dict):
@@ -926,7 +926,7 @@ class AdvancedTab(QWidget):
             self.worker.deleteLater()
             self.worker = None
         self.worker = LoadTokenWorker(self.factory, address)
-        self.worker.finished.connect(self._on_token_loaded)
+        self.worker.load_result.connect(self._on_token_loaded)
         self.worker.start()
 
     def _on_token_loaded(self, success: bool, message: str, info: TokenInfo):
@@ -1223,7 +1223,7 @@ class AdvancedTab(QWidget):
             token0_decimals, token1_decimals
         )
         self.worker.progress.connect(self._log)
-        self.worker.finished.connect(self._on_pool_created)
+        self.worker.create_result.connect(self._on_pool_created)
         self.worker.start()
 
     def _on_pool_created(self, success: bool, message: str, data: dict):

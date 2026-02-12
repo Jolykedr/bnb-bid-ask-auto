@@ -51,7 +51,7 @@ class CreateLadderWorkerV4(QThread):
     """Worker thread for V4 blockchain operations."""
 
     progress = pyqtSignal(str)
-    finished = pyqtSignal(bool, str, dict)
+    create_result = pyqtSignal(bool, str, dict)
 
     def __init__(self, rpc_url: str, private_key: str, config: V4LadderConfig, chain_id: int = 56, auto_create_pool: bool = False, proxy: dict = None, gas_limit: int = 0):
         super().__init__()
@@ -84,7 +84,7 @@ class CreateLadderWorkerV4(QThread):
             is_valid, error = provider.validate_balances(self.config)
 
             if not is_valid:
-                self.finished.emit(False, error, {})
+                self.create_result.emit(False, error, {})
                 return
 
             # Create ladder (auto-creates pool only if checkbox is checked)
@@ -98,17 +98,17 @@ class CreateLadderWorkerV4(QThread):
             )
 
             if result.success:
-                self.finished.emit(True, "Success!", {
+                self.create_result.emit(True, "Success!", {
                     'tx_hash': result.tx_hash,
                     'gas_used': result.gas_used,
                     'token_ids': result.token_ids,
                     'pool_created': result.pool_created
                 })
             else:
-                self.finished.emit(False, result.error or "Unknown error", {})
+                self.create_result.emit(False, result.error or "Unknown error", {})
 
         except Exception as e:
-            self.finished.emit(False, str(e), {})
+            self.create_result.emit(False, str(e), {})
         finally:
             # Zero private key from memory
             self.private_key = None
@@ -126,7 +126,7 @@ class CreateLadderWorker(QThread):
     """Worker thread for blockchain operations."""
 
     progress = pyqtSignal(str)
-    finished = pyqtSignal(bool, str, dict)
+    create_result = pyqtSignal(bool, str, dict)
 
     def __init__(self, provider, config, auto_create_pool=False, factory_address=None, loaded_pool_address=None):
         super().__init__()
@@ -252,7 +252,7 @@ class CreateLadderWorker(QThread):
 
             if not pool_address:
                 if not self.auto_create_pool:
-                    self.finished.emit(
+                    self.create_result.emit(
                         False,
                         f"Pool does not exist for this token pair and fee tier ({self.config.fee_tier/10000}%). "
                         "Enable 'Auto-create pool' option to create it automatically.",
@@ -284,7 +284,7 @@ class CreateLadderWorker(QThread):
                     self.progress.emit("Pool initialized successfully!")
 
                 except Exception as e:
-                    self.finished.emit(False, f"Failed to create pool: {e}", {})
+                    self.create_result.emit(False, f"Failed to create pool: {e}", {})
                     return
             else:
                 self.progress.emit(f"Pool found: {pool_address[:20]}...")
@@ -363,7 +363,7 @@ class CreateLadderWorker(QThread):
             is_valid, error = self.provider.validate_balances_for_ladder(self.config)
 
             if not is_valid:
-                self.finished.emit(False, error, {})
+                self.create_result.emit(False, error, {})
                 return
 
             self.progress.emit("Creating ladder positions...")
@@ -434,7 +434,7 @@ class CreateLadderWorker(QThread):
 
                 if lower_rem != 0 or upper_rem != 0:
                     self.progress.emit(f"⚠️ TICKS NOT ALIGNED! This will cause revert!")
-                    self.finished.emit(False, f"Ticks not aligned to {tick_spacing}: lower%{tick_spacing}={lower_rem}, upper%{tick_spacing}={upper_rem}", {})
+                    self.create_result.emit(False, f"Ticks not aligned to {tick_spacing}: lower%{tick_spacing}={lower_rem}, upper%{tick_spacing}={upper_rem}", {})
                     return
                 else:
                     self.progress.emit(f"✓ Ticks properly aligned to {tick_spacing}")
@@ -445,7 +445,7 @@ class CreateLadderWorker(QThread):
                 pm_code = self.provider.w3.eth.get_code(pm_addr)
                 if len(pm_code) <= 2:
                     self.progress.emit(f"⚠️ Position Manager is NOT a contract!")
-                    self.finished.emit(False, f"Position Manager {pm_addr} is not deployed", {})
+                    self.create_result.emit(False, f"Position Manager {pm_addr} is not deployed", {})
                     return
                 self.progress.emit(f"✓ Position Manager verified ({len(pm_code)} bytes)")
 
@@ -466,7 +466,7 @@ class CreateLadderWorker(QThread):
                 self.progress.emit(f"First pos USD: ${first_usd:.4f}, stablecoin wei: {stablecoin_amount}")
 
                 if stablecoin_amount == 0:
-                    self.finished.emit(False, "Stablecoin amount is 0 - position too small!", {})
+                    self.create_result.emit(False, "Stablecoin amount is 0 - position too small!", {})
                     return
 
             result = self.provider.create_ladder(
@@ -477,16 +477,16 @@ class CreateLadderWorker(QThread):
             )
 
             if result.success:
-                self.finished.emit(True, "Success!", {
+                self.create_result.emit(True, "Success!", {
                     'tx_hash': result.tx_hash,
                     'gas_used': result.gas_used,
                     'token_ids': result.token_ids
                 })
             else:
-                self.finished.emit(False, result.error or "Unknown error", {})
+                self.create_result.emit(False, result.error or "Unknown error", {})
 
         except Exception as e:
-            self.finished.emit(False, str(e), {})
+            self.create_result.emit(False, str(e), {})
         finally:
             # Cleanup temporary resources (PoolFactory etc.)
             pool_factory = None
@@ -1764,7 +1764,7 @@ class CreateTab(QWidget):
             )
 
         self.worker.progress.connect(self._on_progress)
-        self.worker.finished.connect(self._on_finished)
+        self.worker.create_result.connect(self._on_finished)
         self.worker.start()
 
     def _on_progress(self, message: str):

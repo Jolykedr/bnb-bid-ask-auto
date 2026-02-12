@@ -11,6 +11,8 @@ Usage:
 
 import sys
 import os
+import logging
+import traceback
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -18,6 +20,30 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from PyQt6.QtWidgets import QApplication, QMessageBox
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
+
+logger = logging.getLogger(__name__)
+
+
+def _global_exception_handler(exc_type, exc_value, exc_tb):
+    """
+    Глобальный обработчик исключений — логирует ошибку и показывает диалог
+    вместо тихого падения приложения.
+    """
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+
+    error_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    logger.critical(f"Unhandled exception:\n{error_msg}")
+
+    try:
+        QMessageBox.critical(
+            None,
+            "Critical Error",
+            f"Unhandled error:\n\n{exc_value}\n\nSee logs for details."
+        )
+    except Exception:
+        pass  # QApplication may not exist yet
 
 # === ПРОВЕРКА ЛИЦЕНЗИИ ===
 from licensing import LicenseChecker, find_license_file, LicenseError
@@ -85,6 +111,19 @@ def check_license_gui(app: QApplication) -> bool:
 
 def main():
     """Main entry point for the application."""
+    # Install global exception handler to prevent silent crashes
+    sys.excepthook = _global_exception_handler
+
+    # Setup logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        handlers=[
+            logging.FileHandler("bnb_ladder.log", encoding="utf-8"),
+            logging.StreamHandler()
+        ]
+    )
+
     # Create application
     app = QApplication(sys.argv)
 

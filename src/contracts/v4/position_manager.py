@@ -843,7 +843,7 @@ class V4PositionManager:
         timeout: int = 300
     ) -> Tuple[str, int, int]:
         """
-        Close a position (remove liquidity, collect fees, burn NFT).
+        Close a position (remove liquidity, collect fees).
 
         Args:
             token_id: Position NFT ID
