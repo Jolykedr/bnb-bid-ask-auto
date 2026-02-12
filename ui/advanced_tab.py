@@ -1161,7 +1161,15 @@ class AdvancedTab(QWidget):
             self.pool_liquidity_label.setText(f"{info.liquidity:,}")
 
             if info.initialized:
-                price = self.factory.sqrt_price_x96_to_price(info.sqrt_price_x96)
+                # Get token decimals for correct price calculation
+                try:
+                    token0_info = self.factory.get_token_info(info.token0)
+                    token1_info = self.factory.get_token_info(info.token1)
+                    price = self.factory.sqrt_price_x96_to_price(
+                        info.sqrt_price_x96, token0_info.decimals, token1_info.decimals
+                    )
+                except Exception:
+                    price = self.factory.sqrt_price_x96_to_price(info.sqrt_price_x96)
                 self.pool_price_label.setText(f"{price:.8f}")
                 self.pool_status_label.setText("Initialized")
                 self.pool_status_label.setStyleSheet("color: #00b894;")

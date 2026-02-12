@@ -423,6 +423,8 @@ class LoadPositionWorker(QThread):
 
         except Exception as e:
             self.error.emit(self.token_id, str(e))
+        except BaseException as e:
+            logger.critical(f"BaseException in LoadPositionWorker: {e}", exc_info=True)
 
     def _load_v4_position(self):
         """Load a V4 position using shared helper."""
@@ -597,6 +599,8 @@ class ScanWalletWorker(QThread):
         except Exception as e:
             self.progress.emit(f"Scan failed: {e}")
             self.scan_result.emit(0, [], self.protocol)
+        except BaseException as e:
+            logger.critical(f"BaseException in ScanWalletWorker: {e}", exc_info=True)
 
 
 class ClosePositionsWorker(QThread):
@@ -769,6 +773,14 @@ class ClosePositionsWorker(QThread):
 
         except Exception as e:
             self.close_result.emit(False, str(e), {})
+        except BaseException as e:
+            # Catch SystemExit, KeyboardInterrupt etc. — unhandled BaseException
+            # in a QThread can crash the entire application
+            logger.critical(f"BaseException in ClosePositionsWorker: {e}", exc_info=True)
+            try:
+                self.close_result.emit(False, f"Fatal: {e}", {})
+            except Exception:
+                pass
 
     def _auto_sell_tokens(self) -> dict:
         """Sell received tokens via DEX (Uniswap/PancakeSwap)."""
@@ -975,6 +987,12 @@ class BatchCloseWorker(QThread):
         except Exception as e:
             self.progress.emit(f"Batch close failed: {e}")
             self.close_result.emit(False, str(e), {})
+        except BaseException as e:
+            logger.critical(f"BaseException in BatchCloseWorker: {e}", exc_info=True)
+            try:
+                self.close_result.emit(False, f"Fatal: {e}", {})
+            except Exception:
+                pass
 
     def _get_token_balances(self) -> dict:
         """Get current balances of tokens from positions."""
@@ -1200,7 +1218,7 @@ class ManageTab(QWidget):
 
         # Filter options row
         filter_layout = QHBoxLayout()
-        self.hide_empty_cb = QCheckBox("Hide empty positions (liquidity = 0)")
+        self.hide_empty_cb = QCheckBox("Hide empty positions (liquidity = 0 or < $0.000001)")
         self.hide_empty_cb.setChecked(True)  # Hide empty by default
         self.hide_empty_cb.toggled.connect(self._on_filter_changed)
         filter_layout.addWidget(self.hide_empty_cb)
@@ -1559,9 +1577,17 @@ class ManageTab(QWidget):
         """Cancel all running load workers safely."""
         if self.load_workers:
             for w in self.load_workers:
+                # Disconnect all signals to prevent stale callbacks after deletion
+                try:
+                    w.position_loaded.disconnect()
+                    w.error.disconnect()
+                    w.not_owned.disconnect()
+                    w.finished.disconnect()
+                except (TypeError, RuntimeError):
+                    pass
                 if w.isRunning():
                     w.quit()
-                    w.wait(1000)
+                    w.wait(3000)
                 w.deleteLater()
             self.load_workers.clear()
 
@@ -1754,9 +1780,14 @@ class ManageTab(QWidget):
         for token_id, position in self.positions_data.items():
             if position:
                 liquidity = position.get('liquidity', 0)
-                if hide_empty and liquidity == 0:
-                    hidden_count += 1
-                    continue
+                usd_val = position.get('_usd_value')
+                if hide_empty:
+                    if liquidity == 0:
+                        hidden_count += 1
+                        continue
+                    if usd_val is not None and 0 <= usd_val < 0.000001:
+                        hidden_count += 1
+                        continue
                 self._update_table_row(token_id, position)
                 shown_count += 1
 
@@ -1768,6 +1799,8 @@ class ManageTab(QWidget):
     def _on_scan_finished(self, total_found: int, token_ids: list, protocol: str = "v3"):
         """Handle scan completion."""
         if self.scan_worker is not None:
+            if self.scan_worker.isRunning():
+                self.scan_worker.wait(5000)
             self.scan_worker.deleteLater()
             self.scan_worker = None
         self.progress_bar.hide()
@@ -2042,6 +2075,17 @@ class ManageTab(QWidget):
                     usd_value = -1
         except (OverflowError, ValueError, ZeroDivisionError):
             usd_value = -1
+
+        # Store computed USD value for filtering
+        position['_usd_value'] = usd_value
+
+        # Hide dust positions (< $0.000001) when filter is on
+        if self.hide_empty_cb.isChecked():
+            if liquidity == 0 or (0 <= usd_value < 0.000001):
+                # Remove the row if it was added
+                if row < self.positions_table.rowCount():
+                    self.positions_table.removeRow(row)
+                return
 
         if usd_value >= 0:
             if usd_value >= 1000:
@@ -2485,6 +2529,10 @@ class ManageTab(QWidget):
         """Handle batch close completion."""
         try:
             if self.worker is not None:
+                # Wait for thread to fully finish before deleting —
+                # deleteLater on a running QThread can crash (Qt calls terminate())
+                if self.worker.isRunning():
+                    self.worker.wait(10000)
                 self.worker.deleteLater()
                 self.worker = None
             self.progress_bar.hide()
@@ -2637,6 +2685,10 @@ class ManageTab(QWidget):
         """Handle close completion."""
         try:
             if self.worker is not None:
+                # Wait for thread to fully finish before deleting —
+                # deleteLater on a running QThread can crash (Qt calls terminate())
+                if self.worker.isRunning():
+                    self.worker.wait(10000)
                 self.worker.deleteLater()
                 self.worker = None
             self.progress_bar.hide()

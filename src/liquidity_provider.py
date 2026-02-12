@@ -618,6 +618,71 @@ class LiquidityProvider:
                 logger.info(f"Pool found at {pool_address}")
                 logger.info(f"Pool current tick: {pool_info.get('tick')}, liquidity: {pool_info.get('liquidity')}")
 
+        # Get current pool tick to filter out in-range positions
+        # (we only provide one token, but in-range positions need both)
+        current_pool_tick = None
+        if not validated_pool_address and pool_info and pool_info.get('tick') is not None:
+            current_pool_tick = pool_info['tick']
+        elif pool_address:
+            # Get tick via raw eth_call (works for both Uniswap and PancakeSwap V3 slot0)
+            try:
+                raw_slot0 = self.w3.eth.call({
+                    'to': Web3.to_checksum_address(pool_address),
+                    'data': bytes.fromhex('3850c7bd')
+                })
+                if len(raw_slot0) >= 64:
+                    tick_raw = int.from_bytes(raw_slot0[32:64], 'big')
+                    current_pool_tick = tick_raw - 2**256 if tick_raw >= 2**255 else tick_raw
+                    logger.info(f"Current pool tick (raw): {current_pool_tick}")
+            except Exception as e:
+                logger.warning(f"Could not get current pool tick: {e}")
+
+        # Filter positions that would revert because we only provide one token
+        # - If stablecoin is pool's token0: we provide amount0 only → position must be ABOVE current tick
+        # - If stablecoin is pool's token1: we provide amount1 only → position must be BELOW current tick
+        # - In-range positions (tick_lower <= current_tick < tick_upper) need BOTH tokens → skip
+        if current_pool_tick is not None and positions:
+            stablecoin_is_sorted_token0 = stablecoin.lower() == token0.lower()
+            filtered = []
+            skipped_count = 0
+            for pos in positions:
+                if stablecoin_is_sorted_token0:
+                    # Providing token0 only → need current_tick < tick_lower (position above price)
+                    valid = current_pool_tick < pos.tick_lower
+                else:
+                    # Providing token1 only → need current_tick >= tick_upper (position below price)
+                    valid = current_pool_tick >= pos.tick_upper
+
+                if valid:
+                    filtered.append(pos)
+                else:
+                    skipped_count += 1
+                    logger.warning(
+                        f"Skipping position ticks=[{pos.tick_lower},{pos.tick_upper}]: "
+                        f"overlaps current tick {current_pool_tick} (needs both tokens)"
+                    )
+
+            if skipped_count > 0:
+                logger.warning(f"Skipped {skipped_count}/{len(positions)} positions overlapping current tick {current_pool_tick}")
+            positions = filtered
+
+            if not positions:
+                return LadderResult(
+                    positions=[],
+                    tx_hash=None,
+                    gas_used=None,
+                    token_ids=[],
+                    success=False,
+                    error=f"All {skipped_count} positions overlap current pool tick ({current_pool_tick}). "
+                          "Adjust price range so positions are outside the current price."
+                )
+
+            # Recalculate total stablecoin after filtering
+            total_stablecoin_amount = sum(
+                int(pos.usd_amount * (10 ** stablecoin_decimals)) for pos in positions
+            )
+            logger.info(f"After filtering: {len(positions)} positions, total stablecoin: {total_stablecoin_amount}")
+
         # Approve стейблкоин (оригинальный config.token1)
         logger.info(f"Approving stablecoin {stablecoin[:15]}... amount={total_stablecoin_amount} to PM={self.position_manager_address[:15]}...")
         self.check_and_approve_tokens(stablecoin, total_stablecoin_amount, timeout=timeout)
@@ -774,13 +839,20 @@ class LiquidityProvider:
             logger.debug(f"Result: {single_result}")
 
             if "Error" in single_result or "Revert" in single_result:
+                # Build helpful error message
+                hint = ""
+                if current_pool_tick is not None and positions:
+                    pos = positions[0]
+                    if pos.tick_lower <= current_pool_tick < pos.tick_upper:
+                        hint = (f" Position tick range [{pos.tick_lower},{pos.tick_upper}] contains "
+                                f"current tick {current_pool_tick} — needs both tokens but only one provided.")
                 return LadderResult(
                     positions=positions,
                     tx_hash=None,
                     gas_used=None,
                     token_ids=[],
                     success=False,
-                    error=f"Single call test failed: {single_result}"
+                    error=f"Single call test failed: {single_result}{hint}"
                 )
 
             try:

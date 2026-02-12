@@ -13,6 +13,7 @@ import sys
 import os
 import logging
 import traceback
+import threading
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -44,6 +45,16 @@ def _global_exception_handler(exc_type, exc_value, exc_tb):
         )
     except Exception:
         pass  # QApplication may not exist yet
+
+
+def _thread_exception_handler(args):
+    """
+    Обработчик исключений в worker-потоках (threading.excepthook).
+    Предотвращает тихое падение приложения из-за необработанного исключения в потоке.
+    """
+    error_msg = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+    logger.critical(f"Unhandled thread exception ({args.thread}):\n{error_msg}")
+
 
 # === ПРОВЕРКА ЛИЦЕНЗИИ ===
 from licensing import LicenseChecker, find_license_file, LicenseError
@@ -111,8 +122,9 @@ def check_license_gui(app: QApplication) -> bool:
 
 def main():
     """Main entry point for the application."""
-    # Install global exception handler to prevent silent crashes
+    # Install global exception handlers to prevent silent crashes
     sys.excepthook = _global_exception_handler
+    threading.excepthook = _thread_exception_handler
 
     # Setup logging
     logging.basicConfig(

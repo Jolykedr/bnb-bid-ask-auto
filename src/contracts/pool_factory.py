@@ -317,10 +317,26 @@ class PoolFactory:
             tick = slot0[1]
             initialized = sqrt_price_x96 > 0
         except Exception as e:
-            logger.debug(f"Failed to get slot0 for pool {address}: {e}")
-            sqrt_price_x96 = 0
-            tick = 0
-            initialized = False
+            # ABI mismatch: PancakeSwap V3 slot0 returns 8 fields with feeProtocol:uint32,
+            # but our ABI has 7 fields with feeProtocol:uint8. Fallback to raw eth_call.
+            logger.debug(f"slot0 ABI decode failed, trying raw eth_call: {e}")
+            try:
+                raw = self.w3.eth.call({'to': address, 'data': bytes.fromhex('3850c7bd')})
+                if len(raw) >= 64:
+                    sqrt_price_x96 = int.from_bytes(raw[0:32], 'big')
+                    tick_raw = int.from_bytes(raw[32:64], 'big')
+                    tick = tick_raw - 2**256 if tick_raw >= 2**255 else tick_raw
+                    initialized = sqrt_price_x96 > 0
+                    logger.info(f"slot0 raw decode OK: sqrtPriceX96={sqrt_price_x96}, tick={tick}")
+                else:
+                    sqrt_price_x96 = 0
+                    tick = 0
+                    initialized = False
+            except Exception as e2:
+                logger.warning(f"Failed to get slot0 for pool {address}: {e2}")
+                sqrt_price_x96 = 0
+                tick = 0
+                initialized = False
 
         # Calculate tick spacing from fee
         tick_spacing = self._get_tick_spacing(fee)

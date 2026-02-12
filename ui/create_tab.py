@@ -314,15 +314,6 @@ class CreateLadderWorker(QThread):
                     pool_abi = [
                         {"inputs": [], "name": "fee", "outputs": [{"type": "uint24"}], "stateMutability": "view", "type": "function"},
                         {"inputs": [], "name": "tickSpacing", "outputs": [{"type": "int24"}], "stateMutability": "view", "type": "function"},
-                        {"inputs": [], "name": "slot0", "outputs": [
-                            {"type": "uint160", "name": "sqrtPriceX96"},
-                            {"type": "int24", "name": "tick"},
-                            {"type": "uint16", "name": "observationIndex"},
-                            {"type": "uint16", "name": "observationCardinality"},
-                            {"type": "uint16", "name": "observationCardinalityNext"},
-                            {"type": "uint8", "name": "feeProtocol"},
-                            {"type": "bool", "name": "unlocked"}
-                        ], "stateMutability": "view", "type": "function"},
                     ]
                     pool_contract = self.provider.w3.eth.contract(
                         address=self.provider.w3.to_checksum_address(pool_address),
@@ -350,10 +341,19 @@ class CreateLadderWorker(QThread):
                     if actual_tick_spacing != expected_tick_spacing:
                         self.progress.emit(f"⚠️ TICK SPACING MISMATCH! Pool has {actual_tick_spacing}, expected {expected_tick_spacing}")
 
-                    # Get current pool tick
-                    slot0 = pool_contract.functions.slot0().call()
-                    current_tick = slot0[1]
-                    self.progress.emit(f"Pool current tick: {current_tick}")
+                    # Get current pool tick via raw eth_call
+                    # (works for both Uniswap V3 and PancakeSwap V3 slot0 formats)
+                    pool_addr_cs = self.provider.w3.to_checksum_address(pool_address)
+                    raw_slot0 = self.provider.w3.eth.call({
+                        'to': pool_addr_cs,
+                        'data': bytes.fromhex('3850c7bd')
+                    })
+                    if len(raw_slot0) >= 64:
+                        tick_raw = int.from_bytes(raw_slot0[32:64], 'big')
+                        current_tick = tick_raw - 2**256 if tick_raw >= 2**255 else tick_raw
+                        self.progress.emit(f"Pool current tick: {current_tick}")
+                    else:
+                        self.progress.emit(f"⚠️ slot0 returned {len(raw_slot0)} bytes, cannot read tick")
 
                 except Exception as fee_err:
                     self.progress.emit(f"Could not verify pool info: {fee_err}")
@@ -2515,15 +2515,6 @@ class CreateTab(QWidget):
                 {"inputs": [], "name": "token1", "outputs": [{"type": "address"}], "stateMutability": "view", "type": "function"},
                 {"inputs": [], "name": "fee", "outputs": [{"type": "uint24"}], "stateMutability": "view", "type": "function"},
                 {"inputs": [], "name": "factory", "outputs": [{"type": "address"}], "stateMutability": "view", "type": "function"},
-                {"inputs": [], "name": "slot0", "outputs": [
-                    {"type": "uint160", "name": "sqrtPriceX96"},
-                    {"type": "int24", "name": "tick"},
-                    {"type": "uint16", "name": "observationIndex"},
-                    {"type": "uint16", "name": "observationCardinality"},
-                    {"type": "uint16", "name": "observationCardinalityNext"},
-                    {"type": "uint8", "name": "feeProtocol"},
-                    {"type": "bool", "name": "unlocked"}
-                ], "stateMutability": "view", "type": "function"},
             ]
 
             pool_address = Web3.to_checksum_address(pool_input)
@@ -2577,13 +2568,19 @@ class CreateTab(QWidget):
             token0_is_stable = is_stablecoin(token0_addr)
             token1_is_stable = is_stablecoin(token1_addr)
 
-            # Get current price from slot0
+            # Get current price from slot0 via raw eth_call
+            # (works for both Uniswap V3 and PancakeSwap V3 slot0 formats)
             try:
-                slot0 = pool.functions.slot0().call()
-                sqrt_price_x96 = slot0[0]
-                # Price in pool = token1/token0 (how much token1 for 1 token0)
-                pool_price = (sqrt_price_x96 / (2 ** 96)) ** 2
-                pool_price = pool_price * (10 ** (decimals0 - decimals1))
+                raw_slot0 = w3.eth.call({
+                    'to': pool_address,
+                    'data': bytes.fromhex('3850c7bd')
+                })
+                if len(raw_slot0) >= 32:
+                    sqrt_price_x96 = int.from_bytes(raw_slot0[0:32], 'big')
+                    pool_price = (sqrt_price_x96 / (2 ** 96)) ** 2
+                    pool_price = pool_price * (10 ** (decimals0 - decimals1))
+                else:
+                    pool_price = None
             except Exception:
                 pool_price = None
 
