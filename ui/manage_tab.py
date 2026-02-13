@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QStyledItemDelegate, QCheckBox, QComboBox, QDoubleSpinBox,
     QScrollArea
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QRect, QMutex, QMutexLocker
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QRect, QMutex, QMutexLocker, QTimer
 from PyQt6.QtGui import QFont, QColor, QPainter, QBrush, QPen, QLinearGradient, QPainterPath
 
 import json
@@ -354,70 +354,80 @@ class LoadPositionWorker(QThread):
                 self._load_v4_position()
                 return
 
-            # V3 position loading
-            # Check if we need to use a different position manager for Uniswap V3
-            position_manager = self.provider.position_manager
+            # V3 position loading via multicall (2 RPC instead of ~17)
+            from src.utils import BatchRPC
+
+            # Determine position manager address
+            pm_address = self.provider.position_manager_address
 
             if self.protocol == "v3_uniswap":
-                # Use Uniswap V3 position manager
                 try:
                     chain_id = getattr(self.provider, 'chain_id', 56)
                     if chain_id in V3_DEXES and "uniswap" in V3_DEXES[chain_id]:
                         uniswap_config = V3_DEXES[chain_id]["uniswap"]
-                        position_manager = UniswapV3PositionManager(
-                            self.provider.w3,
-                            uniswap_config.position_manager,
-                            self.provider.account
-                        )
-                        logger.debug(f"[V3 Load] Using Uniswap V3 Position Manager: {uniswap_config.position_manager}")
+                        pm_address = uniswap_config.position_manager
+                        logger.debug(f"[V3 Load] Using Uniswap V3 PM: {pm_address}")
                 except Exception as pm_err:
-                    logger.warning(f"[V3 Load] Error creating Uniswap V3 position manager: {pm_err}")
-                    # Fall back to provider's position manager
+                    logger.warning(f"[V3 Load] Error resolving Uniswap V3 PM: {pm_err}")
 
-            # First check if position exists and is owned by current wallet
+            # Phase 1: ownerOf + positions in one multicall (2 calls → 1 RPC)
+            batch1 = BatchRPC(self.provider.w3)
+            batch1.add_erc721_owner_of(pm_address, self.token_id)
+            batch1.add_v3_position(pm_address, self.token_id)
+            results1 = batch1.execute()
+
+            owner = results1[0]
+            position = results1[1]
+
             if self.check_ownership:
-                owner = position_manager.get_owner_of(self.token_id)
                 if owner is None:
-                    # Position doesn't exist (NFT was burned)
                     self.error.emit(self.token_id, "Position does not exist (NFT burned)")
                     return
-
                 if owner.lower() != self.provider.account.address.lower():
-                    # Position exists but belongs to someone else
                     self.not_owned.emit(self.token_id, owner)
                     return
 
-            position = position_manager.get_position(self.token_id)
+            if position is None:
+                self.error.emit(self.token_id, "Failed to decode position data")
+                return
 
-            # Get current pool price if pool_factory is available
-            current_price = None
+            # Phase 2: pool + token data in one multicall (5-6 calls → 1 RPC)
             if self.pool_factory and position['liquidity'] > 0:
                 try:
-                    # Get pool address for this position
-                    pool_addr = self.pool_factory.get_pool_address(
-                        position['token0'],
-                        position['token1'],
-                        position['fee']
-                    )
-                    if pool_addr:
-                        pool_info = self.pool_factory.get_pool_info(pool_addr)
-                        # Get token decimals
-                        token0_info = self.pool_factory.get_token_info(position['token0'])
-                        token1_info = self.pool_factory.get_token_info(position['token1'])
+                    factory_address = self.pool_factory.factory_address
+                    batch2 = BatchRPC(self.provider.w3)
+                    batch2.add_pool_address(factory_address, position['token0'], position['token1'], position['fee'])
+                    batch2.add_decimals(position['token0'])
+                    batch2.add_decimals(position['token1'])
+                    batch2.add_erc20_symbol(position['token0'])
+                    batch2.add_erc20_symbol(position['token1'])
+                    results2 = batch2.execute()
 
-                        current_price = self.pool_factory.sqrt_price_x96_to_price(
-                            pool_info.sqrt_price_x96,
-                            token0_info.decimals,
-                            token1_info.decimals
-                        )
-                        position['current_price'] = current_price
-                        position['current_tick'] = pool_info.tick
-                        position['token0_symbol'] = token0_info.symbol
-                        position['token1_symbol'] = token1_info.symbol
-                        position['token0_decimals'] = token0_info.decimals
-                        position['token1_decimals'] = token1_info.decimals
+                    pool_addr = results2[0]
+                    dec0 = results2[1] if results2[1] is not None else 18
+                    dec1 = results2[2] if results2[2] is not None else 18
+                    sym0 = results2[3] or '???'
+                    sym1 = results2[4] or '???'
+
+                    position['token0_decimals'] = dec0
+                    position['token1_decimals'] = dec1
+                    position['token0_symbol'] = sym0
+                    position['token1_symbol'] = sym1
+
+                    # Get pool price via separate slot0 call (needs pool_addr from phase 2)
+                    if pool_addr:
+                        batch3 = BatchRPC(self.provider.w3)
+                        batch3.add_pool_slot0(pool_addr)
+                        results3 = batch3.execute()
+                        slot0 = results3[0]
+                        if slot0 and slot0['sqrtPriceX96'] > 0:
+                            current_price = self.pool_factory.sqrt_price_x96_to_price(
+                                slot0['sqrtPriceX96'], dec0, dec1
+                            )
+                            position['current_price'] = current_price
+                            position['current_tick'] = slot0['tick']
                 except Exception as e:
-                    logger.warning(f"Error fetching pool info: {e}")
+                    logger.warning(f"Error fetching pool info via multicall: {e}")
 
             self.position_loaded.emit(self.token_id, position)
 
@@ -1155,10 +1165,21 @@ class ManageTab(QWidget):
         self.positions_data = {}  # token_id -> position data
         self._positions_mutex = QMutex()  # Protects positions_data access
         self.worker = None
-        self.load_workers = []
+        self.load_workers = []  # Legacy compat — now means _active_workers
         self.scan_worker = None
+        self._worker_queue = []  # [(token_id, protocol)] pending work
+        self._active_workers = []  # Currently running workers
+        self.MAX_CONCURRENT_WORKERS = 8
+        # Batch table update state
+        self._pending_updates = {}  # {token_id: position} — accumulated for batch flush
+        self._row_index = {}  # {token_id: row_number} — O(1) row lookup
         self.settings = QSettings("BNBLiquidityLadder", "Positions")
         self.setup_ui()
+        # QTimer for batch table updates (must be created after setup_ui)
+        self._update_timer = QTimer()
+        self._update_timer.setSingleShot(True)
+        self._update_timer.setInterval(200)
+        self._update_timer.timeout.connect(self._flush_table_updates)
         self._load_saved_positions()
 
     def reload_settings(self):
@@ -1574,39 +1595,38 @@ class ManageTab(QWidget):
         self._load_positions_by_ids(token_ids)
 
     def _cancel_load_workers(self):
-        """Cancel all running load workers safely."""
-        if self.load_workers:
-            for w in self.load_workers:
-                # Disconnect all signals to prevent stale callbacks after deletion
-                try:
-                    w.position_loaded.disconnect()
-                    w.error.disconnect()
-                    w.not_owned.disconnect()
-                    w.finished.disconnect()
-                except (TypeError, RuntimeError):
-                    pass
-                if w.isRunning():
-                    w.quit()
-                    w.wait(3000)
-                w.deleteLater()
-            self.load_workers.clear()
+        """Cancel all running load workers and clear queue."""
+        # Clear pending queue first
+        self._worker_queue.clear()
+
+        # Stop active workers
+        for w in self._active_workers:
+            try:
+                w.position_loaded.disconnect()
+                w.error.disconnect()
+                w.not_owned.disconnect()
+                w.finished.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            if w.isRunning():
+                w.quit()
+                w.wait(3000)
+            w.deleteLater()
+        self._active_workers.clear()
+        self.load_workers.clear()  # keep in sync
 
     def _load_positions_by_ids(self, token_ids: list, protocol: str = None, cancel_existing: bool = True):
-        """Load specific positions by their IDs."""
-        # Cancel existing workers to prevent duplicates
+        """Load specific positions by their IDs using a worker queue."""
         if cancel_existing:
             self._cancel_load_workers()
 
         try:
             self.progress_bar.show()
 
-            # Use selected protocol if not specified
             if protocol is None:
                 protocol = self.scan_protocol_combo.currentData()
-
-            # Validate protocol
             if protocol is None:
-                protocol = "v3"  # Default fallback
+                protocol = "v3"
 
             if protocol and protocol.startswith("v4"):
                 protocol_name = "V4 PancakeSwap" if protocol == "v4_pancake" else "V4 Uniswap"
@@ -1616,40 +1636,67 @@ class ManageTab(QWidget):
                 protocol_name = "V3 PancakeSwap"
             self._log(f"Loading {len(token_ids)} {protocol_name} positions...")
 
+            # Queue all work items instead of starting all at once
             for token_id in token_ids:
-                try:
-                    worker = LoadPositionWorker(
-                        self.provider, token_id, self.pool_factory,
-                        check_ownership=True, protocol=protocol
-                    )
-                    worker.position_loaded.connect(self._on_position_loaded, Qt.ConnectionType.QueuedConnection)
-                    worker.error.connect(self._on_position_error, Qt.ConnectionType.QueuedConnection)
-                    worker.not_owned.connect(self._on_position_not_owned, Qt.ConnectionType.QueuedConnection)
-                    worker.finished.connect(lambda w=worker: self._on_worker_finished(w), Qt.ConnectionType.QueuedConnection)
-                    self.load_workers.append(worker)
-                    worker.start()
-                except Exception as worker_err:
-                    self._log(f"❌ Failed to start worker for {token_id}: {worker_err}")
+                self._worker_queue.append((token_id, protocol))
+
+            # Start first batch of workers
+            self._start_next_workers()
         except Exception as e:
             logger.exception(f"Error loading positions: {e}")
             self._log(f"❌ Error loading positions: {e}")
             self.progress_bar.hide()
 
+    def _start_next_workers(self):
+        """Start workers from queue up to MAX_CONCURRENT_WORKERS."""
+        while len(self._active_workers) < self.MAX_CONCURRENT_WORKERS and self._worker_queue:
+            token_id, protocol = self._worker_queue.pop(0)
+            try:
+                worker = LoadPositionWorker(
+                    self.provider, token_id, self.pool_factory,
+                    check_ownership=True, protocol=protocol
+                )
+                worker.position_loaded.connect(self._on_position_loaded, Qt.ConnectionType.QueuedConnection)
+                worker.error.connect(self._on_position_error, Qt.ConnectionType.QueuedConnection)
+                worker.not_owned.connect(self._on_position_not_owned, Qt.ConnectionType.QueuedConnection)
+                worker.finished.connect(lambda w=worker: self._on_worker_finished(w), Qt.ConnectionType.QueuedConnection)
+                self._active_workers.append(worker)
+                self.load_workers.append(worker)  # keep legacy list in sync
+                worker.start()
+            except Exception as worker_err:
+                self._log(f"❌ Failed to start worker for {token_id}: {worker_err}")
+
     def _on_position_loaded(self, token_id: int, position: dict):
-        """Handle position loaded from blockchain."""
+        """Handle position loaded — batch updates via QTimer."""
         try:
             logger.debug(f"_on_position_loaded: token_id={token_id}")
             with QMutexLocker(self._positions_mutex):
                 self.positions_data[token_id] = position
-            self._update_table_row(token_id, position)
-            # NOTE: Don't save here - causes race condition when multiple workers finish
-            # Save is done in _on_worker_finished when ALL workers complete
-            self._update_buttons()
+            # Queue for batch table update instead of immediate update
+            self._pending_updates[token_id] = position
+            if not self._update_timer.isActive():
+                self._update_timer.start()
             protocol = position.get('protocol', 'unknown')
             self._log(f"✅ Loaded position #{token_id} ({protocol})")
         except Exception as e:
             logger.exception(f"Error displaying position {token_id}: {e}")
             self._log(f"❌ Error displaying position {token_id}: {e}")
+
+    def _flush_table_updates(self):
+        """Flush all pending position updates to the table in one batch."""
+        if not self._pending_updates:
+            return
+        updates = dict(self._pending_updates)
+        self._pending_updates.clear()
+
+        # Disable sorting ONCE for the entire batch
+        self.positions_table.setSortingEnabled(False)
+        try:
+            for token_id, position in updates.items():
+                self._update_table_row_inner(token_id, position)
+        finally:
+            self.positions_table.setSortingEnabled(True)
+        self._update_buttons()
 
     def _on_position_error(self, token_id: int, error: str):
         """Handle position load error."""
@@ -1772,24 +1819,30 @@ class ManageTab(QWidget):
     def _rebuild_table(self):
         """Rebuild table with current filter settings."""
         self.positions_table.setRowCount(0)
+        self._row_index.clear()  # Reset row index on full rebuild
         hide_empty = self.hide_empty_cb.isChecked()
 
         shown_count = 0
         hidden_count = 0
 
-        for token_id, position in self.positions_data.items():
-            if position:
-                liquidity = position.get('liquidity', 0)
-                usd_val = position.get('_usd_value')
-                if hide_empty:
-                    if liquidity == 0:
-                        hidden_count += 1
-                        continue
-                    if usd_val is not None and 0 <= usd_val < 0.000001:
-                        hidden_count += 1
-                        continue
-                self._update_table_row(token_id, position)
-                shown_count += 1
+        # Batch all updates: disable sorting once
+        self.positions_table.setSortingEnabled(False)
+        try:
+            for token_id, position in self.positions_data.items():
+                if position:
+                    liquidity = position.get('liquidity', 0)
+                    usd_val = position.get('_usd_value')
+                    if hide_empty:
+                        if liquidity == 0:
+                            hidden_count += 1
+                            continue
+                        if usd_val is not None and 0 <= usd_val < 0.000001:
+                            hidden_count += 1
+                            continue
+                    self._update_table_row_inner(token_id, position)
+                    shown_count += 1
+        finally:
+            self.positions_table.setSortingEnabled(True)
 
         if hidden_count > 0:
             self._log(f"Showing {shown_count} positions ({hidden_count} empty hidden)")
@@ -1859,15 +1912,22 @@ class ManageTab(QWidget):
             )
 
     def _on_worker_finished(self, worker):
-        """Handle worker completion."""
+        """Handle worker completion — start next from queue."""
+        if worker in self._active_workers:
+            self._active_workers.remove(worker)
         if worker in self.load_workers:
             self.load_workers.remove(worker)
-            worker.deleteLater()
+        worker.deleteLater()
 
-        if not self.load_workers:
+        # Start more workers from queue
+        self._start_next_workers()
+
+        # All done when no active workers AND queue is empty
+        if not self._active_workers and not self._worker_queue:
+            # Flush any remaining batched table updates
+            if self._pending_updates:
+                self._flush_table_updates()
             self.progress_bar.hide()
-            # Save all positions ONCE after ALL workers have finished
-            # This prevents race condition when multiple workers complete simultaneously
             self._save_positions()
             self._update_pnl_summary()
             self._log(f"All positions loaded ({len(self.positions_data)} total)")
@@ -1883,28 +1943,44 @@ class ManageTab(QWidget):
 
     def _update_table_row_inner(self, token_id: int, position: dict):
         """Inner implementation of table row update."""
-        # Find existing row or create new
-        row = -1
-        for r in range(self.positions_table.rowCount()):
-            item = self.positions_table.item(r, 0)
+        # O(1) row lookup via index, fallback to O(n) scan if index stale
+        row = self._row_index.get(token_id, -1)
+        if row >= 0 and row < self.positions_table.rowCount():
+            # Verify the row still has our token_id (could be stale after removeRow)
+            item = self.positions_table.item(row, 0)
             if item:
-                # Extract numeric ID from display text (may have protocol prefix)
-                display_text = item.text()
                 try:
-                    # Handle both "V4:12345" and "12345" formats
-                    if ":" in display_text:
-                        existing_id = int(display_text.split(":")[1])
-                    else:
-                        existing_id = int(display_text)
-                    if existing_id == token_id:
-                        row = r
-                        break
+                    txt = item.text()
+                    eid = int(txt.split(":")[1]) if ":" in txt else int(txt)
+                    if eid != token_id:
+                        row = -1  # stale, do full scan
                 except ValueError:
-                    continue
+                    row = -1
+            else:
+                row = -1
+        else:
+            row = -1
+
+        # Fallback: full scan (only when index is stale)
+        if row == -1:
+            for r in range(self.positions_table.rowCount()):
+                item = self.positions_table.item(r, 0)
+                if item:
+                    try:
+                        txt = item.text()
+                        eid = int(txt.split(":")[1]) if ":" in txt else int(txt)
+                        if eid == token_id:
+                            row = r
+                            break
+                    except ValueError:
+                        continue
 
         if row == -1:
             row = self.positions_table.rowCount()
             self.positions_table.insertRow(row)
+
+        # Update row index
+        self._row_index[token_id] = row
 
         # Token ID with protocol prefix
         protocol = position.get('protocol', 'v3')
@@ -2085,6 +2161,10 @@ class ManageTab(QWidget):
                 # Remove the row if it was added
                 if row < self.positions_table.rowCount():
                     self.positions_table.removeRow(row)
+                    # Invalidate row index — rows shifted
+                    self._row_index.pop(token_id, None)
+                    self._row_index = {k: (v if v < row else v - 1)
+                                       for k, v in self._row_index.items()}
                 return
 
         if usd_value >= 0:

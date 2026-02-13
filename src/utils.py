@@ -609,6 +609,103 @@ class BatchRPC:
                 results.append(None)
         return results
 
+    # ── Position loading helpers ──────────────────────────────────────
+
+    def add_erc721_owner_of(self, contract_address: str, token_id: int):
+        """Add ownerOf(token_id) call for ERC721 (position manager)."""
+        # ownerOf(uint256) selector = 0x6352211e
+        call_data = bytes.fromhex('6352211e') + token_id.to_bytes(32, 'big')
+
+        def decode_address(data: bytes):
+            if len(data) >= 32:
+                return Web3.to_checksum_address('0x' + data[12:32].hex())
+            return None
+
+        self.add_call(contract_address, call_data, decode_address)
+
+    def add_v3_position(self, position_manager: str, token_id: int):
+        """Add positions(token_id) call — returns V3 position data tuple."""
+        # positions(uint256) selector = 0x99fbab88
+        call_data = bytes.fromhex('99fbab88') + token_id.to_bytes(32, 'big')
+
+        def decode_position(data: bytes) -> dict:
+            if len(data) < 384:  # 12 fields × 32 bytes
+                return None
+            fields = [int.from_bytes(data[i*32:(i+1)*32], 'big') for i in range(12)]
+            # Decode signed int24 for tick fields (indices 5, 6)
+            for idx in (5, 6):
+                if fields[idx] >= 2**255:
+                    fields[idx] -= 2**256
+            return {
+                'nonce': fields[0],
+                'operator': Web3.to_checksum_address('0x' + data[1*32+12:2*32].hex()),
+                'token0': Web3.to_checksum_address('0x' + data[2*32+12:3*32].hex()),
+                'token1': Web3.to_checksum_address('0x' + data[3*32+12:4*32].hex()),
+                'fee': fields[4],
+                'tick_lower': fields[5],
+                'tick_upper': fields[6],
+                'liquidity': fields[7],
+                'fee_growth_inside0_last_x128': fields[8],
+                'fee_growth_inside1_last_x128': fields[9],
+                'tokens_owed0': fields[10],
+                'tokens_owed1': fields[11],
+            }
+
+        self.add_call(position_manager, call_data, decode_position)
+
+    def add_pool_slot0(self, pool_address: str):
+        """Add slot0() call — raw selector for PancakeSwap V3 compatibility."""
+        # slot0() selector = 0x3850c7bd
+        call_data = bytes.fromhex('3850c7bd')
+
+        def decode_slot0(data: bytes) -> dict:
+            if len(data) < 64:
+                return None
+            sqrt_price_x96 = int.from_bytes(data[0:32], 'big')
+            tick_raw = int.from_bytes(data[32:64], 'big')
+            tick = tick_raw - 2**256 if tick_raw >= 2**255 else tick_raw
+            return {'sqrtPriceX96': sqrt_price_x96, 'tick': tick}
+
+        self.add_call(pool_address, call_data, decode_slot0)
+
+    def add_pool_address(self, factory_address: str, token0: str, token1: str, fee: int):
+        """Add getPool(token0, token1, fee) call to factory."""
+        # getPool(address,address,uint24) selector = 0x1698ee82
+        t0 = bytes.fromhex(Web3.to_checksum_address(token0)[2:]).rjust(32, b'\x00')
+        t1 = bytes.fromhex(Web3.to_checksum_address(token1)[2:]).rjust(32, b'\x00')
+        fee_bytes = fee.to_bytes(32, 'big')
+        call_data = bytes.fromhex('1698ee82') + t0 + t1 + fee_bytes
+
+        def decode_address(data: bytes):
+            if len(data) >= 32:
+                addr = '0x' + data[12:32].hex()
+                if addr == '0x' + '00' * 20:
+                    return None
+                return Web3.to_checksum_address(addr)
+            return None
+
+        self.add_call(factory_address, call_data, decode_address)
+
+    def add_erc20_symbol(self, token_address: str):
+        """Add symbol() call for ERC20."""
+        # symbol() selector = 0x95d89b41
+        call_data = bytes.fromhex('95d89b41')
+
+        def decode_string(data: bytes) -> str:
+            if len(data) < 64:
+                # Try as raw bytes (some tokens return non-standard)
+                return data.rstrip(b'\x00').decode('utf-8', errors='replace') if data else '???'
+            try:
+                offset = int.from_bytes(data[0:32], 'big')
+                length = int.from_bytes(data[offset:offset+32], 'big')
+                return data[offset+32:offset+32+length].decode('utf-8', errors='replace')
+            except Exception:
+                return '???'
+
+        self.add_call(token_address, call_data, decode_string)
+
+    # ── End position loading helpers ──────────────────────────────────
+
     def clear(self):
         """Clear all pending calls."""
         self._calls.clear()

@@ -47,6 +47,280 @@ def _format_price(price: float) -> str:
         return f"{price:.12f}".rstrip('0').rstrip('.')
 
 
+class LoadPoolWorker(QThread):
+    """Worker thread for loading pool info without blocking UI."""
+
+    pool_loaded = pyqtSignal(dict)    # result data dict
+    progress = pyqtSignal(str)        # log messages
+    error = pyqtSignal(str)           # error message
+
+    def __init__(self, rpc_url, pool_input, chain_id, proxy=None,
+                 existing_token0=None, existing_token1=None):
+        super().__init__()
+        self.rpc_url = rpc_url
+        self.pool_input = pool_input
+        self.chain_id = chain_id
+        self.proxy = proxy
+        self.existing_token0 = existing_token0  # For V4 fallback when no subgraph
+        self.existing_token1 = existing_token1
+
+    def run(self):
+        try:
+            from web3 import Web3
+            import math
+
+            if self.proxy:
+                w3 = Web3(Web3.HTTPProvider(endpoint_uri=self.rpc_url, request_kwargs={"proxies": self.proxy}))
+            else:
+                w3 = Web3(Web3.HTTPProvider(self.rpc_url))
+
+            result = {'success': True}
+            is_v4 = len(self.pool_input) == 66
+            result['is_v4'] = is_v4
+
+            if is_v4:
+                self._load_v4(w3, result)
+            else:
+                self._load_v3(w3, result)
+
+            self.pool_loaded.emit(result)
+        except Exception as e:
+            import traceback
+            self.progress.emit(f"Failed to load pool: {e}")
+            self.error.emit(str(e))
+
+    def _load_v3(self, w3, result):
+        """Load V3 pool data (runs in worker thread)."""
+        from web3 import Web3
+
+        pool_address = Web3.to_checksum_address(self.pool_input)
+        result['pool_address'] = pool_address
+
+        # Detect DEX
+        detected_dex = None
+        try:
+            from config import detect_v3_dex_by_pool
+            detected_dex = detect_v3_dex_by_pool(w3, pool_address, self.chain_id)
+            result['detected_dex'] = detected_dex
+            self.progress.emit(f"Detected V3 DEX: {detected_dex.name}")
+        except Exception as e:
+            self.progress.emit(f"Could not detect V3 DEX: {e}")
+            result['detected_dex'] = None
+
+        # Use BatchRPC for all pool data in one multicall
+        from src.utils import BatchRPC
+
+        pool_abi = [
+            {"inputs": [], "name": "token0", "outputs": [{"type": "address"}], "stateMutability": "view", "type": "function"},
+            {"inputs": [], "name": "token1", "outputs": [{"type": "address"}], "stateMutability": "view", "type": "function"},
+            {"inputs": [], "name": "fee", "outputs": [{"type": "uint24"}], "stateMutability": "view", "type": "function"},
+        ]
+        pool = w3.eth.contract(address=pool_address, abi=pool_abi)
+
+        # Phase 1: pool token0/1/fee + slot0 in one multicall
+        batch = BatchRPC(w3)
+        # Encode token0(), token1(), fee() calls manually
+        batch.add_call(pool_address, bytes.fromhex('0dfe1681'),  # token0()
+                       lambda d: Web3.to_checksum_address('0x' + d[12:32].hex()) if len(d) >= 32 else None)
+        batch.add_call(pool_address, bytes.fromhex('d21220a7'),  # token1()
+                       lambda d: Web3.to_checksum_address('0x' + d[12:32].hex()) if len(d) >= 32 else None)
+        batch.add_call(pool_address, bytes.fromhex('ddca3f43'),  # fee()
+                       lambda d: int.from_bytes(d[:32], 'big') if len(d) >= 32 else None)
+        batch.add_pool_slot0(pool_address)
+        results1 = batch.execute()
+
+        token0_addr = results1[0]
+        token1_addr = results1[1]
+        fee = results1[2]
+        slot0 = results1[3]
+
+        if not token0_addr or not token1_addr:
+            raise Exception("Failed to read pool token addresses")
+
+        # Phase 2: token info in one multicall
+        batch2 = BatchRPC(w3)
+        batch2.add_erc20_symbol(token0_addr)
+        batch2.add_erc20_symbol(token1_addr)
+        batch2.add_decimals(token0_addr)
+        batch2.add_decimals(token1_addr)
+        results2 = batch2.execute()
+
+        token0_symbol = results2[0] or '???'
+        token1_symbol = results2[1] or '???'
+        decimals0 = results2[2] if results2[2] is not None else 18
+        decimals1 = results2[3] if results2[3] is not None else 18
+
+        # Calculate pool price
+        pool_price = None
+        if slot0 and slot0['sqrtPriceX96'] > 0:
+            sqrt_price_x96 = slot0['sqrtPriceX96']
+            pool_price = (sqrt_price_x96 / (2 ** 96)) ** 2
+            pool_price = pool_price * (10 ** (decimals0 - decimals1))
+
+        # Determine stablecoin ordering
+        token0_is_stable = is_stablecoin(token0_addr)
+        token1_is_stable = is_stablecoin(token1_addr)
+
+        if token0_is_stable and not token1_is_stable:
+            # Swap: volatile → token0 field, stablecoin → token1 field
+            result['ui_token0'] = token1_addr
+            result['ui_token1'] = token0_addr
+            result['ui_dec0'] = decimals1
+            result['ui_dec1'] = decimals0
+            display_price = (1 / pool_price) if pool_price and pool_price > 0 else None
+            result['display_pair'] = f"{token1_symbol}/{token0_symbol}"
+            self.progress.emit(f"Swapped order: {token0_symbol} is stablecoin")
+        else:
+            result['ui_token0'] = token0_addr
+            result['ui_token1'] = token1_addr
+            result['ui_dec0'] = decimals0
+            result['ui_dec1'] = decimals1
+            display_price = pool_price
+            result['display_pair'] = f"{token0_symbol}/{token1_symbol}"
+
+        result['display_price'] = display_price
+        result['fee'] = fee
+        result['token0_addr'] = token0_addr
+        result['token1_addr'] = token1_addr
+        result['token0_symbol'] = token0_symbol
+        result['token1_symbol'] = token1_symbol
+        result['decimals0'] = decimals0
+        result['decimals1'] = decimals1
+
+        self.progress.emit(f"Loaded pool: {result['display_pair']}, fee={fee/10000}%")
+
+    def _load_v4(self, w3, result):
+        """Load V4 pool data (runs in worker thread)."""
+        from src.contracts.v4.pool_manager import V4PoolManager
+        from src.contracts.v4.constants import V4Protocol
+
+        pool_id_bytes = bytes.fromhex(self.pool_input[2:])
+        result['pool_id_bytes'] = pool_id_bytes
+        self.progress.emit(f"Looking for V4 pool ID: {self.pool_input}")
+
+        pool_found = False
+        errors = []
+        for protocol, protocol_name in [(V4Protocol.UNISWAP, "Uniswap V4"), (V4Protocol.PANCAKESWAP, "PancakeSwap V4")]:
+            try:
+                pool_manager = V4PoolManager(w3, protocol=protocol, chain_id=self.chain_id)
+                self.progress.emit(f"Checking {protocol_name}...")
+                state = pool_manager.get_pool_state_by_id(pool_id_bytes)
+
+                if state.initialized:
+                    pool_found = True
+                    result['v4_protocol'] = protocol
+                    result['v4_protocol_name'] = protocol_name
+                    result['v4_fee'] = state.lp_fee
+                    result['v4_tick'] = state.tick
+                    result['v4_sqrt_price_x96'] = state.sqrt_price_x96
+
+                    # Try subgraph
+                    subgraph_info = None
+                    try:
+                        self.progress.emit("Querying subgraph for token addresses...")
+                        subgraph_info = query_v4_subgraph(self.pool_input, w3=w3, chain_id=self.chain_id)
+                    except Exception as e:
+                        self.progress.emit(f"Subgraph error: {e}")
+
+                    if subgraph_info:
+                        result['subgraph'] = subgraph_info
+                        result['ui_token0'] = subgraph_info.token0_address
+                        result['ui_token1'] = subgraph_info.token1_address
+                        result['ui_dec0'] = subgraph_info.token0_decimals
+                        result['ui_dec1'] = subgraph_info.token1_decimals
+                        result['tick_spacing'] = subgraph_info.tick_spacing
+
+                        # Calculate price from tick
+                        import math
+                        price_from_tick = 1.0001 ** state.tick
+                        price_adjusted = price_from_tick * (10 ** (subgraph_info.token0_decimals - subgraph_info.token1_decimals))
+
+                        t0_is_stable = is_stablecoin(subgraph_info.token0_address)
+                        t1_is_stable = is_stablecoin(subgraph_info.token1_address)
+
+                        if t0_is_stable and not t1_is_stable:
+                            display_price = (1 / price_adjusted) if price_adjusted > 0 else price_adjusted
+                        else:
+                            display_price = price_adjusted
+
+                        result['display_price'] = display_price
+                    else:
+                        # No subgraph — try user-entered token addresses
+                        result['subgraph'] = None
+                        self._load_v4_token_info_fallback(w3, result, state)
+
+                    self.progress.emit(f"V4 pool found on {protocol_name}")
+                    break
+            except Exception as e:
+                errors.append(f"{protocol_name}: {str(e)[:100]}")
+                self.progress.emit(f"Error checking {protocol_name}: {e}")
+                continue
+
+        if not pool_found:
+            # Fallback: try subgraph only
+            self.progress.emit("On-chain query failed, trying subgraph...")
+            try:
+                subgraph_info = query_v4_subgraph(self.pool_input, w3=w3, chain_id=self.chain_id)
+                if subgraph_info:
+                    result['v4_protocol'] = V4Protocol.UNISWAP
+                    result['v4_protocol_name'] = 'Subgraph'
+                    result['subgraph'] = subgraph_info
+                    result['ui_token0'] = subgraph_info.token0_address
+                    result['ui_token1'] = subgraph_info.token1_address
+                    result['ui_dec0'] = subgraph_info.token0_decimals
+                    result['ui_dec1'] = subgraph_info.token1_decimals
+                    result['tick_spacing'] = subgraph_info.tick_spacing
+                    result['v4_fee'] = subgraph_info.fee_tier
+                    result['pool_id_bytes'] = pool_id_bytes
+                    pool_found = True
+                    self.progress.emit(f"Found via subgraph: {subgraph_info.token0_symbol}/{subgraph_info.token1_symbol}")
+            except Exception as e:
+                self.progress.emit(f"Subgraph fallback error: {e}")
+
+        result['pool_found'] = pool_found
+        if not pool_found:
+            result['errors'] = errors
+
+    def _load_v4_token_info_fallback(self, w3, result, state):
+        """V4 fallback: get token info from user-entered addresses."""
+        from src.utils import BatchRPC
+
+        token0_addr = self.existing_token0
+        token1_addr = self.existing_token1
+
+        if token0_addr and token0_addr.startswith("0x") and len(token0_addr) == 42 and \
+           token1_addr and token1_addr.startswith("0x") and len(token1_addr) == 42:
+            batch = BatchRPC(w3)
+            batch.add_erc20_symbol(token0_addr)
+            batch.add_erc20_symbol(token1_addr)
+            batch.add_decimals(token0_addr)
+            batch.add_decimals(token1_addr)
+            results = batch.execute()
+
+            sym0 = results[0] or '???'
+            sym1 = results[1] or '???'
+            dec0 = results[2] if results[2] is not None else 18
+            dec1 = results[3] if results[3] is not None else 18
+
+            result['ui_dec0'] = dec0
+            result['ui_dec1'] = dec1
+            result['token0_symbol'] = sym0
+            result['token1_symbol'] = sym1
+
+            # Calculate price
+            sqrt_price = state.sqrt_price_x96 / (2 ** 96)
+            raw_price = sqrt_price ** 2
+            price_adjusted = raw_price * (10 ** (dec0 - dec1))
+
+            t0_is_stable = is_stablecoin(token0_addr)
+            if t0_is_stable:
+                result['display_price'] = (1 / price_adjusted) if price_adjusted > 0 else price_adjusted
+            else:
+                result['display_price'] = price_adjusted
+
+            self.progress.emit(f"Token info from addresses: {sym0}/{sym1}")
+
+
 class CreateLadderWorkerV4(QThread):
     """Worker thread for V4 blockchain operations."""
 
@@ -76,6 +350,26 @@ class CreateLadderWorkerV4(QThread):
                 chain_id=self.chain_id,
                 proxy=self.proxy
             )
+
+            # Auto-detect decimals if still default (18) - moved from UI thread
+            if self.config.token0_decimals == 18 or self.config.token1_decimals == 18:
+                self.progress.emit("Auto-detecting token decimals...")
+                erc20_abi = [{"inputs": [], "name": "decimals", "outputs": [{"type": "uint8"}], "stateMutability": "view", "type": "function"}]
+                w3 = provider.w3
+                if self.config.token0_decimals == 18:
+                    try:
+                        t0c = w3.eth.contract(address=w3.to_checksum_address(self.config.token0), abi=erc20_abi)
+                        self.config.token0_decimals = t0c.functions.decimals().call()
+                        self.progress.emit(f"Token0 decimals: {self.config.token0_decimals}")
+                    except Exception as e:
+                        self.progress.emit(f"Could not detect token0 decimals: {e}")
+                if self.config.token1_decimals == 18:
+                    try:
+                        t1c = w3.eth.contract(address=w3.to_checksum_address(self.config.token1), abi=erc20_abi)
+                        self.config.token1_decimals = t1c.functions.decimals().call()
+                        self.progress.emit(f"Token1 decimals: {self.config.token1_decimals}")
+                    except Exception as e:
+                        self.progress.emit(f"Could not detect token1 decimals: {e}")
 
             self.progress.emit(f"Using custom fee: {self.config.fee_percent}%")
 
@@ -138,6 +432,26 @@ class CreateLadderWorker(QThread):
 
     def run(self):
         try:
+            # Auto-detect decimals if still default (18) - moved from UI thread
+            if self.config.token0_decimals == 18 or self.config.token1_decimals == 18:
+                self.progress.emit("Auto-detecting token decimals...")
+                erc20_abi = [{"inputs": [], "name": "decimals", "outputs": [{"type": "uint8"}], "stateMutability": "view", "type": "function"}]
+                w3 = self.provider.w3
+                if self.config.token0_decimals == 18:
+                    try:
+                        t0c = w3.eth.contract(address=w3.to_checksum_address(self.config.token0), abi=erc20_abi)
+                        self.config.token0_decimals = t0c.functions.decimals().call()
+                        self.progress.emit(f"Token0 decimals: {self.config.token0_decimals}")
+                    except Exception as e:
+                        self.progress.emit(f"Could not detect token0 decimals: {e}")
+                if self.config.token1_decimals == 18:
+                    try:
+                        t1c = w3.eth.contract(address=w3.to_checksum_address(self.config.token1), abi=erc20_abi)
+                        self.config.token1_decimals = t1c.functions.decimals().call()
+                        self.progress.emit(f"Token1 decimals: {self.config.token1_decimals}")
+                    except Exception as e:
+                        self.progress.emit(f"Could not detect token1 decimals: {e}")
+
             # Check if pool exists
             self.progress.emit("Checking if pool exists...")
 
@@ -1530,36 +1844,6 @@ class CreateTab(QWidget):
             else:
                 tick_spacing = self.tick_spacing_spin.value()
 
-            # Auto-detect decimals if still default (18) - important for Base USDC (6 decimals)
-            if self._token0_decimals == 18 or self._token1_decimals == 18:
-                try:
-                    from web3 import Web3
-                    rpc_url = self.rpc_input.text().strip()
-                    proxy = self._get_proxy_config()
-                    if proxy:
-                        w3 = Web3(Web3.HTTPProvider(endpoint_uri=rpc_url, request_kwargs={"proxies": proxy}))
-                    else:
-                        w3 = Web3(Web3.HTTPProvider(rpc_url))
-                    erc20_abi = [{"inputs": [], "name": "decimals", "outputs": [{"type": "uint8"}], "stateMutability": "view", "type": "function"}]
-
-                    if self._token0_decimals == 18:
-                        try:
-                            t0_contract = w3.eth.contract(address=Web3.to_checksum_address(token0), abi=erc20_abi)
-                            self._token0_decimals = t0_contract.functions.decimals().call()
-                            self._log(f"Auto-detected token0 decimals: {self._token0_decimals}")
-                        except Exception as e:
-                            self._log(f"Could not detect token0 decimals: {e}")
-
-                    if self._token1_decimals == 18:
-                        try:
-                            t1_contract = w3.eth.contract(address=Web3.to_checksum_address(token1), abi=erc20_abi)
-                            self._token1_decimals = t1_contract.functions.decimals().call()
-                            self._log(f"Auto-detected token1 decimals: {self._token1_decimals}")
-                        except Exception as e:
-                            self._log(f"Could not detect token1 decimals: {e}")
-                except Exception as e:
-                    self._log(f"Decimals auto-detection failed: {e}")
-
             # Auto-detect invert_price based on stablecoin position
             # Pool price in Uniswap = token1/token0
             # If stablecoin is token1: pool price = stablecoin/token = price in USD → NO inversion
@@ -1700,36 +1984,6 @@ class CreateTab(QWidget):
                     self.preview_btn.setEnabled(True)
                     QMessageBox.critical(self, "Error", f"Failed to create V3 provider: {e}")
                     return
-
-            # Auto-detect decimals for V3 if still default (important for Base USDC 6 dec)
-            if self._token0_decimals == 18 or self._token1_decimals == 18:
-                try:
-                    from web3 import Web3 as Web3Check
-                    rpc_url = self.rpc_input.text().strip()
-                    proxy = self._get_proxy_config()
-                    if proxy:
-                        w3_check = Web3Check(Web3Check.HTTPProvider(endpoint_uri=rpc_url, request_kwargs={"proxies": proxy}))
-                    else:
-                        w3_check = Web3Check(Web3Check.HTTPProvider(rpc_url))
-                    erc20_dec_abi = [{"inputs": [], "name": "decimals", "outputs": [{"type": "uint8"}], "stateMutability": "view", "type": "function"}]
-
-                    if self._token0_decimals == 18:
-                        try:
-                            t0c = w3_check.eth.contract(address=Web3Check.to_checksum_address(token0), abi=erc20_dec_abi)
-                            self._token0_decimals = t0c.functions.decimals().call()
-                            self._log(f"V3 auto-detected token0 decimals: {self._token0_decimals}")
-                        except Exception as e:
-                            self._log(f"Could not detect V3 token0 decimals: {e}")
-
-                    if self._token1_decimals == 18:
-                        try:
-                            t1c = w3_check.eth.contract(address=Web3Check.to_checksum_address(token1), abi=erc20_dec_abi)
-                            self._token1_decimals = t1c.functions.decimals().call()
-                            self._log(f"V3 auto-detected token1 decimals: {self._token1_decimals}")
-                        except Exception as e:
-                            self._log(f"Could not detect V3 token1 decimals: {e}")
-                except Exception as e:
-                    self._log(f"V3 decimals auto-detection failed: {e}")
 
             config = LiquidityLadderConfig(
                 current_price=upper_price,
@@ -2142,529 +2396,175 @@ class CreateTab(QWidget):
         self.save_wallet_cb.setChecked(False)
 
     def _load_pool_info(self):
-        """Load pool information from pool address (V3) or pool ID (V4)."""
-        # Reset previous pool state before loading new pool
+        """Load pool info via worker thread (non-blocking)."""
         self._reset_pool_state()
 
         pool_input = self.pool_input.text().strip()
-        network = self._get_current_network()  # Get current network for chain_id
-        self._log(f"Load button clicked. Input: '{pool_input}' (len={len(pool_input)}) Network: {network.chain_id}")
+        network = self._get_current_network()
+        self._log(f"Load button clicked. Input: '{pool_input}' Network: {network.chain_id}")
 
         if not pool_input:
             QMessageBox.warning(self, "Error", "Please enter a pool address or ID.")
             return
-
         if not pool_input.startswith("0x"):
-            self._log(f"Error: Input doesn't start with 0x")
-            QMessageBox.warning(self, "Error", f"Invalid format. Must start with 0x\nYour input: {pool_input[:20]}...")
+            QMessageBox.warning(self, "Error", f"Invalid format. Must start with 0x")
             return
 
-        # Determine if V3 pool (42 chars) or V4 pool ID (66 chars)
-        is_v4_pool = len(pool_input) == 66
-        is_v3_pool = len(pool_input) == 42
-
-        self._log(f"Input length: {len(pool_input)}, is_v3={is_v3_pool}, is_v4={is_v4_pool}")
-
-        if not is_v3_pool and not is_v4_pool:
-            QMessageBox.warning(
-                self, "Error",
+        is_v4 = len(pool_input) == 66
+        is_v3 = len(pool_input) == 42
+        if not is_v3 and not is_v4:
+            QMessageBox.warning(self, "Error",
                 f"Invalid format (length={len(pool_input)}).\n\n"
                 "V3 Pool: 42 characters (0x + 40 hex)\n"
-                "V4 Pool ID: 66 characters (0x + 64 hex)"
-            )
+                "V4 Pool ID: 66 characters (0x + 64 hex)")
             return
 
-        try:
-            from web3 import Web3
+        # Disable button while loading
+        self.load_pool_btn.setEnabled(False)
+        self.pool_info_label.setText("Loading pool...")
+        self.pool_info_label.setStyleSheet("color: #fdcb6e;")
 
-            # Connect to RPC
-            rpc_url = self.rpc_input.text().strip()
-            if not rpc_url:
-                rpc_url = BNB_CHAIN.rpc_url
+        rpc_url = self.rpc_input.text().strip() or BNB_CHAIN.rpc_url
+        proxy = self._get_proxy_config()
 
-            # Create provider with proxy support
-            proxy = self._get_proxy_config()
-            if proxy:
-                w3 = Web3(Web3.HTTPProvider(endpoint_uri=rpc_url, request_kwargs={"proxies": proxy}))
+        # Existing token inputs for V4 fallback
+        existing_t0 = self.token0_input.text().strip()
+        existing_t1 = self.token1_input.text().strip()
+
+        self._load_pool_worker = LoadPoolWorker(
+            rpc_url, pool_input, network.chain_id, proxy,
+            existing_token0=existing_t0, existing_token1=existing_t1
+        )
+        self._load_pool_worker.pool_loaded.connect(self._on_pool_data_loaded)
+        self._load_pool_worker.progress.connect(self._log)
+        self._load_pool_worker.error.connect(self._on_pool_load_error)
+        self._load_pool_worker.finished.connect(lambda: self.load_pool_btn.setEnabled(True))
+        self._load_pool_worker.start()
+
+    def _on_pool_load_error(self, error_msg):
+        """Handle pool loading error."""
+        self.pool_info_label.setText(f"Error: {error_msg[:100]}")
+        self.pool_info_label.setStyleSheet("color: #e94560;")
+
+    def _on_pool_data_loaded(self, data: dict):
+        """Apply loaded pool data to UI (runs on main thread)."""
+        from src.contracts.v4.constants import V4Protocol
+
+        is_v4 = data.get('is_v4', False)
+        network = self._get_current_network()
+
+        if is_v4:
+            # ── V4 pool results ──
+            pool_id_bytes = data.get('pool_id_bytes')
+            pool_found = data.get('pool_found', False)
+
+            if pool_found:
+                v4_fee = data.get('v4_fee', 0)
+                fee_percent = v4_fee / 10000
+                protocol_name = data.get('v4_protocol_name', 'V4')
+                v4_protocol = data.get('v4_protocol')
+
+                self._loaded_pool_fee = v4_fee
+                self._loaded_pool_id_bytes = pool_id_bytes
+                self.loaded_v4_pool_id = pool_id_bytes
+
+                subgraph = data.get('subgraph')
+                if subgraph:
+                    self.token0_input.setText(subgraph.token0_address)
+                    self.token1_input.setText(subgraph.token1_address)
+                    self.tick_spacing_spin.setValue(subgraph.tick_spacing)
+                    self.tick_spacing_auto_cb.setChecked(False)
+                    self.tick_spacing_spin.setEnabled(True)
+                    self._token0_decimals = subgraph.token0_decimals
+                    self._token1_decimals = subgraph.token1_decimals
+                elif 'ui_dec0' in data:
+                    self._token0_decimals = data['ui_dec0']
+                    self._token1_decimals = data['ui_dec1']
+
+                # Set price
+                display_price = data.get('display_price')
+                if display_price:
+                    self.price_input.setText(_format_price(display_price))
+
+                # Set fee
+                self.custom_fee_spin.setValue(fee_percent)
+
+                # Set protocol combo
+                if v4_protocol == V4Protocol.UNISWAP:
+                    self.protocol_combo.setCurrentIndex(3)
+                else:
+                    self.protocol_combo.setCurrentIndex(1)
+
+                # Build info label
+                if subgraph:
+                    price_str = self.price_input.text() or "N/A"
+                    tick = data.get('v4_tick', '?')
+                    ts = data.get('tick_spacing', subgraph.tick_spacing if subgraph else '?')
+                    self.pool_info_label.setText(
+                        f"✅ V4 Pool found on {protocol_name}!\n"
+                        f"Tokens: {subgraph.token0_symbol}/{subgraph.token1_symbol}\n"
+                        f"Fee: {fee_percent}% | TickSpacing: {ts} | Tick: {tick}\n"
+                        f"Price: {price_str} | Token addresses auto-filled!"
+                    )
+                else:
+                    self.pool_info_label.setText(f"✅ V4 Pool found on {protocol_name}!\nFee: {fee_percent}%")
+                self.pool_info_label.setStyleSheet("color: #00b894;")
             else:
-                w3 = Web3(Web3.HTTPProvider(rpc_url))
+                # Not found
+                self.pool_info_label.setText("V4 pool ID not found on-chain or in subgraph.\nEnter token addresses manually.")
+                self.pool_info_label.setStyleSheet("color: #fdcb6e;")
+                self.loaded_v4_pool_id = None
 
-            # ERC20 ABI for token symbols
-            erc20_abi = [
-                {"inputs": [], "name": "symbol", "outputs": [{"type": "string"}], "stateMutability": "view", "type": "function"},
-                {"inputs": [], "name": "decimals", "outputs": [{"type": "uint8"}], "stateMutability": "view", "type": "function"},
-            ]
+                # Switch to V4 mode
+                idx = self.protocol_combo.currentIndex()
+                if idx == 0:
+                    self.protocol_combo.setCurrentIndex(1)
+                elif idx == 2:
+                    self.protocol_combo.setCurrentIndex(3)
 
-            if is_v4_pool:
-                # V4 pool ID - try to query pool state from PoolManager
-                from src.contracts.v4.pool_manager import V4PoolManager
-                from src.contracts.v4.constants import V4Protocol
-
-                # Convert hex string to bytes
-                pool_id_bytes = bytes.fromhex(pool_input[2:])
-                self._log(f"Looking for V4 pool ID: {pool_input}")
-                self._log(f"Pool ID bytes length: {len(pool_id_bytes)}")
-
-                # Try both Uniswap V4 and PancakeSwap V4
-                pool_found = False
-                errors = []
-                for protocol, protocol_name in [(V4Protocol.UNISWAP, "Uniswap V4"), (V4Protocol.PANCAKESWAP, "PancakeSwap V4")]:
-                    try:
-                        pool_manager = V4PoolManager(w3, protocol=protocol, chain_id=network.chain_id)
-                        self._log(f"Checking {protocol_name} PoolManager: {pool_manager.pool_manager_address}")
-                        if pool_manager.state_view_address:
-                            self._log(f"  Using StateView: {pool_manager.state_view_address}")
-
-                        state = pool_manager.get_pool_state_by_id(pool_id_bytes)
-                        self._log(f"{protocol_name}: sqrtPrice={state.sqrt_price_x96}, tick={state.tick}, liq={state.liquidity}")
-
-                        if state.initialized:
-                            # Pool exists!
-                            pool_found = True
-                            fee_percent = state.lp_fee / 10000
-
-                            # Calculate raw price from sqrtPriceX96
-                            # Note: actual price depends on token decimals
-                            sqrt_price = state.sqrt_price_x96 / (2 ** 96)
-                            raw_price = sqrt_price ** 2
-
-                            # Get tick spacing from the pool (need to query or estimate)
-                            # For now, suggest based on fee
-                            suggested_tick_spacing = self._suggest_tick_spacing(fee_percent)
-
-                            # Store pool info for later tick_spacing detection
-                            self._loaded_pool_fee = state.lp_fee  # V4 format (40000 = 4%)
-                            self._loaded_pool_id_bytes = pool_id_bytes
-                            self.loaded_v4_pool_id = pool_id_bytes  # Also store for config
-
-                            # Try to get token addresses from subgraph or blockchain events
-                            subgraph_info = None
-                            tokens_found = False
-                            try:
-                                self._log("Querying V4 subgraph/events for token addresses...")
-                                subgraph_info = query_v4_subgraph(pool_input, w3=w3, chain_id=network.chain_id)
-                                if subgraph_info:
-                                    tokens_found = True
-                                    self._log(f"Subgraph: {subgraph_info.token0_symbol}/{subgraph_info.token1_symbol}")
-                                    self._log(f"  Token0: {subgraph_info.token0_address}")
-                                    self._log(f"  Token1: {subgraph_info.token1_address}")
-                                    self._log(f"  TickSpacing: {subgraph_info.tick_spacing}")
-
-                                    # Auto-populate token addresses
-                                    self.token0_input.setText(subgraph_info.token0_address)
-                                    self.token1_input.setText(subgraph_info.token1_address)
-
-                                    # Set tick spacing (disable auto to use exact value from API)
-                                    self.tick_spacing_spin.setValue(subgraph_info.tick_spacing)
-                                    self.tick_spacing_auto_cb.setChecked(False)
-                                    self.tick_spacing_spin.setEnabled(True)
-
-                                    # Store decimals for price calculation
-                                    self._token0_decimals = subgraph_info.token0_decimals
-                                    self._token1_decimals = subgraph_info.token1_decimals
-                                else:
-                                    self._log("Subgraph: Pool not found in indexed data")
-                            except Exception as e:
-                                self._log(f"Subgraph query error: {e}")
-
-                            # Calculate and set price if we have token decimals
-                            if tokens_found and state.tick != 0:
-                                # Calculate price from TICK (more reliable than sqrtPriceX96)
-                                # price = 1.0001^tick gives token1/token0 ratio
-                                import math
-                                price_from_tick = 1.0001 ** state.tick
-
-                                # Adjust for decimals: multiply by 10^(dec0-dec1)
-                                dec0 = subgraph_info.token0_decimals
-                                dec1 = subgraph_info.token1_decimals
-                                price_adjusted = price_from_tick * (10 ** (dec0 - dec1))
-
-                                self._log(f"Price calc: tick={state.tick}, raw={price_from_tick:.6f}, dec0={dec0}, dec1={dec1}")
-                                self._log(f"Price adjusted: {self._format_price(price_adjusted)}")
-
-                                # Check if token0 is stablecoin (need to invert) — by address
-                                t0_is_stable = is_stablecoin(subgraph_info.token0_address) if hasattr(subgraph_info, 'token0_address') else False
-                                t1_is_stable = is_stablecoin(subgraph_info.token1_address) if hasattr(subgraph_info, 'token1_address') else False
-                                t0_sym = subgraph_info.token0_symbol.upper()
-                                t1_sym = subgraph_info.token1_symbol.upper()
-
-                                self._log(f"Tokens: {t0_sym} (stable={t0_is_stable}) / {t1_sym} (stable={t1_is_stable})")
-
-                                if t0_is_stable and not t1_is_stable:
-                                    # Pool is STABLE/VOLATILE (e.g. USDT/BULLA)
-                                    # price_adjusted = BULLA per 1 USDT
-                                    # We want: USD price of BULLA = 1/price_adjusted
-                                    if price_adjusted > 0:
-                                        display_price = 1 / price_adjusted
-                                    else:
-                                        display_price = price_adjusted
-                                    self._log(f"Inverted (token0 is stable): 1/{price_adjusted:.6f} = {self._format_price(display_price)}")
-                                elif t1_is_stable and not t0_is_stable:
-                                    # Pool is VOLATILE/STABLE (e.g. BULLA/USDT)
-                                    # price_adjusted = USDT per 1 BULLA = USD price directly
-                                    display_price = price_adjusted
-                                    self._log(f"Direct (token1 is stable): {self._format_price(display_price)}")
-                                else:
-                                    # Neither or both are stablecoins - just show raw
-                                    display_price = price_adjusted
-                                    self._log(f"Raw price (no stable): {self._format_price(display_price)}")
-
-                                self.price_input.setText(self._format_price(display_price))
-                                self._log(f"Final price: {self._format_price(display_price)} USD per {t1_sym if t0_is_stable else t0_sym}")
-
-                            # Build info message
-                            if tokens_found:
-                                price_str = self.price_input.text() if self.price_input.text() else "N/A"
-                                self.pool_info_label.setText(
-                                    f"✅ V4 Pool found on {protocol_name}!\n"
-                                    f"Tokens: {subgraph_info.token0_symbol}/{subgraph_info.token1_symbol}\n"
-                                    f"Fee: {fee_percent}% | TickSpacing: {subgraph_info.tick_spacing} | Tick: {state.tick}\n"
-                                    f"Price: {price_str} | Token addresses auto-filled!"
-                                )
-                            else:
-                                # No subgraph - try to get token info from user inputs
-                                token0_addr = self.token0_input.text().strip()
-                                token1_addr = self.token1_input.text().strip()
-
-                                token0_sym = "Token0"
-                                token1_sym = "Token1"
-                                token0_dec = 18
-                                token1_dec = 18
-
-                                # Try to get decimals and symbols from entered addresses
-                                erc20_abi = [
-                                    {"inputs": [], "name": "symbol", "outputs": [{"type": "string"}], "stateMutability": "view", "type": "function"},
-                                    {"inputs": [], "name": "decimals", "outputs": [{"type": "uint8"}], "stateMutability": "view", "type": "function"},
-                                ]
-
-                                if token0_addr and token0_addr.startswith("0x") and len(token0_addr) == 42:
-                                    try:
-                                        t0_contract = w3.eth.contract(address=Web3.to_checksum_address(token0_addr), abi=erc20_abi)
-                                        token0_sym = t0_contract.functions.symbol().call()
-                                        token0_dec = t0_contract.functions.decimals().call()
-                                        self._log(f"Token0: {token0_sym}, decimals={token0_dec}")
-                                    except Exception as e:
-                                        self._log(f"Could not get token0 info: {e}")
-
-                                if token1_addr and token1_addr.startswith("0x") and len(token1_addr) == 42:
-                                    try:
-                                        t1_contract = w3.eth.contract(address=Web3.to_checksum_address(token1_addr), abi=erc20_abi)
-                                        token1_sym = t1_contract.functions.symbol().call()
-                                        token1_dec = t1_contract.functions.decimals().call()
-                                        self._log(f"Token1: {token1_sym}, decimals={token1_dec}")
-                                    except Exception as e:
-                                        self._log(f"Could not get token1 info: {e}")
-
-                                # Store decimals
-                                self._token0_decimals = token0_dec
-                                self._token1_decimals = token1_dec
-
-                                # Calculate price with proper decimals
-                                # raw_price = token1/token0 in smallest units
-                                # price_adjusted = raw_price * 10^(decimals0 - decimals1)
-                                price_adjusted = raw_price * (10 ** (token0_dec - token1_dec))
-
-                                # Determine if we need to invert — by address
-                                token0_is_stable = is_stablecoin(token0_addr) if token0_addr else False
-                                token1_is_stable = is_stablecoin(token1_addr) if token1_addr else False
-
-                                self._log(f"Raw price: {raw_price}, adjusted: {price_adjusted}")
-                                self._log(f"Token0 is stable: {token0_is_stable}, Token1 is stable: {token1_is_stable}")
-
-                                if token0_is_stable and not token1_is_stable:
-                                    # Pool is STABLE/VOLATILE - invert to show VOLATILE price in USD
-                                    if price_adjusted > 0:
-                                        display_price = 1 / price_adjusted
-                                    else:
-                                        display_price = price_adjusted
-                                    price_note = f"(1 {token1_sym} = ${self._format_price(display_price)})"
-                                elif token1_is_stable and not token0_is_stable:
-                                    # Pool is VOLATILE/STABLE - price already in correct form
-                                    display_price = price_adjusted
-                                    price_note = f"(1 {token0_sym} = ${self._format_price(display_price)})"
-                                else:
-                                    # Neither or both are stablecoins - just show raw
-                                    display_price = price_adjusted
-                                    price_note = f"({token0_sym}/{token1_sym})"
-
-                                self.price_input.setText(self._format_price(display_price))
-                                self._log(f"Auto-filled price: {self._format_price(display_price)} {price_note}")
-
-                                # Build info message
-                                addr_status = "✅ Token info loaded" if (token0_addr and token1_addr) else "⚠️ Enter token addresses"
-                                self.pool_info_label.setText(
-                                    f"✅ V4 Pool found on {protocol_name}!\n"
-                                    f"Fee: {fee_percent}% | Tick: {state.tick}\n"
-                                    f"Price: {self._format_price(display_price)} {price_note}\n"
-                                    f"{addr_status}"
-                                )
-                            self.pool_info_label.setStyleSheet("color: #00b894;")
-
-                            # Switch to correct V4 mode
-                            # Protocol combo indexes: 0=PancakeSwap V3, 1=PancakeSwap V4, 2=Uniswap V3, 3=Uniswap V4
-                            if protocol == V4Protocol.UNISWAP:
-                                self.protocol_combo.setCurrentIndex(3)  # Uniswap V4
-                            else:
-                                self.protocol_combo.setCurrentIndex(1)  # PancakeSwap V4
-
-                            # Set custom fee
-                            self.custom_fee_spin.setValue(fee_percent)
-
-                            # Store pool ID for later use
-                            self.loaded_v4_pool_id = pool_id_bytes
-
-                            self._log(f"V4 pool found on {protocol_name}, fee={fee_percent}%")
-                            self._log(f"Pool ID stored for verification")
-                            break
-                    except Exception as e:
-                        errors.append(f"{protocol_name}: {str(e)[:100]}")
-                        self._log(f"Error checking {protocol_name}: {e}")
-                        continue
-
-                if not pool_found:
-                    # Try subgraph/events as fallback
-                    self._log("On-chain query failed, trying subgraph/events...")
-                    subgraph_info = None
-                    try:
-                        subgraph_info = query_v4_subgraph(pool_input, w3=w3, chain_id=network.chain_id)
-                    except Exception as e:
-                        self._log(f"Subgraph/events fallback error: {e}")
-
-                    if subgraph_info:
-                        # Found in subgraph!
-                        self._log(f"Found in subgraph: {subgraph_info.token0_symbol}/{subgraph_info.token1_symbol}")
-                        self.token0_input.setText(subgraph_info.token0_address)
-                        self.token1_input.setText(subgraph_info.token1_address)
-                        self.tick_spacing_spin.setValue(subgraph_info.tick_spacing)
-                        self.tick_spacing_auto_cb.setChecked(False)
-                        self.tick_spacing_spin.setEnabled(True)
-                        self._token0_decimals = subgraph_info.token0_decimals
-                        self._token1_decimals = subgraph_info.token1_decimals
-                        self.custom_fee_spin.setValue(subgraph_info.fee_tier / 10000)
-
-                        self._loaded_pool_fee = subgraph_info.fee_tier
-                        self._loaded_pool_id_bytes = pool_id_bytes
-                        self.loaded_v4_pool_id = pool_id_bytes
-
-                        # Try to get current price from StateView
-                        price_str = "N/A"
-                        try:
-                            pool_manager = V4PoolManager(w3, protocol=V4Protocol.UNISWAP, chain_id=network.chain_id)
-                            state = pool_manager.get_pool_state_by_id(pool_id_bytes)
-                            if state.initialized and state.sqrt_price_x96 > 0:
-                                sqrt_price = state.sqrt_price_x96 / (2 ** 96)
-                                price_raw = sqrt_price ** 2
-                                price_adjusted = price_raw * (10 ** (subgraph_info.token0_decimals - subgraph_info.token1_decimals))
-
-                                # Invert if token0 is stablecoin — by address
-                                if is_stablecoin(subgraph_info.token0_address) if hasattr(subgraph_info, 'token0_address') else False:
-                                    if price_adjusted > 0:
-                                        display_price = 1 / price_adjusted
-                                    else:
-                                        display_price = price_adjusted
-                                else:
-                                    display_price = price_adjusted
-
-                                self.price_input.setText(self._format_price(display_price))
-                                price_str = self._format_price(display_price)
-                                self._log(f"Auto-filled price from StateView: {price_str}")
-                        except Exception as price_err:
-                            self._log(f"Could not get price from StateView: {price_err}")
-
-                        self.pool_info_label.setText(
-                            f"✅ V4 Pool found via subgraph!\n"
-                            f"Tokens: {subgraph_info.token0_symbol}/{subgraph_info.token1_symbol}\n"
-                            f"Fee: {subgraph_info.fee_tier / 10000}% | TickSpacing: {subgraph_info.tick_spacing}\n"
-                            f"Price: {price_str} | Token addresses auto-filled!"
-                        )
-                        self.pool_info_label.setStyleSheet("color: #00b894;")
-
-                        # Switch to Uniswap V4 mode (index 3)
-                        self.protocol_combo.setCurrentIndex(3)
-                    else:
-                        self.pool_info_label.setText(
-                            "V4 pool ID not found on-chain or in subgraph.\n"
-                            "Enter token addresses manually."
-                        )
-                        self.pool_info_label.setStyleSheet("color: #fdcb6e;")
-
-                        # Clear stored pool ID and fee
-                        self.loaded_v4_pool_id = None
-                        self._loaded_pool_id_bytes = None
-                        self._loaded_pool_fee = None
-
-                    # Switch to V4 mode if currently on V3
-                    # Indexes: 0=PCS V3, 1=PCS V4, 2=Uni V3, 3=Uni V4
-                    current_idx = self.protocol_combo.currentIndex()
-                    if current_idx == 0:  # PancakeSwap V3 -> V4
-                        self.protocol_combo.setCurrentIndex(1)
-                    elif current_idx == 2:  # Uniswap V3 -> V4
-                        self.protocol_combo.setCurrentIndex(3)
-
-                    if not subgraph_info:
-                        self._log("V4 pool ID not found - enter tokens manually")
-                        if errors:
-                            for err in errors:
-                                self._log(f"  {err}")
-
-                return
-
-            # V3 Pool - standard pool address
-            pool_abi = [
-                {"inputs": [], "name": "token0", "outputs": [{"type": "address"}], "stateMutability": "view", "type": "function"},
-                {"inputs": [], "name": "token1", "outputs": [{"type": "address"}], "stateMutability": "view", "type": "function"},
-                {"inputs": [], "name": "fee", "outputs": [{"type": "uint24"}], "stateMutability": "view", "type": "function"},
-                {"inputs": [], "name": "factory", "outputs": [{"type": "address"}], "stateMutability": "view", "type": "function"},
-            ]
-
-            pool_address = Web3.to_checksum_address(pool_input)
-            pool = w3.eth.contract(address=pool_address, abi=pool_abi)
-
-            # Store loaded pool address
+                for err in data.get('errors', []):
+                    self._log(f"  {err}")
+        else:
+            # ── V3 pool results ──
+            pool_address = data.get('pool_address')
             self._loaded_v3_pool_address = pool_address
+            self._detected_v3_dex = data.get('detected_dex')
 
-            # Detect which V3 DEX this pool belongs to
-            try:
-                from config import detect_v3_dex_by_pool, V3_DEXES
-                detected_dex = detect_v3_dex_by_pool(w3, pool_address, network.chain_id)
-                self._detected_v3_dex = detected_dex
-                self._log(f"Detected V3 DEX: {detected_dex.name}")
-                self._log(f"Position Manager: {detected_dex.position_manager}")
-            except Exception as dex_err:
-                self._log(f"Could not detect V3 DEX: {dex_err}")
-                self._detected_v3_dex = None
+            # Set token inputs
+            self.token0_input.setText(data.get('ui_token0', ''))
+            self.token1_input.setText(data.get('ui_token1', ''))
+            self._token0_decimals = data.get('ui_dec0', 18)
+            self._token1_decimals = data.get('ui_dec1', 18)
 
-            # Get pool data
-            token0_addr = pool.functions.token0().call()
-            token1_addr = pool.functions.token1().call()
-            fee = pool.functions.fee().call()
+            fee = data.get('fee', 0)
+            display_price = data.get('display_price')
+            display_pair = data.get('display_pair', '???/???')
 
-            # Get token symbols and decimals
-            token0_contract = w3.eth.contract(address=token0_addr, abi=erc20_abi)
-            token1_contract = w3.eth.contract(address=token1_addr, abi=erc20_abi)
-
-            try:
-                token0_symbol = token0_contract.functions.symbol().call()
-            except Exception:
-                token0_symbol = "???"
-
-            try:
-                token1_symbol = token1_contract.functions.symbol().call()
-            except Exception:
-                token1_symbol = "???"
-
-            try:
-                decimals0 = token0_contract.functions.decimals().call()
-            except Exception:
-                decimals0 = 18
-
-            try:
-                decimals1 = token1_contract.functions.decimals().call()
-            except Exception:
-                decimals1 = 18
-
-            # Determine if we need to swap: token0 should be volatile, token1 should be stablecoin
-            # Use address-based detection (more reliable than symbol matching)
-            token0_is_stable = is_stablecoin(token0_addr)
-            token1_is_stable = is_stablecoin(token1_addr)
-
-            # Get current price from slot0 via raw eth_call
-            # (works for both Uniswap V3 and PancakeSwap V3 slot0 formats)
-            try:
-                raw_slot0 = w3.eth.call({
-                    'to': pool_address,
-                    'data': bytes.fromhex('3850c7bd')
-                })
-                if len(raw_slot0) >= 32:
-                    sqrt_price_x96 = int.from_bytes(raw_slot0[0:32], 'big')
-                    pool_price = (sqrt_price_x96 / (2 ** 96)) ** 2
-                    pool_price = pool_price * (10 ** (decimals0 - decimals1))
-                else:
-                    pool_price = None
-            except Exception:
-                pool_price = None
-
-            # Decide how to fill the inputs based on which token is stablecoin
-            if token0_is_stable and not token1_is_stable:
-                # token0 is stablecoin (e.g., USDT), token1 is volatile (e.g., memes)
-                # We need to SWAP: put volatile in token0 field, stablecoin in token1 field
-                self.token0_input.setText(token1_addr)  # volatile goes to token0
-                self.token1_input.setText(token0_addr)  # stablecoin goes to token1
-                self._token0_decimals = decimals1  # volatile token decimals
-                self._token1_decimals = decimals0  # stablecoin decimals
-
-                # Price should be: stablecoin per volatile (USDT per memes)
-                # pool_price is token1/token0 = memes/USDT, so we invert
-                if pool_price and pool_price > 0:
-                    display_price = 1 / pool_price
-                else:
-                    display_price = None
-
-                display_pair = f"{token1_symbol}/{token0_symbol}"
-                self._log(f"Swapped order: {token0_symbol} is stablecoin, using {token1_symbol} as base")
-
-            else:
-                # token1 is stablecoin (or neither/both - use as-is)
-                self.token0_input.setText(token0_addr)
-                self.token1_input.setText(token1_addr)
-                self._token0_decimals = decimals0
-                self._token1_decimals = decimals1
-                display_price = pool_price
-                display_pair = f"{token0_symbol}/{token1_symbol}"
-
-            self._log(f"Token decimals: token0={self._token0_decimals}, token1={self._token1_decimals}")
-
-            # Set fee combo or custom fee input
+            # Set fee combo
             fee_map = {500: 0, 2500: 1, 3000: 2, 10000: 3}
-
-            # Determine V3 protocol based on detected DEX
-            # Protocol combo: 0=PancakeSwap V3, 1=PancakeSwap V4, 2=Uniswap V3, 3=Uniswap V4
-            detected_dex_name = getattr(self, '_detected_v3_dex', None)
-            if detected_dex_name and hasattr(detected_dex_name, 'name'):
-                if "uniswap" in detected_dex_name.name.lower():
-                    v3_protocol_index = 2  # Uniswap V3
-                    self._log(f"Setting protocol to Uniswap V3 (index 2)")
-                else:
-                    v3_protocol_index = 0  # PancakeSwap V3
-                    self._log(f"Setting protocol to PancakeSwap V3 (index 0)")
+            detected = self._detected_v3_dex
+            if detected and hasattr(detected, 'name'):
+                v3_idx = 2 if "uniswap" in detected.name.lower() else 0
             else:
-                # Default to PancakeSwap V3 for BSC
-                v3_protocol_index = 0 if network.chain_id in [56, 97] else 2
+                v3_idx = 0 if network.chain_id in [56, 97] else 2
 
             if fee in fee_map:
-                # Standard V3 fee tier
-                self.protocol_combo.setCurrentIndex(v3_protocol_index)
+                self.protocol_combo.setCurrentIndex(v3_idx)
                 self.fee_combo.setCurrentIndex(fee_map[fee])
             else:
-                # Non-standard fee - likely V4 or custom pool
-                # Switch to V4 mode and set custom fee
-                self.protocol_combo.setCurrentIndex(1)  # PancakeSwap V4
-                fee_percent_value = fee / 10000
-                self.custom_fee_spin.setValue(fee_percent_value)
-                self._log(f"Non-standard fee {fee_percent_value}% - switched to V4 mode")
+                self.protocol_combo.setCurrentIndex(1)
+                self.custom_fee_spin.setValue(fee / 10000)
 
-            # Update price input if we got price
+            # Set price
             if display_price:
-                self.price_input.setText(self._format_price(display_price))
+                self.price_input.setText(_format_price(display_price))
 
-            # Determine DEX name for display
-            dex_display_name = "V3"
-            if detected_dex_name and hasattr(detected_dex_name, 'name'):
-                dex_display_name = detected_dex_name.name
-
-            # Update info label
-            fee_percent = fee / 10000
-            info_text = f"✅ {dex_display_name}: {display_pair} | Fee: {fee_percent}%"
+            # Info label
+            dex_name = detected.name if detected and hasattr(detected, 'name') else "V3"
+            info_text = f"✅ {dex_name}: {display_pair} | Fee: {fee/10000}%"
             if display_price:
-                info_text += f" | Price: {self._format_price(display_price)}"
+                info_text += f" | Price: {_format_price(display_price)}"
             self.pool_info_label.setText(info_text)
             self.pool_info_label.setStyleSheet("color: #00b894;")
 
-            self._log(f"Loaded pool: {display_pair}, fee={fee_percent}%")
-
-        except Exception as e:
-            import traceback
-            self.pool_info_label.setText(f"Error: {str(e)[:100]}")
-            self.pool_info_label.setStyleSheet("color: #e94560;")
-            self._log(f"Failed to load pool: {e}")
-            self._log(f"Traceback: {traceback.format_exc()}")
+            self._log(f"Loaded pool: {display_pair}, fee={fee/10000}%")
