@@ -6,6 +6,7 @@ DEX Swap Module
 """
 
 import logging
+import math
 from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
 from decimal import Decimal
@@ -298,11 +299,12 @@ class DexSwap:
         )
     """
 
-    def __init__(self, w3: Web3, chain_id: int = 56, nonce_manager: 'NonceManager' = None, private_key: str = None):
+    def __init__(self, w3: Web3, chain_id: int = 56, nonce_manager: 'NonceManager' = None, private_key: str = None, max_price_impact: float = 5.0):
         self.w3 = w3
         self.chain_id = chain_id
         self.nonce_manager = nonce_manager
         self.account = Account.from_key(private_key) if private_key else None
+        self.max_price_impact = max_price_impact  # Max price impact in % (0 = disabled)
 
         if chain_id not in ROUTER_V2_ADDRESSES:
             raise ValueError(f"Unsupported chain ID: {chain_id}")
@@ -424,6 +426,182 @@ class DexSwap:
         except Exception as e:
             logger.warning(f"Failed to parse Transfer events: {e}")
             return None
+
+    def _get_pool_sqrt_price_x96(self, token0: str, token1: str, fee: int) -> Optional[int]:
+        """
+        Получить текущую sqrtPriceX96 из пула V3.
+
+        Args:
+            token0: Адрес currency0 пула (меньший адрес)
+            token1: Адрес currency1 пула
+            fee: Fee tier
+
+        Returns:
+            sqrtPriceX96 или None если не удалось получить
+        """
+        if not self.v3_available:
+            return None
+
+        try:
+            # Получить адрес пула через factory
+            # PancakeSwap V3 factory = 0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865 (BNB)
+            # Используем raw eth_call для getPool(address,address,uint24) = 0x1698ee82
+            factory_addresses = {
+                56: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",   # PCS V3
+                1: "0x1F98431c8aD98523631AE4a59f267346ea31F984",    # Uni V3
+                8453: "0x33128a8fC17869897dcE68Ed026d694621f6FDfD", # Uni V3 Base
+            }
+
+            factory = factory_addresses.get(self.chain_id)
+            if not factory:
+                return None
+
+            # Сортировать адреса (pool: lower = token0)
+            t0 = Web3.to_checksum_address(token0)
+            t1 = Web3.to_checksum_address(token1)
+            if int(t0, 16) > int(t1, 16):
+                t0, t1 = t1, t0
+
+            # getPool(address,address,uint24) selector = 0x1698ee82
+            calldata = bytes.fromhex('1698ee82')
+            calldata += bytes.fromhex(t0[2:].lower().zfill(64))
+            calldata += bytes.fromhex(t1[2:].lower().zfill(64))
+            calldata += fee.to_bytes(32, 'big')
+
+            result = self.w3.eth.call({
+                'to': Web3.to_checksum_address(factory),
+                'data': calldata
+            })
+
+            pool_address = '0x' + result[-20:].hex()
+            if int(pool_address, 16) == 0:
+                return None
+
+            # slot0() selector = 0x3850c7bd
+            slot0_data = self.w3.eth.call({
+                'to': Web3.to_checksum_address(pool_address),
+                'data': bytes.fromhex('3850c7bd')
+            })
+
+            if len(slot0_data) >= 32:
+                sqrt_price_x96 = int.from_bytes(slot0_data[0:32], 'big')
+                if sqrt_price_x96 > 0:
+                    return sqrt_price_x96
+
+            return None
+        except Exception as e:
+            logger.debug(f"Failed to get pool sqrtPriceX96: {e}")
+            return None
+
+    def _check_price_impact(
+        self, from_token: str, to_token: str, amount_in: int, expected_out: int, fee: int
+    ) -> Optional[str]:
+        """
+        Проверить price impact свапа.
+
+        Сравнивает цену исполнения (из котировки) с spot ценой пула.
+        Если impact > max_price_impact — возвращает ошибку.
+
+        Returns:
+            None если OK, строка с ошибкой если impact слишком большой
+        """
+        if self.max_price_impact <= 0:
+            return None  # Проверка отключена
+
+        sqrt_price_x96 = self._get_pool_sqrt_price_x96(from_token, to_token, fee)
+        if sqrt_price_x96 is None:
+            logger.debug("Cannot check price impact: pool sqrtPriceX96 unavailable")
+            return None  # Не блокируем свап если не удалось получить цену
+
+        try:
+            # spot_price = (sqrtPriceX96 / 2^96)^2 = token1 / token0
+            Q96 = 2 ** 96
+            spot_price = (sqrt_price_x96 / Q96) ** 2
+
+            if spot_price == 0:
+                return None
+
+            # Определить порядок токенов в пуле
+            t0_int = int(from_token, 16)
+            t1_int = int(to_token, 16)
+            from_is_token0 = t0_int < t1_int
+
+            # exec_price = соотношение исполнения
+            if from_is_token0:
+                # Продаём token0, получаем token1: exec_price = out / in (в единицах token1/token0)
+                exec_price = expected_out / amount_in
+            else:
+                # Продаём token1, получаем token0: exec_price = in / out (в единицах token1/token0)
+                if expected_out == 0:
+                    return f"Price impact check: expected_out is 0"
+                exec_price = amount_in / expected_out
+
+            # price_impact = |1 - exec_price / spot_price| * 100%
+            if spot_price > 0:
+                price_impact = abs(1 - exec_price / spot_price) * 100
+            else:
+                return None
+
+            logger.info(f"Price impact: {price_impact:.2f}% (spot={spot_price:.8e}, exec={exec_price:.8e})")
+
+            if price_impact > self.max_price_impact:
+                return (
+                    f"Price impact too high: {price_impact:.2f}% > {self.max_price_impact}% max. "
+                    f"Pool may have low liquidity or be manipulated. "
+                    f"Increase max_price_impact or reduce swap amount."
+                )
+
+            return None
+        except Exception as e:
+            logger.debug(f"Price impact calculation error: {e}")
+            return None  # Не блокируем свап при ошибке расчёта
+
+    def _calc_sqrt_price_limit_x96(
+        self, from_token: str, to_token: str, fee: int, slippage: float
+    ) -> int:
+        """
+        Рассчитать sqrtPriceLimitX96 для V3 свапа.
+
+        Ограничивает движение цены пула на slippage% от текущей.
+
+        Args:
+            from_token: Адрес входного токена
+            to_token: Адрес выходного токена
+            fee: Fee tier
+            slippage: Slippage в %
+
+        Returns:
+            sqrtPriceLimitX96 (0 если не удалось рассчитать — fallback к без лимита)
+        """
+        sqrt_price_x96 = self._get_pool_sqrt_price_x96(from_token, to_token, fee)
+        if sqrt_price_x96 is None:
+            return 0
+
+        try:
+            # Определить направление: from_token < to_token по адресу = продаём token0
+            from_is_token0 = int(from_token, 16) < int(to_token, 16)
+
+            slippage_fraction = slippage / 100.0
+
+            # MIN/MAX допустимые значения sqrtPriceX96 (из Uniswap V3)
+            MIN_SQRT_RATIO = 4295128739 + 1  # TickMath.MIN_SQRT_RATIO + 1
+            MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342 - 1  # MAX - 1
+
+            if from_is_token0:
+                # Продаём token0 → цена (token1/token0) падает → sqrtPrice уменьшается
+                limit = int(sqrt_price_x96 * math.sqrt(1 - slippage_fraction))
+                limit = max(limit, MIN_SQRT_RATIO)
+            else:
+                # Продаём token1 → цена растёт → sqrtPrice увеличивается
+                limit = int(sqrt_price_x96 * math.sqrt(1 + slippage_fraction))
+                limit = min(limit, MAX_SQRT_RATIO)
+
+            logger.debug(f"sqrtPriceLimitX96: current={sqrt_price_x96}, limit={limit}, "
+                        f"direction={'sell token0' if from_is_token0 else 'sell token1'}")
+            return limit
+        except Exception as e:
+            logger.debug(f"Failed to calc sqrtPriceLimitX96: {e}")
+            return 0
 
     def get_quote(self, from_token: str, to_token: str, amount_in: int) -> int:
         """
@@ -617,6 +795,16 @@ class DexSwap:
             else:
                 logger.info(f"V3 swap: DIRECT fee={best_fee/10000}%, expected out = {expected_out}")
 
+            # Price impact check (только для direct свапов — для multi-hop сложно определить pool)
+            if not is_multi_hop:
+                impact_error = self._check_price_impact(from_token, to_token, amount_in, expected_out, best_fee)
+                if impact_error:
+                    return SwapResult(
+                        success=False, tx_hash=None, from_token=from_token, to_token=to_token,
+                        from_amount=amount_in, to_amount=0, to_amount_usd=0, gas_used=0,
+                        error=impact_error
+                    )
+
             # Рассчитать минимум с учётом слипажа
             min_out = int(expected_out * (100 - slippage) / 100)
 
@@ -652,7 +840,8 @@ class DexSwap:
                     args=[swap_params]
                 )
             else:
-                # Direct: exactInputSingle
+                # Direct: exactInputSingle with price limit
+                price_limit = self._calc_sqrt_price_limit_x96(from_token, to_token, best_fee, slippage)
                 swap_params = (
                     from_token,       # tokenIn
                     to_token,         # tokenOut
@@ -660,7 +849,7 @@ class DexSwap:
                     wallet_address,   # recipient
                     amount_in,        # amountIn
                     min_out,          # amountOutMinimum
-                    0                 # sqrtPriceLimitX96 (0 = no limit)
+                    price_limit       # sqrtPriceLimitX96
                 )
                 swap_data = self.router_v3.encodeABI(
                     fn_name='exactInputSingle',
@@ -965,6 +1154,14 @@ class DexSwap:
                     # Сравнить с V2 котировкой
                     v2_quote = self.get_quote(from_token, to_token, amount_in)
 
+                    # Cross-source divergence check: если обе котировки > 0 и расходятся > 10%, предупреждаем
+                    if v3_quote > 0 and v2_quote > 0:
+                        higher = max(v3_quote, v2_quote)
+                        lower = min(v3_quote, v2_quote)
+                        divergence = (higher - lower) / higher * 100
+                        if divergence > 10:
+                            logger.warning(f"V2/V3 quote divergence: {divergence:.1f}% (V3={v3_quote}, V2={v2_quote}) — possible pool manipulation")
+
                     # Использовать V3 если котировка лучше или V2 недоступен
                     if v3_quote >= v2_quote or v2_quote == 0:
                         logger.info(f"Using V3 (V3: {v3_quote} vs V2: {v2_quote})")
@@ -1184,7 +1381,8 @@ def sell_tokens_after_close(
     tokens: List[Dict[str, Any]],
     wallet_address: str,
     private_key: str,
-    slippage: float = 1.0
+    slippage: float = 1.0,
+    max_price_impact: float = 5.0
 ) -> Dict[str, Any]:
     """
     Продать токены после закрытия позиции через DEX.
@@ -1196,6 +1394,7 @@ def sell_tokens_after_close(
         wallet_address: Адрес кошелька
         private_key: Приватный ключ
         slippage: Проскальзывание в %
+        max_price_impact: Максимальный price impact в %
 
     Returns:
         {
@@ -1205,7 +1404,7 @@ def sell_tokens_after_close(
         }
     """
     nonce_mgr = NonceManager(w3, Account.from_key(private_key).address)
-    swapper = DexSwap(w3, chain_id, nonce_manager=nonce_mgr, private_key=private_key)
+    swapper = DexSwap(w3, chain_id, nonce_manager=nonce_mgr, private_key=private_key, max_price_impact=max_price_impact)
     output_token = swapper.get_output_token()
 
     results = {

@@ -123,6 +123,19 @@ class SettingsDialog(QDialog):
         timeout_row.addStretch()
         tx_group_layout.addLayout(timeout_row)
 
+        # Max price impact
+        impact_row = QHBoxLayout()
+        impact_row.addWidget(QLabel("Max Price Impact:"))
+        self.price_impact_spin = QDoubleSpinBox()
+        self.price_impact_spin.setRange(0, 50.0)
+        self.price_impact_spin.setValue(5.0)
+        self.price_impact_spin.setSuffix(" %")
+        self.price_impact_spin.setSpecialValueText("Disabled")
+        self.price_impact_spin.setToolTip("Max allowed price impact for swaps (0 = disabled). Blocks swaps if pool price would move too much.")
+        impact_row.addWidget(self.price_impact_spin)
+        impact_row.addStretch()
+        tx_group_layout.addLayout(impact_row)
+
         # Simulate first checkbox
         self.simulate_check = QCheckBox("Always simulate before executing")
         self.simulate_check.setChecked(True)
@@ -320,6 +333,9 @@ class SettingsDialog(QDialog):
         self.simulate_check.setChecked(
             self.settings.value("tx/simulate_first", True, type=bool)
         )
+        self.price_impact_spin.setValue(
+            self.settings.value("tx/max_price_impact", 5.0, type=float)
+        )
         self.dist_combo.setCurrentIndex(
             self.settings.value("calc/distribution", 0, type=int)
         )
@@ -361,6 +377,7 @@ class SettingsDialog(QDialog):
         self.settings.setValue("tx/gas_limit_override", int(self.gas_limit_spin.value()))
         self.settings.setValue("tx/timeout", self.timeout_spin.value())
         self.settings.setValue("tx/simulate_first", self.simulate_check.isChecked())
+        self.settings.setValue("tx/max_price_impact", self.price_impact_spin.value())
         self.settings.setValue("calc/distribution", self.dist_combo.currentIndex())
         self.settings.setValue("calc/fee_tier", self.fee_combo.currentIndex())
         self.settings.setValue("calc/positions", self.positions_spin.value())

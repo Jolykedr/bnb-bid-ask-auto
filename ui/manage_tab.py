@@ -620,7 +620,8 @@ class ClosePositionsWorker(QThread):
     close_result = pyqtSignal(bool, str, dict)
 
     def __init__(self, provider, token_ids, positions_data=None, auto_sell=False,
-                 private_key=None, swap_slippage=3.0, chain_id=56, initial_investment=0):
+                 private_key=None, swap_slippage=3.0, chain_id=56, initial_investment=0,
+                 max_price_impact=5.0):
         super().__init__()
         self.provider = provider
         self.token_ids = token_ids
@@ -630,6 +631,7 @@ class ClosePositionsWorker(QThread):
         self.swap_slippage = swap_slippage
         self.chain_id = chain_id
         self.initial_investment = initial_investment
+        self.max_price_impact = max_price_impact
 
     def run(self):
         try:
@@ -844,8 +846,8 @@ class ClosePositionsWorker(QThread):
             wallet = self.provider.account.address
 
             # Initialize DEX swapper
-            swapper = DexSwap(w3, self.chain_id)
-            self.progress.emit(f"Using {swapper.dex_name} for swaps")
+            swapper = DexSwap(w3, self.chain_id, max_price_impact=self.max_price_impact)
+            self.progress.emit(f"Using {swapper.dex_name} for swaps (max price impact: {self.max_price_impact}%)")
 
             erc20_abi = [
                 {"constant": True, "inputs": [{"name": "account", "type": "address"}],
@@ -930,7 +932,7 @@ class BatchCloseWorker(QThread):
     close_result = pyqtSignal(bool, str, dict)
 
     def __init__(self, provider, positions: list, auto_sell=False, private_key=None,
-                 swap_slippage=3.0, initial_investment=0):
+                 swap_slippage=3.0, initial_investment=0, max_price_impact=5.0):
         super().__init__()
         self.provider = provider
         self.positions = positions  # List of position dicts
@@ -939,6 +941,7 @@ class BatchCloseWorker(QThread):
         self.swap_slippage = swap_slippage
         self.initial_investment = initial_investment
         self.chain_id = getattr(provider, 'chain_id', 56)
+        self.max_price_impact = max_price_impact
 
     def run(self):
         try:
@@ -1042,8 +1045,8 @@ class BatchCloseWorker(QThread):
             wallet = self.provider.account.address
 
             # Initialize DEX swapper
-            swapper = DexSwap(w3, self.chain_id)
-            self.progress.emit(f"Using {swapper.dex_name} for swaps")
+            swapper = DexSwap(w3, self.chain_id, max_price_impact=self.max_price_impact)
+            self.progress.emit(f"Using {swapper.dex_name} for swaps (max price impact: {self.max_price_impact}%)")
 
             # Collect unique tokens from positions
             tokens_to_check = []
@@ -1341,6 +1344,16 @@ class ManageTab(QWidget):
         self.swap_slippage_spin.setToolTip("Slippage for auto-sell swaps (0.5% - 50%)")
         self.swap_slippage_spin.setFixedWidth(75)
         close_settings_layout.addWidget(self.swap_slippage_spin)
+
+        close_settings_layout.addWidget(QLabel("Max Impact:"))
+        self.max_impact_spin = QDoubleSpinBox()
+        self.max_impact_spin.setRange(0, 50.0)
+        self.max_impact_spin.setValue(5.0)
+        self.max_impact_spin.setSuffix(" %")
+        self.max_impact_spin.setSpecialValueText("Off")
+        self.max_impact_spin.setToolTip("Max price impact for swaps (0 = disabled)")
+        self.max_impact_spin.setFixedWidth(75)
+        close_settings_layout.addWidget(self.max_impact_spin)
 
         close_settings_layout.addWidget(QLabel("Initial $:"))
         self.initial_investment_spin = QDoubleSpinBox()
@@ -2599,7 +2612,8 @@ class ManageTab(QWidget):
             auto_sell=auto_sell,
             private_key=private_key,
             swap_slippage=swap_slippage,
-            initial_investment=initial_investment
+            initial_investment=initial_investment,
+            max_price_impact=self.max_impact_spin.value()
         )
         self.worker.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
         self.worker.close_result.connect(self._on_batch_close_finished, Qt.ConnectionType.QueuedConnection)
@@ -2751,7 +2765,8 @@ class ManageTab(QWidget):
             private_key=private_key,
             swap_slippage=swap_slippage,
             chain_id=chain_id,
-            initial_investment=initial_investment
+            initial_investment=initial_investment,
+            max_price_impact=self.max_impact_spin.value()
         )
         self.worker.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
         self.worker.close_result.connect(self._on_close_finished, Qt.ConnectionType.QueuedConnection)
