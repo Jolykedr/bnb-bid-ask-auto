@@ -58,13 +58,15 @@ class V3DexConfig:
     position_manager: str
     pool_factory: str
     fee_tiers: list  # Supported fee tiers
+    swap_router: str = ""  # V3 swap router (SmartRouter for PCS, SwapRouter02 for Uni)
 
 # Uniswap V3 on BSC
 UNISWAP_V3_BSC = V3DexConfig(
     name="Uniswap V3",
     position_manager="0x7b8A01B39D58278b5DE7e48c8449c9f4F5170613",
     pool_factory="0xdB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7",
-    fee_tiers=[100, 500, 3000, 10000]  # 0.01%, 0.05%, 0.3%, 1%
+    fee_tiers=[100, 500, 3000, 10000],  # 0.01%, 0.05%, 0.3%, 1%
+    swap_router="0xB971eF87ede563556b2ED4b1C0b0019111Dd85d2",  # Uniswap UniversalRouter BSC
 )
 
 # PancakeSwap V3 on BSC
@@ -72,7 +74,8 @@ PANCAKESWAP_V3_BSC = V3DexConfig(
     name="PancakeSwap V3",
     position_manager="0x46A15B0b27311cedF172AB29E4f4766fbE7F4364",
     pool_factory="0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
-    fee_tiers=[100, 500, 2500, 10000]  # 0.01%, 0.05%, 0.25%, 1%
+    fee_tiers=[100, 500, 2500, 10000],  # 0.01%, 0.05%, 0.25%, 1%
+    swap_router="0x13f4EA83D0bd40E75C8222255bc855a974568Dd4",  # PCS SmartRouter BSC
 )
 
 # Map of all V3 DEXes per chain
@@ -86,7 +89,15 @@ V3_DEXES = {
             name="Uniswap V3",
             position_manager="0xC36442b4a4522E871399CD717aBDD847Ab11FE88",
             pool_factory="0x1F98431c8aD98523631AE4a59f267346ea31F984",
-            fee_tiers=[100, 500, 3000, 10000]
+            fee_tiers=[100, 500, 3000, 10000],
+            swap_router="0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",  # Uniswap SwapRouter02 ETH
+        ),
+        "pancakeswap": V3DexConfig(
+            name="PancakeSwap V3",
+            position_manager="0x46A15B0b27311cedF172AB29E4f4766fbE7F4364",
+            pool_factory="0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
+            fee_tiers=[100, 500, 2500, 10000],
+            swap_router="0x13f4EA83D0bd40E75C8222255bc855a974568Dd4",  # PCS SmartRouter ETH
         ),
     },
     8453: {  # Base
@@ -94,7 +105,15 @@ V3_DEXES = {
             name="Uniswap V3",
             position_manager="0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1",
             pool_factory="0x33128a8fC17869897dcE68Ed026d694621f6FDfD",
-            fee_tiers=[100, 500, 3000, 10000]
+            fee_tiers=[100, 500, 3000, 10000],
+            swap_router="0x2626664c2603336E57B271c5C0b26F421741e481",  # Uniswap SwapRouter02 BASE
+        ),
+        "pancakeswap": V3DexConfig(
+            name="PancakeSwap V3",
+            position_manager="0x46A15B0b27311cedF172AB29E4f4766fbE7F4364",
+            pool_factory="0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
+            fee_tiers=[100, 500, 2500, 10000],  # 0.01%, 0.05%, 0.25%, 1%
+            swap_router="0x678Aa4bF4E210cf2166753e054d5b7c31cc7fa86",  # PCS SmartRouter BASE
         ),
     },
 }

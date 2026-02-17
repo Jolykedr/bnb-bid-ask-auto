@@ -677,8 +677,23 @@ class V4LiquidityProvider:
             abi=PERMIT2_ABI
         )
 
-        # Always set Permit2 allowance (don't skip even if seems sufficient)
+        # Check existing Permit2 allowance before sending TX
         current_time = int(time.time())
+
+        allowance_data = permit2.functions.allowance(
+            self.account.address,
+            Web3.to_checksum_address(token_address),
+            Web3.to_checksum_address(spender)
+        ).call()
+
+        current_amount = allowance_data[0]
+        current_expiration = allowance_data[1]
+
+        # Skip if allowance sufficient and not expiring within 1 hour
+        if current_amount >= amount and current_expiration > current_time + 3600:
+            logger.info(f"Permit2 allowance sufficient: amount={current_amount}, expiration={current_expiration}, skipping approve")
+            return None
+
         max_uint160 = 2**160 - 1
         expiration = current_time + 365 * 24 * 60 * 60  # 1 year from now
 

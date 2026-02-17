@@ -181,7 +181,7 @@ class UniswapV3PositionManager:
             Закодированные данные вызова
         """
         return self.contract.encode_abi(
-            fn_name='mint',
+            'mint',
             args=[params.to_tuple(recipient, deadline)]
         )
 

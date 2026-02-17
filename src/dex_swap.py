@@ -835,8 +835,8 @@ class DexSwap:
                     amount_in,        # amountIn
                     min_out,          # amountOutMinimum
                 )
-                swap_data = self.router_v3.encodeABI(
-                    fn_name='exactInput',
+                swap_data = self.router_v3.encode_abi(
+                    'exactInput',
                     args=[swap_params]
                 )
             else:
@@ -851,8 +851,8 @@ class DexSwap:
                     min_out,          # amountOutMinimum
                     price_limit       # sqrtPriceLimitX96
                 )
-                swap_data = self.router_v3.encodeABI(
-                    fn_name='exactInputSingle',
+                swap_data = self.router_v3.encode_abi(
+                    'exactInputSingle',
                     args=[swap_params]
                 )
 
