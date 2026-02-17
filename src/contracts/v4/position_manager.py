@@ -1461,10 +1461,11 @@ class V4PositionManager:
 
         try:
             # Select block explorer API by chain
+            # Basescan V1 deprecated; use Blockscout for BASE
             EXPLORER_APIS = {
                 56: "https://api.bscscan.com/api",
                 1: "https://api.etherscan.io/api",
-                8453: "https://api.basescan.org/api",
+                8453: "https://base.blockscout.com/api",
             }
             api_url = EXPLORER_APIS.get(self.chain_id, "https://api.bscscan.com/api")
 
