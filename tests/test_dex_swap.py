@@ -723,10 +723,10 @@ class TestSwapV3:
 
         result = swapper.swap_v3(TOKEN_VOLATILE, USDT_BSC, 10**18, WALLET, PRIVATE_KEY)
         assert result.success is True
-        # Should have called encodeABI with 'exactInput'
-        swapper.router_v3.encodeABI.assert_called_once()
-        call_args = swapper.router_v3.encodeABI.call_args
-        assert call_args[1]['fn_name'] == 'exactInput' or call_args[0][0] if call_args[0] else True
+        # Should have called encode_abi with 'exactInput'
+        swapper.router_v3.encode_abi.assert_called_once()
+        call_args = swapper.router_v3.encode_abi.call_args
+        assert call_args[0][0] == 'exactInput' if call_args[0] else True
 
     def test_reverted_tx_returns_error(self, _mock_from_key):
         swapper, w3 = self._setup_v3_swap()
@@ -1336,7 +1336,7 @@ class TestEdgeCases:
         swapper, w3 = _make_swapper(56)
         swapper.get_quote_v3 = MagicMock(return_value=(10**18, 500, 0))  # direct
         swapper._check_and_approve_v3 = MagicMock(return_value=True)
-        swapper.router_v3.encodeABI = MagicMock(return_value=b'\x00')
+        swapper.router_v3.encode_abi = MagicMock(return_value=b'\x00')
         swapper.router_v3.functions.multicall.return_value.build_transaction = \
             MagicMock(return_value={})
         tx_hash = MagicMock()
@@ -1349,10 +1349,9 @@ class TestEdgeCases:
 
         swapper.swap_v3(TOKEN_VOLATILE, USDT_BSC, 10**18, WALLET, PRIVATE_KEY)
 
-        swapper.router_v3.encodeABI.assert_called_once()
-        call_kwargs = swapper.router_v3.encodeABI.call_args
-        assert call_kwargs[1].get('fn_name') == 'exactInputSingle' or \
-               (call_kwargs[0] and 'exactInputSingle' in str(call_kwargs))
+        swapper.router_v3.encode_abi.assert_called_once()
+        call_kwargs = swapper.router_v3.encode_abi.call_args
+        assert call_kwargs[0][0] == 'exactInputSingle' if call_kwargs[0] else True
 
     def test_swap_slippage_calculation(self):
         """Slippage calculation: min_out = expected * (100 - slippage) / 100."""
@@ -1362,12 +1361,18 @@ class TestEdgeCases:
 
         captured_params = {}
 
-        def capture_encodeABI(fn_name=None, args=None):
-            captured_params['fn_name'] = fn_name
-            captured_params['args'] = args
+        def capture_encode_abi(*pos_args, **kwargs):
+            if pos_args:
+                captured_params['fn_name'] = pos_args[0]
+            else:
+                captured_params['fn_name'] = kwargs.get('fn_name')
+            if len(pos_args) > 1:
+                captured_params['args'] = pos_args[1]
+            else:
+                captured_params['args'] = kwargs.get('args')
             return b'\x00'
 
-        swapper.router_v3.encodeABI = capture_encodeABI
+        swapper.router_v3.encode_abi = capture_encode_abi
         swapper.router_v3.functions.multicall.return_value.build_transaction = \
             MagicMock(return_value={})
         tx_hash = MagicMock()

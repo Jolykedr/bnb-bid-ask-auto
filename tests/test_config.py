@@ -654,10 +654,12 @@ class TestGetV3DexConfig:
         with pytest.raises(ValueError, match="No V3 DEXes configured for chain_id"):
             get_v3_dex_config("uniswap", chain_id=999)
 
-    def test_pancakeswap_not_on_ethereum_returns_none(self):
-        """Ethereum only has uniswap; pancakeswap key does not exist so .get() returns None."""
+    def test_pancakeswap_on_ethereum_returns_config(self):
+        """Ethereum has both uniswap and pancakeswap V3 configs."""
         result = get_v3_dex_config("pancakeswap", chain_id=1)
-        assert result is None
+        assert result is not None
+        assert isinstance(result, V3DexConfig)
+        assert result.name == "PancakeSwap V3"
 
     def test_return_type(self):
         result = get_v3_dex_config("uniswap", chain_id=56)

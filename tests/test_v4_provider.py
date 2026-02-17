@@ -932,9 +932,12 @@ class TestV4LiquidityProvider:
         mock_approve_fn = Mock()
         mock_approve_fn.build_transaction = Mock(return_value={})
         mock_contract.functions.approve = Mock(return_value=mock_approve_fn)
-        # Мок allowance (для верификации после approve)
+        # Мок allowance: первый вызов — проверка (недостаточно), второй — верификация после approve
         mock_contract.functions.allowance = Mock(
-            return_value=Mock(call=Mock(return_value=(10**160, 9999999999, 0)))
+            return_value=Mock(call=Mock(side_effect=[
+                (0, 0, 0),  # pre-check: insufficient → proceed with approve
+                (10**160, 9999999999, 0),  # post-approve verification
+            ]))
         )
         provider.w3.eth.contract = Mock(return_value=mock_contract)
         provider.gas_estimator.estimate = Mock(return_value=60_000)
@@ -963,6 +966,10 @@ class TestV4LiquidityProvider:
         mock_approve_fn = Mock()
         mock_approve_fn.build_transaction = Mock(return_value={})
         mock_contract.functions.approve = Mock(return_value=mock_approve_fn)
+        # Мок allowance: pre-check returns insufficient → proceed with approve
+        mock_contract.functions.allowance = Mock(
+            return_value=Mock(call=Mock(return_value=(0, 0, 0)))
+        )
         provider.w3.eth.contract = Mock(return_value=mock_contract)
         provider.gas_estimator.estimate = Mock(return_value=60_000)
 
