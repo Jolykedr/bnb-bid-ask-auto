@@ -368,6 +368,29 @@ class V4LiquidityProvider:
         logger.info(f"Creating pool with initial price: {price_for_init}")
         logger.info(f"  invert_price: {config.invert_price}")
 
+        # CRITICAL: Verify decimals on-chain before computing sqrtPriceX96
+        # Wrong decimals → wrong tick offset → pool created at absurd price
+        for token_addr, label, cfg_dec in [
+            (config.token0, "token0", config.token0_decimals),
+            (config.token1, "token1", config.token1_decimals),
+        ]:
+            try:
+                erc20 = self.w3.eth.contract(
+                    address=Web3.to_checksum_address(token_addr), abi=ERC20_ABI
+                )
+                actual_dec = erc20.functions.decimals().call()
+                if actual_dec != cfg_dec:
+                    logger.warning(
+                        f"[create_pool] {label} decimals MISMATCH: config={cfg_dec}, on-chain={actual_dec}. "
+                        f"Overriding config."
+                    )
+                    if label == "token0":
+                        config.token0_decimals = actual_dec
+                    else:
+                        config.token1_decimals = actual_dec
+            except Exception as e:
+                logger.warning(f"[create_pool] Could not verify {label} decimals: {e}")
+
         # Convert price to sqrtPriceX96
         # If invert_price=True, the user's price is TOKEN/USD (e.g., 0.005 USD per token)
         # But sqrtPriceX96 uses pool price format: token1/token0
@@ -385,6 +408,16 @@ class V4LiquidityProvider:
             config.token0_decimals,
             config.token1_decimals
         )
+
+        # Sanity check: sqrtPriceX96 must be within Uniswap V4 bounds
+        MIN_SQRT_PRICE = 4295128739
+        MAX_SQRT_PRICE = 1461446703485210103287273052203988822378723970342
+        if sqrt_price_x96 < MIN_SQRT_PRICE or sqrt_price_x96 > MAX_SQRT_PRICE:
+            raise ValueError(
+                f"Computed sqrtPriceX96 ({sqrt_price_x96:.2e}) is outside valid range. "
+                f"Likely wrong token decimals: t0_dec={config.token0_decimals}, t1_dec={config.token1_decimals}, "
+                f"pool_price={pool_price}"
+            )
 
         logger.info(f"Initializing pool with sqrtPriceX96: {sqrt_price_x96}")
         logger.debug(f"Pool key: {pool_key.to_tuple()}")
@@ -1212,6 +1245,29 @@ class V4LiquidityProvider:
                 success=False,
                 error="Account not configured"
             )
+
+        # CRITICAL: Verify token decimals on-chain before any calculations
+        # Stale/wrong decimals cause catastrophic tick offsets and absurd pool prices
+        for token_addr, label, cfg_dec in [
+            (config.token0, "token0", config.token0_decimals),
+            (config.token1, "token1", config.token1_decimals),
+        ]:
+            try:
+                erc20 = self.w3.eth.contract(
+                    address=Web3.to_checksum_address(token_addr), abi=ERC20_ABI
+                )
+                actual_dec = erc20.functions.decimals().call()
+                if actual_dec != cfg_dec:
+                    logger.warning(
+                        f"[create_ladder] {label} decimals MISMATCH: config={cfg_dec}, on-chain={actual_dec}. "
+                        f"Overriding config to prevent wrong tick offset."
+                    )
+                    if label == "token0":
+                        config.token0_decimals = actual_dec
+                    else:
+                        config.token1_decimals = actual_dec
+            except Exception as e:
+                logger.warning(f"[create_ladder] Could not verify {label} decimals: {e}")
 
         # Validate fee
         if config.fee_percent < 0 or config.fee_percent > 100:

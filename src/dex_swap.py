@@ -338,7 +338,6 @@ class DexSwap:
                     logger.info(f"KyberSwap Aggregator available for chain {chain_id}")
             except Exception as e:
                 logger.warning(f"KyberSwap unavailable: {e}")
-            logger.info(f"V3 router available: {self.dex_name_v3}")
 
     def _resolve_account(self, private_key: str = None):
         """Resolve account from private_key arg or stored self.account."""
@@ -1219,7 +1218,7 @@ class DexSwap:
                         f"router={quote.router_address[:10]}..., route={quote.route_description}")
 
             # 2. Build route (получить calldata)
-            slippage_bips = int(slippage * 100)  # 1.0% → 100 bips
+            slippage_bips = max(int(slippage * 100), 300)  # minimum 3% for volatile tokens
             build = self.kyber_client.build_route(
                 quote.route_summary, wallet_address, wallet_address, slippage_bips
             )
