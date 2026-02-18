@@ -722,12 +722,14 @@ class V4LiquidityProvider:
         current_amount = allowance_data[0]
         current_expiration = allowance_data[1]
 
+        max_uint160 = 2**160 - 1
+        # Cap comparison at uint160 max — Permit2 stores allowances as uint160
+        capped_amount = min(amount, max_uint160)
+
         # Skip if allowance sufficient and not expiring within 1 hour
-        if current_amount >= amount and current_expiration > current_time + 3600:
+        if current_amount >= capped_amount and current_expiration > current_time + 3600:
             logger.info(f"Permit2 allowance sufficient: amount={current_amount}, expiration={current_expiration}, skipping approve")
             return None
-
-        max_uint160 = 2**160 - 1
         expiration = current_time + 365 * 24 * 60 * 60  # 1 year from now
 
         logger.info(f"Setting Permit2 allowance: token={token_address[:10]}..., spender={spender[:10]}..., expiration={expiration}")
