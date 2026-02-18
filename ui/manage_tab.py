@@ -1484,7 +1484,10 @@ class ManageTab(QWidget):
         self.positions_table.setSortingEnabled(False)
         try:
             for token_id, position in updates.items():
-                self._update_table_row_inner(token_id, position)
+                try:
+                    self._update_table_row_inner(token_id, position)
+                except Exception as e:
+                    logger.error(f"Error updating table row for {token_id}: {e}", exc_info=True)
         finally:
             self.positions_table.setSortingEnabled(True)
         self._update_buttons()
@@ -1594,14 +1597,17 @@ class ManageTab(QWidget):
 
     def _on_scan_position_found(self, token_id: int, position: dict):
         """Handle position found during scan."""
-        liquidity = position.get('liquidity', 0)
-        self._log(f"  Found #{token_id}: liquidity={liquidity:,}")
+        try:
+            liquidity = position.get('liquidity', 0)
+            self._log(f"  Found #{token_id}: liquidity={liquidity:,}")
 
-        self.positions_data[token_id] = position
+            self.positions_data[token_id] = position
 
-        # Only show in table if not filtering or has liquidity
-        if not self.hide_empty_cb.isChecked() or liquidity > 0:
-            self._update_table_row(token_id, position)
+            # Only show in table if not filtering or has liquidity
+            if not self.hide_empty_cb.isChecked() or liquidity > 0:
+                self._update_table_row(token_id, position)
+        except Exception as e:
+            logger.error(f"Error handling scan position {token_id}: {e}", exc_info=True)
 
     def _on_filter_changed(self, checked: bool):
         """Handle filter checkbox change - rebuild table."""
@@ -1617,9 +1623,11 @@ class ManageTab(QWidget):
         hidden_count = 0
 
         # Batch all updates: disable sorting once
+        # Take snapshot to avoid RuntimeError: dictionary changed size during iteration
+        positions_snapshot = list(self.positions_data.items())
         self.positions_table.setSortingEnabled(False)
         try:
-            for token_id, position in self.positions_data.items():
+            for token_id, position in positions_snapshot:
                 if position:
                     liquidity = position.get('liquidity', 0)
                     usd_val = position.get('_usd_value')
@@ -1630,8 +1638,11 @@ class ManageTab(QWidget):
                         if usd_val is not None and 0 <= usd_val < 0.00001:
                             hidden_count += 1
                             continue
-                    self._update_table_row_inner(token_id, position)
-                    shown_count += 1
+                    try:
+                        self._update_table_row_inner(token_id, position)
+                        shown_count += 1
+                    except Exception as e:
+                        logger.error(f"Error rebuilding row for {token_id}: {e}", exc_info=True)
         finally:
             self.positions_table.setSortingEnabled(True)
 
@@ -1940,7 +1951,7 @@ class ManageTab(QWidget):
                 else:
                     # No stablecoin — show raw L as fallback
                     usd_value = -1
-        except (OverflowError, ValueError, ZeroDivisionError):
+        except Exception:
             usd_value = -1
 
         # Store computed USD value for filtering

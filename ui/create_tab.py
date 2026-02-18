@@ -47,6 +47,32 @@ def _format_price(price: float) -> str:
         return f"{price:.12f}".rstrip('0').rstrip('.')
 
 
+# Subscript digits used by DexScreener/DEXTools: ₀₁₂₃₄₅₆₇₈₉
+_SUBSCRIPT_MAP = {chr(0x2080 + i): str(i) for i in range(10)}
+
+def _parse_price_text(text: str) -> float:
+    """Parse price text, handling DexScreener subscript notation.
+
+    Examples:
+        '0.0₄5962' → 0.00005962  (₄ = 4 zeros after decimal)
+        '0.0₅1234' → 0.000001234
+        '$0.0₄5962' → 0.00005962
+        '0.00125' → 0.00125 (normal)
+    """
+    text = text.strip().lstrip('$').replace(',', '').replace(' ', '')
+    # Check for subscript digits
+    for sub_char, digit in _SUBSCRIPT_MAP.items():
+        if sub_char in text:
+            # Pattern: 0.0₄5962 → zeros_count=4, significant=5962
+            idx = text.index(sub_char)
+            before = text[:idx]  # e.g. "0.0"
+            zeros_count = int(digit)
+            after = text[idx + 1:]  # e.g. "5962"
+            # Build normal decimal: "0." + "0" * zeros_count + significant
+            return float("0." + "0" * zeros_count + after)
+    return float(text)
+
+
 class LoadPoolWorker(QThread):
     """Worker thread for loading pool info without blocking UI."""
 
@@ -1089,6 +1115,7 @@ class CreateTab(QWidget):
         self.price_input = QLineEdit()
         self.price_input.setPlaceholderText("e.g. 0.00125 or 600.50")
         self.price_input.setText("1.0")
+        self.price_input.textChanged.connect(self._normalize_price_input)
         price_row.addWidget(self.price_input)
         settings_layout.addLayout(price_row)
 
@@ -1342,6 +1369,19 @@ class CreateTab(QWidget):
         # Update address inputs
         self._on_token0_combo_changed(self.token0_combo.currentIndex())
         self._on_token1_combo_changed(self.token1_combo.currentIndex())
+
+    def _normalize_price_input(self, text: str):
+        """Auto-convert DexScreener subscript notation on paste."""
+        for sub_char in _SUBSCRIPT_MAP:
+            if sub_char in text:
+                try:
+                    normalized = _format_price(_parse_price_text(text))
+                    self.price_input.blockSignals(True)
+                    self.price_input.setText(normalized)
+                    self.price_input.blockSignals(False)
+                except (ValueError, OverflowError):
+                    pass
+                return
 
     def _on_network_changed(self, index):
         """Update RPC URL and token combos when network changes."""
@@ -1684,7 +1724,7 @@ class CreateTab(QWidget):
     def _preview_positions(self):
         """Preview positions without creating."""
         try:
-            current_price = float(self.price_input.text().strip())
+            current_price = _parse_price_text(self.price_input.text())
             percent_from = self.range_from_spin.value()
             percent_to = self.range_to_spin.value()
 
@@ -1810,7 +1850,7 @@ class CreateTab(QWidget):
 
         # Calculate price range
         try:
-            current_price = float(self.price_input.text().strip())
+            current_price = _parse_price_text(self.price_input.text())
         except (ValueError, AttributeError):
             QMessageBox.critical(self, "Error", "Invalid price value")
             return
@@ -2093,7 +2133,7 @@ class CreateTab(QWidget):
             return
 
         try:
-            initial_price = float(self.price_input.text().strip())
+            initial_price = _parse_price_text(self.price_input.text())
             if initial_price <= 0:
                 raise ValueError("Price must be positive")
         except ValueError:
