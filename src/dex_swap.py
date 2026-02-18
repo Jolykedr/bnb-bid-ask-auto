@@ -299,7 +299,7 @@ class DexSwap:
         )
     """
 
-    def __init__(self, w3: Web3, chain_id: int = 56, nonce_manager: 'NonceManager' = None, private_key: str = None, max_price_impact: float = 5.0):
+    def __init__(self, w3: Web3, chain_id: int = 56, nonce_manager: 'NonceManager' = None, private_key: str = None, max_price_impact: float = 5.0, use_kyber: bool = True):
         self.w3 = w3
         self.chain_id = chain_id
         self.nonce_manager = nonce_manager
@@ -327,6 +327,17 @@ class DexSwap:
             self.dex_name_v3 = config_v3["name"]
             self.router_v3 = w3.eth.contract(address=self.router_v3_address, abi=ROUTER_V3_ABI)
             self.quoter_v3 = w3.eth.contract(address=self.quoter_v3_address, abi=QUOTER_V3_ABI)
+
+        # KyberSwap Aggregator (primary swap path)
+        self.kyber_client = None
+        if use_kyber:
+            try:
+                from .kyberswap import KyberSwapClient, KYBER_CHAIN_SLUGS
+                if chain_id in KYBER_CHAIN_SLUGS:
+                    self.kyber_client = KyberSwapClient(chain_id)
+                    logger.info(f"KyberSwap Aggregator available for chain {chain_id}")
+            except Exception as e:
+                logger.warning(f"KyberSwap unavailable: {e}")
             logger.info(f"V3 router available: {self.dex_name_v3}")
 
     def _resolve_account(self, private_key: str = None):
@@ -1075,6 +1086,261 @@ class DexSwap:
             logger.error(f"Failed to approve: {e}")
             return False
 
+    # ── KyberSwap Aggregator methods ──
+
+    def get_kyber_quote(self, from_token: str, to_token: str, amount_in: int):
+        """
+        Получить котировку через KyberSwap Aggregator.
+
+        Returns:
+            KyberQuote или None если KyberSwap недоступен / ошибка
+        """
+        if not self.kyber_client:
+            return None
+        try:
+            quote = self.kyber_client.get_quote(from_token, to_token, amount_in)
+            # Дополнить amount_out_human decimals выходного токена
+            try:
+                to_decimals = self.get_token_decimals(to_token)
+                quote.amount_out_human = quote.amount_out / (10 ** to_decimals)
+            except Exception:
+                pass
+            return quote
+        except Exception as e:
+            logger.warning(f"KyberSwap quote failed: {e}")
+            return None
+
+    def _check_and_approve_kyber(
+        self,
+        token_address: str,
+        amount: int,
+        wallet_address: str,
+        router_address: str,
+        private_key: str = None
+    ) -> bool:
+        """Проверить и при необходимости одобрить токен для KyberSwap Router."""
+        try:
+            account = self._resolve_account(private_key)
+            token_address = Web3.to_checksum_address(token_address)
+            wallet_address = Web3.to_checksum_address(wallet_address)
+            router_address = Web3.to_checksum_address(router_address)
+
+            token_contract = self.w3.eth.contract(address=token_address, abi=ERC20_ABI)
+
+            current_allowance = token_contract.functions.allowance(
+                wallet_address, router_address
+            ).call()
+
+            if current_allowance >= amount:
+                logger.info(f"Token already approved for KyberSwap: {current_allowance} >= {amount}")
+                return True
+
+            logger.info(f"Approving token for KyberSwap router {router_address[:10]}...")
+
+            max_uint256 = 2**256 - 1
+            nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
+                    self.w3.eth.get_transaction_count(wallet_address, 'pending')
+
+            tx_sent = False
+            try:
+                tx = token_contract.functions.approve(
+                    router_address, max_uint256
+                ).build_transaction({
+                    'from': wallet_address,
+                    'nonce': nonce,
+                    'gas': 100000,
+                    'gasPrice': self.w3.eth.gas_price
+                })
+
+                signed_tx = account.sign_transaction(tx)
+                tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                tx_sent = True
+
+                logger.info(f"KyberSwap Approve TX: {tx_hash.hex()}")
+
+                receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+                if self.nonce_manager:
+                    self.nonce_manager.confirm_transaction(nonce)
+
+                return receipt.status == 1
+
+            except Exception as e:
+                if self.nonce_manager:
+                    if tx_sent:
+                        self.nonce_manager.confirm_transaction(nonce)
+                    else:
+                        self.nonce_manager.release_nonce(nonce)
+                raise
+
+        except Exception as e:
+            logger.error(f"Failed to approve for KyberSwap: {e}")
+            return False
+
+    def swap_kyber(
+        self,
+        from_token: str,
+        to_token: str,
+        amount_in: int,
+        wallet_address: str,
+        private_key: str = None,
+        slippage: float = 1.0,
+    ) -> SwapResult:
+        """
+        Выполнить своп через KyberSwap Aggregator.
+
+        Args:
+            from_token: Адрес токена для продажи
+            to_token: Адрес токена для покупки
+            amount_in: Количество в минимальных единицах
+            wallet_address: Адрес кошелька
+            private_key: Приватный ключ
+            slippage: Проскальзывание в % (1.0 = 1%)
+
+        Returns:
+            SwapResult с результатом операции
+        """
+        account = self._resolve_account(private_key)
+        if account is None:
+            return SwapResult(
+                success=False, tx_hash=None, from_token=from_token, to_token=to_token,
+                from_amount=amount_in, to_amount=0, to_amount_usd=0, gas_used=0,
+                error="No private key provided"
+            )
+
+        try:
+            from_token = Web3.to_checksum_address(from_token)
+            to_token = Web3.to_checksum_address(to_token)
+            wallet_address = Web3.to_checksum_address(wallet_address)
+
+            # 1. Получить котировку
+            quote = self.kyber_client.get_quote(from_token, to_token, amount_in)
+            logger.info(f"KyberSwap quote: in={amount_in}, out={quote.amount_out}, "
+                        f"router={quote.router_address[:10]}..., route={quote.route_description}")
+
+            # 2. Build route (получить calldata)
+            slippage_bips = int(slippage * 100)  # 1.0% → 100 bips
+            build = self.kyber_client.build_route(
+                quote.route_summary, wallet_address, wallet_address, slippage_bips
+            )
+            logger.info(f"KyberSwap build: router={build.router_address[:10]}..., "
+                        f"data_len={len(build.encoded_data)}")
+
+            router_address = build.router_address or quote.router_address
+
+            # 3. Approve токен для KyberSwap router
+            if not self._check_and_approve_kyber(
+                from_token, amount_in, wallet_address, router_address, private_key
+            ):
+                return SwapResult(
+                    success=False, tx_hash=None, from_token=from_token, to_token=to_token,
+                    from_amount=amount_in, to_amount=0, to_amount_usd=0, gas_used=0,
+                    error="Failed to approve for KyberSwap"
+                )
+
+            # 4. Построить и отправить TX
+            nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
+                    self.w3.eth.get_transaction_count(wallet_address, 'pending')
+
+            encoded_data = build.encoded_data
+            if isinstance(encoded_data, str) and encoded_data.startswith('0x'):
+                encoded_data_bytes = bytes.fromhex(encoded_data[2:])
+            elif isinstance(encoded_data, str):
+                encoded_data_bytes = bytes.fromhex(encoded_data)
+            else:
+                encoded_data_bytes = encoded_data
+
+            # Оценить газ
+            gas_estimate = build.gas_estimate
+            if gas_estimate == 0:
+                try:
+                    gas_estimate = self.w3.eth.estimate_gas({
+                        'from': wallet_address,
+                        'to': Web3.to_checksum_address(router_address),
+                        'data': encoded_data_bytes,
+                        'value': 0,
+                    })
+                    gas_estimate = int(gas_estimate * 1.3)  # +30% запас
+                except Exception as e:
+                    logger.warning(f"Gas estimate failed, using default 500000: {e}")
+                    gas_estimate = 500000
+
+            tx = {
+                'from': wallet_address,
+                'to': Web3.to_checksum_address(router_address),
+                'data': encoded_data_bytes,
+                'value': 0,
+                'gas': gas_estimate,
+                'gasPrice': self.w3.eth.gas_price,
+                'nonce': nonce,
+                'chainId': self.chain_id,
+            }
+
+            tx_sent = False
+            try:
+                signed_tx = account.sign_transaction(tx)
+                tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                tx_sent = True
+
+                logger.info(f"KyberSwap TX sent: {tx_hash.hex()}")
+
+                receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+                if self.nonce_manager:
+                    self.nonce_manager.confirm_transaction(nonce)
+            except Exception as e:
+                if self.nonce_manager:
+                    if tx_sent:
+                        self.nonce_manager.confirm_transaction(nonce)
+                    else:
+                        self.nonce_manager.release_nonce(nonce)
+                raise
+
+            if receipt.status == 1:
+                # Парсим реальное количество из Transfer events
+                actual_out = self._parse_actual_output(receipt, to_token, wallet_address)
+                if actual_out is None:
+                    actual_out = quote.amount_out
+                    logger.warning(f"Could not parse KyberSwap output, using quote: {quote.amount_out}")
+
+                # USD значение
+                to_decimals = self.get_token_decimals(to_token)
+                if self.is_stable_token(to_token):
+                    to_amount_usd = actual_out / (10 ** to_decimals)
+                else:
+                    to_amount_usd = 0
+
+                return SwapResult(
+                    success=True,
+                    tx_hash=tx_hash.hex(),
+                    from_token=from_token,
+                    to_token=to_token,
+                    from_amount=amount_in,
+                    to_amount=actual_out,
+                    to_amount_usd=to_amount_usd,
+                    gas_used=receipt.gasUsed
+                )
+            else:
+                return SwapResult(
+                    success=False,
+                    tx_hash=tx_hash.hex(),
+                    from_token=from_token,
+                    to_token=to_token,
+                    from_amount=amount_in,
+                    to_amount=0,
+                    to_amount_usd=0,
+                    gas_used=receipt.gasUsed,
+                    error="KyberSwap transaction reverted"
+                )
+
+        except Exception as e:
+            logger.error(f"KyberSwap swap failed: {e}")
+            return SwapResult(
+                success=False, tx_hash=None, from_token=from_token, to_token=to_token,
+                from_amount=amount_in, to_amount=0, to_amount_usd=0, gas_used=0,
+                error=f"KyberSwap: {e}"
+            )
+
     def swap(
         self,
         from_token: str,
@@ -1088,7 +1354,8 @@ class DexSwap:
         prefer_v3: bool = True
     ) -> SwapResult:
         """
-        Выполнить своп токена. Сначала пробует V3, затем V2.
+        Выполнить своп токена.
+        Приоритет: KyberSwap → V3 → V2.
 
         Args:
             from_token: Адрес токена для продажи
@@ -1142,9 +1409,20 @@ class DexSwap:
                     error="Zero balance"
                 )
 
-            # Пробуем V3 сначала (если доступен и prefer_v3=True)
+            # Приоритет 1: KyberSwap Aggregator
+            if self.kyber_client:
+                logger.info("Trying KyberSwap Aggregator first...")
+                result = self.swap_kyber(
+                    from_token, to_token, amount_in,
+                    wallet_address, private_key, slippage
+                )
+                if result.success:
+                    return result
+                logger.warning(f"KyberSwap failed: {result.error}, falling back to V3/V2...")
+
+            # Приоритет 2: V3 (если доступен и prefer_v3=True)
             if prefer_v3 and self.v3_available:
-                logger.info("Trying V3 swap first...")
+                logger.info("Trying V3 swap...")
                 v3_quote, best_fee, multi_hop_fee2 = self.get_quote_v3(from_token, to_token, amount_in)
 
                 if v3_quote > 0:
@@ -1154,7 +1432,7 @@ class DexSwap:
                     # Сравнить с V2 котировкой
                     v2_quote = self.get_quote(from_token, to_token, amount_in)
 
-                    # Cross-source divergence check: если обе котировки > 0 и расходятся > 10%, предупреждаем
+                    # Cross-source divergence check
                     if v3_quote > 0 and v2_quote > 0:
                         higher = max(v3_quote, v2_quote)
                         lower = min(v3_quote, v2_quote)
@@ -1162,10 +1440,8 @@ class DexSwap:
                         if divergence > 10:
                             logger.warning(f"V2/V3 quote divergence: {divergence:.1f}% (V3={v3_quote}, V2={v2_quote}) — possible pool manipulation")
 
-                    # Использовать V3 если котировка лучше или V2 недоступен
                     if v3_quote >= v2_quote or v2_quote == 0:
                         logger.info(f"Using V3 (V3: {v3_quote} vs V2: {v2_quote})")
-                        # Pass fee=None for multi-hop so swap_v3 re-discovers the best route
                         result = self.swap_v3(
                             from_token, to_token, amount_in,
                             wallet_address, private_key,
@@ -1180,7 +1456,7 @@ class DexSwap:
                 else:
                     logger.info("No V3 liquidity found, falling back to V2")
 
-            # V2 Swap
+            # Приоритет 3: V2 Swap
             return self._swap_v2(
                 from_token, to_token, amount_in,
                 wallet_address, private_key,

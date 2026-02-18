@@ -31,6 +31,7 @@ from src.contracts.v4.constants import get_v4_addresses, UNISWAP_V4_ADDRESSES, P
 from src.contracts.v4.pool_manager import V4PoolManager
 from src.liquidity_provider import LiquidityProvider
 from src.dex_swap import DexSwap
+from ui.swap_preview_dialog import SwapPreviewDialog
 
 logger = logging.getLogger(__name__)
 
@@ -619,19 +620,15 @@ class ClosePositionsWorker(QThread):
     progress = pyqtSignal(str)
     close_result = pyqtSignal(bool, str, dict)
 
-    def __init__(self, provider, token_ids, positions_data=None, auto_sell=False,
-                 private_key=None, swap_slippage=3.0, chain_id=56, initial_investment=0,
-                 max_price_impact=5.0):
+    def __init__(self, provider, token_ids, positions_data=None,
+                 chain_id=56, initial_investment=0, record_balances=False):
         super().__init__()
         self.provider = provider
         self.token_ids = token_ids
         self.positions_data = positions_data or {}
-        self.auto_sell = auto_sell
-        self.private_key = private_key
-        self.swap_slippage = swap_slippage
         self.chain_id = chain_id
         self.initial_investment = initial_investment
-        self.max_price_impact = max_price_impact
+        self.record_balances = record_balances
 
     def run(self):
         try:
@@ -750,33 +747,19 @@ class ClosePositionsWorker(QThread):
             all_success = all(r[2] for r in results) if results else False
             tx_hashes = [r[1] for r in results if r[1]]
 
-            # Auto-sell received tokens if enabled
-            sell_results = None
-            if all_success and self.auto_sell and self.private_key:
-                # Wait for tokens to arrive
-                self.progress.emit("Waiting for tokens to settle (5 sec)...")
-                time.sleep(5)
-                self.progress.emit("Auto-selling received tokens...")
-                sell_results = self._auto_sell_tokens()
-
             # Build result data
             result_data = {
                 'tx_hash': ', '.join(tx_hashes) if tx_hashes else 'N/A',
                 'gas_used': 0,
-                'initial_investment': self.initial_investment
+                'initial_investment': self.initial_investment,
+                'positions_data': self.positions_data,
+                'token_ids': self.token_ids,
             }
 
-            if sell_results:
-                result_data['sell_results'] = sell_results
-                result_data['total_usd'] = sell_results.get('total_usd', 0)
-                result_data['swaps'] = len(sell_results.get('swaps', []))
-                result_data['skipped'] = len(sell_results.get('skipped', []))
-                # Calculate PnL
-                if self.initial_investment > 0:
-                    pnl = result_data['total_usd'] - self.initial_investment
-                    pnl_percent = (pnl / self.initial_investment) * 100
-                    result_data['pnl'] = pnl
-                    result_data['pnl_percent'] = pnl_percent
+            # Record balances after close for swap preview
+            if all_success and self.record_balances:
+                self.progress.emit("Recording token balances...")
+                result_data['balances_before'] = self._get_token_balances()
 
             if all_success:
                 self.close_result.emit(True, "Positions closed successfully", result_data)
@@ -786,143 +769,39 @@ class ClosePositionsWorker(QThread):
         except Exception as e:
             self.close_result.emit(False, str(e), {})
         except BaseException as e:
-            # Catch SystemExit, KeyboardInterrupt etc. — unhandled BaseException
-            # in a QThread can crash the entire application
             logger.critical(f"BaseException in ClosePositionsWorker: {e}", exc_info=True)
             try:
                 self.close_result.emit(False, f"Fatal: {e}", {})
             except Exception:
                 pass
 
-    def _auto_sell_tokens(self) -> dict:
-        """Sell received tokens via DEX (Uniswap/PancakeSwap)."""
-        try:
-            # Get wallet balance of tokens from closed positions
-            tokens_to_sell = []
-            for tid in self.token_ids:
-                pos = self.positions_data.get(tid, {})
-                if not pos:
-                    logger.debug(f"Position {tid} has no data, skipping")
+    def _get_token_balances(self) -> dict:
+        """Get current balances of tokens from positions."""
+        w3 = self.provider.w3
+        wallet = self.provider.account.address
+        erc20_abi = [
+            {"constant": True, "inputs": [{"name": "account", "type": "address"}],
+             "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "type": "function"}
+        ]
+        balances = {}
+        seen = set()
+        for tid in self.token_ids:
+            pos = self.positions_data.get(tid, {})
+            if not pos:
+                continue
+            for key in ['token0', 'token1']:
+                addr = pos.get(key, '')
+                if not addr or addr.lower() in seen:
                     continue
-
-                token0 = pos.get('token0', '')
-                token1 = pos.get('token1', '')
-                dec0 = pos.get('token0_decimals', 18)
-                dec1 = pos.get('token1_decimals', 18)
-                sym0 = pos.get('token0_symbol', 'TOKEN0')
-                sym1 = pos.get('token1_symbol', 'TOKEN1')
-
-                # Check if token0 is NOT stable
-                token0_is_stable = token0 and token0.lower() in [t.lower() for t in STABLE_TOKENS]
-                token1_is_stable = token1 and token1.lower() in [t.lower() for t in STABLE_TOKENS]
-
-                if token0 and not token0_is_stable:
-                    tokens_to_sell.append({
-                        'address': token0,
-                        'decimals': dec0,
-                        'symbol': sym0
-                    })
-                if token1 and not token1_is_stable:
-                    tokens_to_sell.append({
-                        'address': token1,
-                        'decimals': dec1,
-                        'symbol': sym1
-                    })
-
-            if not tokens_to_sell:
-                self.progress.emit("No tokens to sell (all are stablecoins)")
-                return {'total_usd': 0, 'swaps': [], 'skipped': []}
-
-            # Remove duplicates
-            seen = set()
-            unique_tokens = []
-            for t in tokens_to_sell:
-                if t['address'].lower() not in seen:
-                    seen.add(t['address'].lower())
-                    unique_tokens.append(t)
-
-            # Get current balances
-            w3 = self.provider.w3
-            wallet = self.provider.account.address
-
-            # Initialize DEX swapper
-            swapper = DexSwap(w3, self.chain_id, max_price_impact=self.max_price_impact)
-            self.progress.emit(f"Using {swapper.dex_name} for swaps (max price impact: {self.max_price_impact}%)")
-
-            erc20_abi = [
-                {"constant": True, "inputs": [{"name": "account", "type": "address"}],
-                 "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "type": "function"}
-            ]
-
-            for token in unique_tokens:
+                seen.add(addr.lower())
                 try:
-                    contract = w3.eth.contract(
-                        address=Web3.to_checksum_address(token['address']),
-                        abi=erc20_abi
-                    )
+                    contract = w3.eth.contract(address=Web3.to_checksum_address(addr), abi=erc20_abi)
                     balance = contract.functions.balanceOf(Web3.to_checksum_address(wallet)).call()
-                    token['amount'] = balance
-                    self.progress.emit(f"  {token['symbol']}: balance = {balance / (10**token['decimals']):.6f}")
-                except Exception as e:
-                    self.progress.emit(f"  Failed to get balance for {token['symbol']}: {e}")
-                    token['amount'] = 0
+                    balances[addr.lower()] = balance
+                except Exception:
+                    balances[addr.lower()] = 0
+        return balances
 
-            # Filter tokens with balance > 0
-            tokens_with_balance = [t for t in unique_tokens if t.get('amount', 0) > 0]
-
-            if not tokens_with_balance:
-                self.progress.emit("No tokens with balance to sell")
-                return {'total_usd': 0, 'swaps': [], 'skipped': []}
-
-            output_token = swapper.get_output_token()
-            slippage = self.swap_slippage
-
-            results = {
-                'total_usd': 0.0,
-                'swaps': [],
-                'skipped': []
-            }
-
-            for token in tokens_with_balance:
-                # Skip if it's a stable token
-                if swapper.is_stable_token(token['address']):
-                    self.progress.emit(f"  Skipping {token['symbol']} (stablecoin)")
-                    results['skipped'].append(token['address'])
-                    # Add to total as 1:1
-                    results['total_usd'] += token['amount'] / (10 ** token['decimals'])
-                    continue
-
-                self.progress.emit(f"  Selling {token['symbol']} via {swapper.dex_name}...")
-
-                result = swapper.swap(
-                    from_token=token['address'],
-                    to_token=output_token,
-                    amount_in=token['amount'],
-                    wallet_address=wallet,
-                    private_key=self.private_key,
-                    slippage=slippage
-                )
-
-                if result.success:
-                    self.progress.emit(f"  ✅ Sold {token['symbol']}: ${result.to_amount_usd:.2f}")
-                    results['total_usd'] += result.to_amount_usd
-                else:
-                    self.progress.emit(f"  ❌ Failed to sell {token['symbol']}: {result.error}")
-
-                results['swaps'].append({
-                    'token': token['symbol'],
-                    'success': result.success,
-                    'usd': result.to_amount_usd,
-                    'tx_hash': result.tx_hash,
-                    'error': result.error
-                })
-
-            self.progress.emit(f"Auto-sell complete. Total: ${results['total_usd']:.2f}")
-            return results
-
-        except Exception as e:
-            self.progress.emit(f"Auto-sell error: {e}")
-            return {'total_usd': 0, 'swaps': [], 'skipped': [], 'error': str(e)}
 
 
 class BatchCloseWorker(QThread):
@@ -931,17 +810,14 @@ class BatchCloseWorker(QThread):
     progress = pyqtSignal(str)
     close_result = pyqtSignal(bool, str, dict)
 
-    def __init__(self, provider, positions: list, auto_sell=False, private_key=None,
-                 swap_slippage=3.0, initial_investment=0, max_price_impact=5.0):
+    def __init__(self, provider, positions: list,
+                 initial_investment=0, record_balances=False):
         super().__init__()
         self.provider = provider
         self.positions = positions  # List of position dicts
-        self.auto_sell = auto_sell
-        self.private_key = private_key
-        self.swap_slippage = swap_slippage
         self.initial_investment = initial_investment
         self.chain_id = getattr(provider, 'chain_id', 56)
-        self.max_price_impact = max_price_impact
+        self.record_balances = record_balances
 
     def run(self):
         try:
@@ -950,9 +826,9 @@ class BatchCloseWorker(QThread):
             w3 = self.provider.w3
             wallet = self.provider.account.address
 
-            # Record balances BEFORE close (to sell only the difference)
+            # Record balances BEFORE close
             balances_before = {}
-            if self.auto_sell:
+            if self.record_balances:
                 self.progress.emit("Recording balances before close...")
                 balances_before = self._get_token_balances()
 
@@ -972,27 +848,14 @@ class BatchCloseWorker(QThread):
             result_data = {
                 'tx_hash': tx_hash,
                 'gas_used': gas_used,
-                'initial_investment': self.initial_investment
+                'initial_investment': self.initial_investment,
+                'positions': self.positions,
             }
 
+            if success and self.record_balances:
+                result_data['balances_before'] = balances_before
+
             if success:
-                # Auto-sell if enabled
-                if self.auto_sell and self.private_key:
-                    self.progress.emit("Waiting for tokens to settle (5 sec)...")
-                    time.sleep(5)
-                    self.progress.emit("Auto-selling received tokens...")
-                    sell_results = self._auto_sell_tokens(balances_before)
-
-                    if sell_results:
-                        result_data['sell_results'] = sell_results
-                        result_data['total_usd'] = sell_results.get('total_usd', 0)
-                        # Calculate PnL
-                        if self.initial_investment > 0:
-                            pnl = result_data['total_usd'] - self.initial_investment
-                            pnl_percent = (pnl / self.initial_investment) * 100
-                            result_data['pnl'] = pnl
-                            result_data['pnl_percent'] = pnl_percent
-
                 self.close_result.emit(True, f"Closed {len(self.positions)} positions", result_data)
             else:
                 self.close_result.emit(False, f"Transaction reverted. TX: {tx_hash}", result_data)
@@ -1011,22 +874,18 @@ class BatchCloseWorker(QThread):
         """Get current balances of tokens from positions."""
         w3 = self.provider.w3
         wallet = self.provider.account.address
-
         erc20_abi = [
             {"constant": True, "inputs": [{"name": "account", "type": "address"}],
              "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "type": "function"}
         ]
-
         balances = {}
         seen = set()
-
         for pos in self.positions:
             for token_key in ['token0', 'token1']:
                 addr = pos.get(token_key, '')
                 if not addr or addr.lower() in seen:
                     continue
                 seen.add(addr.lower())
-
                 try:
                     contract = w3.eth.contract(address=Web3.to_checksum_address(addr), abi=erc20_abi)
                     balance = contract.functions.balanceOf(Web3.to_checksum_address(wallet)).call()
@@ -1035,114 +894,96 @@ class BatchCloseWorker(QThread):
                 except Exception as e:
                     self.progress.emit(f"  Failed to get balance for {addr[:10]}...: {e}")
                     balances[addr.lower()] = 0
-
         return balances
 
-    def _auto_sell_tokens(self, balances_before: dict) -> dict:
-        """Sell only RECEIVED tokens via DEX (difference between before and after)."""
+
+class SwapWorker(QThread):
+    """Worker thread for executing swaps after position close (via KyberSwap/DEX)."""
+
+    progress = pyqtSignal(str)
+    swap_result = pyqtSignal(dict)  # Final results dict
+
+    def __init__(self, w3, chain_id: int, tokens: list, private_key: str,
+                 output_token: str, slippage: float = 3.0, max_price_impact: float = 5.0,
+                 initial_investment: float = 0):
+        super().__init__()
+        self.w3 = w3
+        self.chain_id = chain_id
+        self.tokens = tokens  # List of {'address', 'symbol', 'decimals', 'amount'}
+        self.private_key = private_key
+        self.output_token = output_token
+        self.slippage = slippage
+        self.max_price_impact = max_price_impact
+        self.initial_investment = initial_investment
+
+    def run(self):
         try:
-            w3 = self.provider.w3
-            wallet = self.provider.account.address
-
-            # Initialize DEX swapper
-            swapper = DexSwap(w3, self.chain_id, max_price_impact=self.max_price_impact)
-            self.progress.emit(f"Using {swapper.dex_name} for swaps (max price impact: {self.max_price_impact}%)")
-
-            # Collect unique tokens from positions
-            tokens_to_check = []
-            for pos in self.positions:
-                token0 = pos.get('token0', '')
-                token1 = pos.get('token1', '')
-                dec0 = pos.get('token0_decimals', 18)
-                dec1 = pos.get('token1_decimals', 18)
-                sym0 = pos.get('token0_symbol', 'TOKEN0')
-                sym1 = pos.get('token1_symbol', 'TOKEN1')
-
-                if token0:
-                    tokens_to_check.append({'address': token0, 'decimals': dec0, 'symbol': sym0})
-                if token1:
-                    tokens_to_check.append({'address': token1, 'decimals': dec1, 'symbol': sym1})
-
-            # Remove duplicates
-            seen = set()
-            unique_tokens = []
-            for t in tokens_to_check:
-                addr = t['address'].lower()
-                if addr not in seen:
-                    seen.add(addr)
-                    unique_tokens.append(t)
-
-            self.progress.emit(f"Checking {len(unique_tokens)} tokens for received amounts...")
-
-            # Get balances
-            erc20_abi = [
-                {"constant": True, "inputs": [{"name": "account", "type": "address"}],
-                 "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "type": "function"}
-            ]
+            swapper = DexSwap(self.w3, self.chain_id, max_price_impact=self.max_price_impact)
+            wallet = swapper.w3.eth.account.from_key(self.private_key).address
+            self.progress.emit(f"Selling tokens via KyberSwap/DEX (slippage: {self.slippage}%)...")
 
             results = {'total_usd': 0.0, 'swaps': [], 'skipped': []}
-            output_token = swapper.get_output_token()
 
-            for token in unique_tokens:
+            for token in self.tokens:
                 addr = token['address']
-                addr_lower = addr.lower()
+                amount = token.get('amount', 0)
 
-                # Get current balance
-                try:
-                    contract = w3.eth.contract(address=Web3.to_checksum_address(addr), abi=erc20_abi)
-                    balance_after = contract.functions.balanceOf(Web3.to_checksum_address(wallet)).call()
-                except Exception as e:
-                    self.progress.emit(f"  Failed to get balance for {token['symbol']}: {e}")
+                if amount <= 0:
                     continue
 
-                # Calculate received amount (difference)
-                balance_before = balances_before.get(addr_lower, 0)
-                received = balance_after - balance_before
-
-                if received <= 0:
-                    self.progress.emit(f"  {token['symbol']}: no new tokens received (before={balance_before}, after={balance_after})")
-                    continue
-
-                self.progress.emit(f"  {token['symbol']}: received {received / (10**token['decimals']):.6f} (was {balance_before / (10**token['decimals']):.6f}, now {balance_after / (10**token['decimals']):.6f})")
-
-                # Skip stablecoins (but add to total)
+                # Skip stablecoins (add to total as 1:1)
                 if swapper.is_stable_token(addr):
-                    self.progress.emit(f"  Skipping {token['symbol']} (stablecoin) - adding ${received / (10**token['decimals']):.2f} to total")
-                    results['total_usd'] += received / (10 ** token['decimals'])
+                    usd_val = amount / (10 ** token.get('decimals', 18))
+                    self.progress.emit(f"  Skipping {token['symbol']} (stablecoin) — ${usd_val:.2f}")
+                    results['total_usd'] += usd_val
                     results['skipped'].append(addr)
                     continue
 
-                self.progress.emit(f"  Selling {received / (10**token['decimals']):.6f} {token['symbol']} via {swapper.dex_name}...")
+                self.progress.emit(f"  Selling {token['symbol']}...")
 
                 result = swapper.swap(
                     from_token=addr,
-                    to_token=output_token,
-                    amount_in=received,  # Only sell received amount!
+                    to_token=self.output_token,
+                    amount_in=amount,
                     wallet_address=wallet,
                     private_key=self.private_key,
-                    slippage=self.swap_slippage
+                    slippage=self.slippage
                 )
 
                 if result.success:
-                    self.progress.emit(f"  ✅ Sold {token['symbol']}: ${result.to_amount_usd:.2f}")
+                    self.progress.emit(f"  ✅ {token['symbol']}: ${result.to_amount_usd:.2f}")
                     results['total_usd'] += result.to_amount_usd
                 else:
-                    self.progress.emit(f"  ❌ Failed: {result.error}")
+                    self.progress.emit(f"  ❌ {token['symbol']}: {result.error}")
 
                 results['swaps'].append({
                     'token': token['symbol'],
                     'success': result.success,
                     'usd': result.to_amount_usd,
                     'tx_hash': result.tx_hash,
-                    'error': result.error
+                    'error': result.error,
                 })
 
-            self.progress.emit(f"Auto-sell complete. Total: ${results['total_usd']:.2f}")
-            return results
+            # Calculate PnL
+            if self.initial_investment > 0:
+                pnl = results['total_usd'] - self.initial_investment
+                pnl_percent = (pnl / self.initial_investment) * 100
+                results['pnl'] = pnl
+                results['pnl_percent'] = pnl_percent
+                results['initial_investment'] = self.initial_investment
+
+            self.progress.emit(f"Swap complete. Total: ${results['total_usd']:.2f}")
+            self.swap_result.emit(results)
 
         except Exception as e:
-            self.progress.emit(f"Auto-sell error: {e}")
-            return {'total_usd': 0, 'swaps': [], 'skipped': [], 'error': str(e)}
+            logger.error(f"SwapWorker error: {e}", exc_info=True)
+            self.swap_result.emit({'total_usd': 0, 'swaps': [], 'skipped': [], 'error': str(e)})
+        except BaseException as e:
+            logger.critical(f"BaseException in SwapWorker: {e}", exc_info=True)
+            try:
+                self.swap_result.emit({'total_usd': 0, 'swaps': [], 'error': f"Fatal: {e}"})
+            except Exception:
+                pass
 
 
 class ManageTab(QWidget):
@@ -2564,11 +2405,11 @@ class ManageTab(QWidget):
             f"Close {len(v4_positions)} V4 position(s) in ONE transaction?\n\n"
             f"Token IDs: {token_ids}\n\n"
             "This is more gas-efficient than closing one by one.\n\n"
-            "⚠️ If ANY position fails, the entire transaction will revert."
+            "If ANY position fails, the entire transaction will revert."
         )
 
         if auto_sell:
-            confirm_msg += f"\n\n✅ Auto-sell: Tokens will be sold via DEX (slippage: {swap_slippage}%)"
+            confirm_msg += f"\n\nAuto-sell: After close, a preview of the swap will be shown"
 
         reply = QMessageBox.question(
             self, "Confirm Batch Close",
@@ -2579,19 +2420,23 @@ class ManageTab(QWidget):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        # Get private key for auto-sell
-        private_key = None
+        # Save swap settings for preview/swap step
+        self._pending_auto_sell = auto_sell
+        self._pending_swap_slippage = swap_slippage
+        self._pending_max_price_impact = self.max_impact_spin.value()
+        self._pending_private_key = None
+
         if auto_sell:
             try:
                 main_window = self.window()
                 if hasattr(main_window, 'create_tab') and hasattr(main_window.create_tab, 'private_key'):
-                    private_key = main_window.create_tab.private_key
+                    self._pending_private_key = main_window.create_tab.private_key
                 elif hasattr(self.provider, 'account') and hasattr(self.provider.account, 'key'):
-                    private_key = self.provider.account.key.hex()
+                    self._pending_private_key = self.provider.account.key.hex()
             except Exception:
                 pass
 
-            if not private_key:
+            if not self._pending_private_key:
                 QMessageBox.warning(
                     self, "Auto-sell Error",
                     "Could not get private key for auto-sell.\n"
@@ -2609,22 +2454,17 @@ class ManageTab(QWidget):
 
         self.worker = BatchCloseWorker(
             self.provider, v4_positions,
-            auto_sell=auto_sell,
-            private_key=private_key,
-            swap_slippage=swap_slippage,
             initial_investment=initial_investment,
-            max_price_impact=self.max_impact_spin.value()
+            record_balances=auto_sell,
         )
         self.worker.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
         self.worker.close_result.connect(self._on_batch_close_finished, Qt.ConnectionType.QueuedConnection)
         self.worker.start()
 
     def _on_batch_close_finished(self, success: bool, message: str, data: dict):
-        """Handle batch close completion."""
+        """Handle batch close completion. Shows swap preview if auto-sell enabled."""
         try:
             if self.worker is not None:
-                # Wait for thread to fully finish before deleting —
-                # deleteLater on a running QThread can crash (Qt calls terminate())
                 if self.worker.isRunning():
                     self.worker.wait(10000)
                 self.worker.deleteLater()
@@ -2637,63 +2477,25 @@ class ManageTab(QWidget):
             if success:
                 self._log(f"SUCCESS: {message}")
                 self._log(f"TX Hash: {data.get('tx_hash', 'N/A')}")
-                self._log(f"Gas Used: {data.get('gas_used', 'N/A')}")
 
-                # Build result message
-                result_msg = (
-                    f"All positions closed successfully in 1 transaction!\n\n"
-                    f"TX: {data.get('tx_hash', 'N/A')}\n"
-                    f"Gas Used: {data.get('gas_used', 'N/A')}"
-                )
-
-                # Add auto-sell results if present
-                sell_results = data.get('sell_results')
-                if sell_results:
-                    total_usd = sell_results.get('total_usd', 0)
-                    swaps = sell_results.get('swaps', [])
-                    skipped = sell_results.get('skipped', [])
-                    initial = data.get('initial_investment', 0)
-                    pnl = data.get('pnl')
-                    pnl_percent = data.get('pnl_percent')
-
-                    result_msg += f"\n\n{'='*40}\n"
-                    result_msg += f"💰 AUTO-SELL RESULTS\n"
-                    result_msg += f"{'='*40}\n"
-                    result_msg += f"\nTotal received: ${total_usd:.2f}\n"
-
-                    # Show PnL if initial investment was provided
-                    if initial > 0 and pnl is not None:
-                        pnl_sign = "+" if pnl >= 0 else ""
-                        pnl_emoji = "📈" if pnl >= 0 else "📉"
-                        result_msg += f"\n{pnl_emoji} PnL SUMMARY:\n"
-                        result_msg += f"  Initial investment: ${initial:.2f}\n"
-                        result_msg += f"  Final amount: ${total_usd:.2f}\n"
-                        result_msg += f"  Profit/Loss: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_percent:.1f}%)\n"
-                        self._log(f"PnL: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_percent:.1f}%)")
-
-                    if swaps:
-                        result_msg += f"\nSwaps executed: {len(swaps)}\n"
-                        for swap in swaps:
-                            if swap.get('success'):
-                                result_msg += f"  ✅ {swap.get('token', '?')}: ${swap.get('usd', 0):.2f}\n"
-                            else:
-                                result_msg += f"  ❌ {swap.get('token', '?')}: {swap.get('error', 'Failed')}\n"
-
-                    if skipped:
-                        result_msg += f"\nSkipped (stablecoins): {len(skipped)}\n"
-
-                    self._log(f"Auto-sell total: ${total_usd:.2f}")
-
-                QMessageBox.information(self, "Batch Close Success", result_msg)
-
-                # Reload positions
-                self._refresh_all_positions()
+                # Check if auto-sell with preview is pending
+                if getattr(self, '_pending_auto_sell', False) and self._pending_private_key:
+                    self._log("Preparing swap preview...")
+                    self._show_swap_preview(data)
+                else:
+                    QMessageBox.information(
+                        self, "Batch Close Success",
+                        f"All positions closed successfully in 1 transaction!\n\n"
+                        f"TX: {data.get('tx_hash', 'N/A')}\n"
+                        f"Gas Used: {data.get('gas_used', 'N/A')}"
+                    )
+                    self._refresh_all_positions()
             else:
                 self._log(f"FAILED: {message}")
                 QMessageBox.critical(self, "Batch Close Failed", f"Failed:\n{message}")
         except Exception as e:
             logger.exception(f"Error in _on_batch_close_finished: {e}")
-            self._log(f"❌ Error in batch close handler: {e}")
+            self._log(f"Error in batch close handler: {e}")
 
     def _close_positions(self, token_ids: list):
         """Close specified positions."""
@@ -2716,7 +2518,7 @@ class ManageTab(QWidget):
         )
 
         if auto_sell:
-            confirm_msg += f"\n\n✅ Auto-sell: Tokens will be sold via DEX (slippage: {swap_slippage}%)"
+            confirm_msg += f"\n\n✅ Auto-sell: After close, a preview of the swap will be shown"
 
         reply = QMessageBox.question(
             self, "Confirm Close",
@@ -2727,19 +2529,23 @@ class ManageTab(QWidget):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        # Get private key from parent window's create tab
-        private_key = None
+        # Save swap settings for preview/swap step
+        self._pending_auto_sell = auto_sell
+        self._pending_swap_slippage = swap_slippage
+        self._pending_max_price_impact = self.max_impact_spin.value()
+        self._pending_private_key = None
+
         if auto_sell:
             try:
                 main_window = self.window()
                 if hasattr(main_window, 'create_tab') and hasattr(main_window.create_tab, 'private_key'):
-                    private_key = main_window.create_tab.private_key
+                    self._pending_private_key = main_window.create_tab.private_key
                 elif hasattr(self.provider, 'account') and hasattr(self.provider.account, 'key'):
-                    private_key = self.provider.account.key.hex()
+                    self._pending_private_key = self.provider.account.key.hex()
             except Exception:
                 pass
 
-            if not private_key:
+            if not self._pending_private_key:
                 QMessageBox.warning(
                     self, "Auto-sell Error",
                     "Could not get private key for auto-sell.\n"
@@ -2761,12 +2567,9 @@ class ManageTab(QWidget):
 
         self.worker = ClosePositionsWorker(
             self.provider, token_ids, self.positions_data,
-            auto_sell=auto_sell,
-            private_key=private_key,
-            swap_slippage=swap_slippage,
             chain_id=chain_id,
             initial_investment=initial_investment,
-            max_price_impact=self.max_impact_spin.value()
+            record_balances=auto_sell,
         )
         self.worker.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
         self.worker.close_result.connect(self._on_close_finished, Qt.ConnectionType.QueuedConnection)
@@ -2777,11 +2580,9 @@ class ManageTab(QWidget):
         self._log(message)
 
     def _on_close_finished(self, success: bool, message: str, data: dict):
-        """Handle close completion."""
+        """Handle close completion. Shows swap preview if auto-sell enabled."""
         try:
             if self.worker is not None:
-                # Wait for thread to fully finish before deleting —
-                # deleteLater on a running QThread can crash (Qt calls terminate())
                 if self.worker.isRunning():
                     self.worker.wait(10000)
                 self.worker.deleteLater()
@@ -2794,65 +2595,244 @@ class ManageTab(QWidget):
             if success:
                 self._log(f"SUCCESS: {message}")
                 self._log(f"TX Hash: {data.get('tx_hash', 'N/A')}")
-                self._log(f"Gas Used: {data.get('gas_used', 'N/A')}")
 
-                # Build result message
-                result_msg = f"Positions closed successfully!\n\nTX: {data.get('tx_hash', 'N/A')}"
-
-                # Add auto-sell results if present
-                sell_results = data.get('sell_results')
-                if sell_results:
-                    total_usd = sell_results.get('total_usd', 0)
-                    swaps = sell_results.get('swaps', [])
-                    skipped = sell_results.get('skipped', [])
-                    initial = data.get('initial_investment', 0)
-                    pnl = data.get('pnl')
-                    pnl_percent = data.get('pnl_percent')
-
-                    result_msg += f"\n\n{'='*40}\n"
-                    result_msg += f"💰 AUTO-SELL RESULTS\n"
-                    result_msg += f"{'='*40}\n"
-                    result_msg += f"\nTotal received: ${total_usd:.2f}\n"
-
-                    # Show PnL if initial investment was provided
-                    if initial > 0 and pnl is not None:
-                        pnl_sign = "+" if pnl >= 0 else ""
-                        pnl_emoji = "📈" if pnl >= 0 else "📉"
-                        result_msg += f"\n{pnl_emoji} PnL SUMMARY:\n"
-                        result_msg += f"  Initial investment: ${initial:.2f}\n"
-                        result_msg += f"  Final amount: ${total_usd:.2f}\n"
-                        result_msg += f"  Profit/Loss: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_percent:.1f}%)\n"
-                        self._log(f"PnL: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_percent:.1f}%)")
-
-                    if swaps:
-                        result_msg += f"\nSwaps executed: {len(swaps)}\n"
-                        for swap in swaps:
-                            if swap.get('success'):
-                                result_msg += f"  ✅ {swap.get('token', '?')}: ${swap.get('usd', 0):.2f}\n"
-                            else:
-                                result_msg += f"  ❌ {swap.get('token', '?')}: {swap.get('error', 'Failed')}\n"
-
-                    if skipped:
-                        result_msg += f"\nSkipped (stablecoins): {len(skipped)}\n"
-
-                    self._log(f"Auto-sell total: ${total_usd:.2f}")
-
-                    # Show PnL summary
-                    QMessageBox.information(
-                        self, "Close & Sell Complete",
-                        result_msg
-                    )
+                # Check if auto-sell with preview is pending
+                if getattr(self, '_pending_auto_sell', False) and self._pending_private_key:
+                    self._log("Preparing swap preview...")
+                    self._show_swap_preview(data)
                 else:
-                    QMessageBox.information(self, "Success", result_msg)
-
-                # Reload positions
-                self._refresh_all_positions()
+                    QMessageBox.information(
+                        self, "Success",
+                        f"Positions closed successfully!\n\nTX: {data.get('tx_hash', 'N/A')}"
+                    )
+                    self._refresh_all_positions()
             else:
                 self._log(f"FAILED: {message}")
                 QMessageBox.critical(self, "Error", f"Failed to close positions:\n{message}")
         except Exception as e:
             logger.exception(f"Error in _on_close_finished: {e}")
-            self._log(f"❌ Error in close handler: {e}")
+            self._log(f"Error in close handler: {e}")
+
+    def _show_swap_preview(self, close_data: dict):
+        """Show swap preview dialog after successful position close."""
+        try:
+            chain_id = getattr(self.provider, 'chain_id', 56)
+            w3 = self.provider.w3
+
+            # Collect volatile tokens from positions
+            positions_data = close_data.get('positions_data', {})
+            token_ids = close_data.get('token_ids', [])
+            positions = close_data.get('positions', [])
+
+            tokens_to_sell = []
+            seen = set()
+
+            # From ClosePositionsWorker (has positions_data + token_ids)
+            if positions_data and token_ids:
+                for tid in token_ids:
+                    pos = positions_data.get(tid, {})
+                    if not pos:
+                        continue
+                    for key, dec_key, sym_key in [
+                        ('token0', 'token0_decimals', 'token0_symbol'),
+                        ('token1', 'token1_decimals', 'token1_symbol'),
+                    ]:
+                        addr = pos.get(key, '')
+                        if not addr or addr.lower() in seen:
+                            continue
+                        if addr.lower() in STABLE_TOKENS:
+                            continue
+                        seen.add(addr.lower())
+                        tokens_to_sell.append({
+                            'address': addr,
+                            'decimals': pos.get(dec_key, 18),
+                            'symbol': pos.get(sym_key, 'TOKEN'),
+                            'amount': 0,  # Will be fetched by QuoteWorker
+                        })
+
+            # From BatchCloseWorker (has positions list)
+            if positions:
+                for pos in positions:
+                    for key, dec_key, sym_key in [
+                        ('token0', 'token0_decimals', 'token0_symbol'),
+                        ('token1', 'token1_decimals', 'token1_symbol'),
+                    ]:
+                        addr = pos.get(key, '')
+                        if not addr or addr.lower() in seen:
+                            continue
+                        if addr.lower() in STABLE_TOKENS:
+                            continue
+                        seen.add(addr.lower())
+                        tokens_to_sell.append({
+                            'address': addr,
+                            'decimals': pos.get(dec_key, 18),
+                            'symbol': pos.get(sym_key, 'TOKEN'),
+                            'amount': 0,
+                        })
+
+            if not tokens_to_sell:
+                self._log("No volatile tokens to sell (all stablecoins)")
+                QMessageBox.information(
+                    self, "Success",
+                    f"Positions closed!\n\nTX: {close_data.get('tx_hash', 'N/A')}\n\n"
+                    "No volatile tokens to sell."
+                )
+                self._refresh_all_positions()
+                return
+
+            # Fetch current balances
+            erc20_abi = [
+                {"constant": True, "inputs": [{"name": "account", "type": "address"}],
+                 "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "type": "function"}
+            ]
+            wallet = self.provider.account.address
+            balances_before = close_data.get('balances_before', {})
+
+            for token in tokens_to_sell:
+                try:
+                    contract = w3.eth.contract(
+                        address=Web3.to_checksum_address(token['address']), abi=erc20_abi
+                    )
+                    balance_now = contract.functions.balanceOf(
+                        Web3.to_checksum_address(wallet)
+                    ).call()
+
+                    # If we have balances_before, sell only received amount
+                    bal_before = balances_before.get(token['address'].lower(), 0)
+                    if balances_before:
+                        token['amount'] = max(0, balance_now - bal_before)
+                    else:
+                        token['amount'] = balance_now
+                except Exception as e:
+                    self._log(f"Failed to get balance for {token['symbol']}: {e}")
+                    token['amount'] = 0
+
+            # Filter out zero-balance tokens
+            tokens_to_sell = [t for t in tokens_to_sell if t.get('amount', 0) > 0]
+
+            if not tokens_to_sell:
+                self._log("No tokens with balance to sell")
+                QMessageBox.information(
+                    self, "Success",
+                    f"Positions closed!\n\nTX: {close_data.get('tx_hash', 'N/A')}\n\n"
+                    "No tokens received to sell."
+                )
+                self._refresh_all_positions()
+                return
+
+            # Get output token
+            swapper = DexSwap(w3, chain_id, use_kyber=False)
+            output_token = swapper.get_output_token()
+
+            # Save close_data for PnL display after swap
+            self._close_data = close_data
+
+            # Show preview dialog
+            dialog = SwapPreviewDialog(
+                self, tokens_to_sell, chain_id, w3,
+                output_token=output_token,
+                slippage=self._pending_swap_slippage,
+                max_price_impact=self._pending_max_price_impact,
+            )
+            dialog.confirmed.connect(self._on_swap_confirmed)
+            result = dialog.exec()
+
+            if result != SwapPreviewDialog.DialogCode.Accepted:
+                self._log("Swap cancelled by user")
+                QMessageBox.information(
+                    self, "Success",
+                    f"Positions closed!\n\nTX: {close_data.get('tx_hash', 'N/A')}\n\n"
+                    "Swap cancelled."
+                )
+                self._refresh_all_positions()
+
+        except Exception as e:
+            logger.exception(f"Error showing swap preview: {e}")
+            self._log(f"Error showing swap preview: {e}")
+            self._refresh_all_positions()
+
+    def _on_swap_confirmed(self, tokens: list):
+        """Handle swap confirmation from preview dialog."""
+        try:
+            chain_id = getattr(self.provider, 'chain_id', 56)
+            w3 = self.provider.w3
+            swapper = DexSwap(w3, chain_id, use_kyber=False)
+            output_token = swapper.get_output_token()
+
+            self.progress_bar.show()
+            self.close_selected_btn.setEnabled(False)
+            self.close_all_btn.setEnabled(False)
+            self.batch_close_btn.setEnabled(False)
+
+            initial_investment = self.initial_investment_spin.value()
+
+            self._swap_worker = SwapWorker(
+                w3, chain_id, tokens,
+                private_key=self._pending_private_key,
+                output_token=output_token,
+                slippage=self._pending_swap_slippage,
+                max_price_impact=self._pending_max_price_impact,
+                initial_investment=initial_investment,
+            )
+            self._swap_worker.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
+            self._swap_worker.swap_result.connect(self._on_swap_finished, Qt.ConnectionType.QueuedConnection)
+            self._swap_worker.start()
+        except Exception as e:
+            logger.exception(f"Error starting swap: {e}")
+            self._log(f"Error starting swap: {e}")
+
+    def _on_swap_finished(self, results: dict):
+        """Handle swap completion — show results."""
+        try:
+            if hasattr(self, '_swap_worker') and self._swap_worker is not None:
+                if self._swap_worker.isRunning():
+                    self._swap_worker.wait(10000)
+                self._swap_worker.deleteLater()
+                self._swap_worker = None
+            self.progress_bar.hide()
+            self.close_selected_btn.setEnabled(True)
+            self.close_all_btn.setEnabled(True)
+            self.batch_close_btn.setEnabled(True)
+
+            close_data = getattr(self, '_close_data', {})
+            tx_hash = close_data.get('tx_hash', 'N/A')
+
+            total_usd = results.get('total_usd', 0)
+            swaps = results.get('swaps', [])
+            pnl = results.get('pnl')
+            pnl_percent = results.get('pnl_percent')
+            initial = results.get('initial_investment', 0)
+
+            result_msg = f"Positions closed & tokens sold!\n\nClose TX: {tx_hash}\n"
+            result_msg += f"\n{'='*40}\n"
+            result_msg += f"SWAP RESULTS\n"
+            result_msg += f"{'='*40}\n"
+            result_msg += f"\nTotal received: ${total_usd:.2f}\n"
+
+            if initial > 0 and pnl is not None:
+                pnl_sign = "+" if pnl >= 0 else ""
+                result_msg += f"\nPnL SUMMARY:\n"
+                result_msg += f"  Initial investment: ${initial:.2f}\n"
+                result_msg += f"  Final amount: ${total_usd:.2f}\n"
+                result_msg += f"  Profit/Loss: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_percent:.1f}%)\n"
+                self._log(f"PnL: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_percent:.1f}%)")
+
+            if swaps:
+                result_msg += f"\nSwaps ({len(swaps)}):\n"
+                for swap in swaps:
+                    if swap.get('success'):
+                        result_msg += f"  OK {swap.get('token', '?')}: ${swap.get('usd', 0):.2f}\n"
+                    else:
+                        result_msg += f"  FAIL {swap.get('token', '?')}: {swap.get('error', 'Failed')}\n"
+
+            self._log(f"Swap total: ${total_usd:.2f}")
+
+            QMessageBox.information(self, "Close & Sell Complete", result_msg)
+            self._refresh_all_positions()
+
+        except Exception as e:
+            logger.exception(f"Error in _on_swap_finished: {e}")
+            self._log(f"Error in swap handler: {e}")
 
     def _clear_list(self):
         """Clear the positions list."""

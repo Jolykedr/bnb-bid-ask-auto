@@ -19,6 +19,7 @@ from src.math.distribution import (
     calculate_bid_ask_from_percent,
     calculate_bid_ask_distribution
 )
+import math
 
 
 class CalculatorTab(QWidget):
@@ -183,6 +184,28 @@ class CalculatorTab(QWidget):
 
         left_layout.addWidget(dist_group)
 
+        # Token Decimals Group (for correct tick calculation on mixed-decimal pairs)
+        dec_group = QGroupBox("Token Decimals")
+        dec_layout = QVBoxLayout(dec_group)
+
+        dec0_row = QHBoxLayout()
+        dec0_row.addWidget(QLabel("Token0 (volatile):"))
+        self.token0_dec_spin = QSpinBox()
+        self.token0_dec_spin.setRange(0, 18)
+        self.token0_dec_spin.setValue(18)
+        dec0_row.addWidget(self.token0_dec_spin)
+        dec_layout.addLayout(dec0_row)
+
+        dec1_row = QHBoxLayout()
+        dec1_row.addWidget(QLabel("Token1 (stable):"))
+        self.token1_dec_spin = QSpinBox()
+        self.token1_dec_spin.setRange(0, 18)
+        self.token1_dec_spin.setValue(18)
+        dec1_row.addWidget(self.token1_dec_spin)
+        dec_layout.addLayout(dec1_row)
+
+        left_layout.addWidget(dec_group)
+
         # Calculate button
         self.calculate_btn = QPushButton("Calculate Preview")
         self.calculate_btn.setObjectName("primaryButton")
@@ -239,6 +262,15 @@ class CalculatorTab(QWidget):
         tiers = [500, 2500, 3000, 10000]
         return tiers[index]
 
+    def _compute_decimal_offset(self) -> int:
+        """Compute decimal tick offset from token decimals."""
+        t0_dec = self.token0_dec_spin.value()
+        t1_dec = self.token1_dec_spin.value()
+        dec_diff = t1_dec - t0_dec
+        if dec_diff == 0:
+            return 0
+        return round(dec_diff * math.log(10) / math.log(1.0001))
+
     def calculate_positions(self):
         """Calculate and display positions."""
         try:
@@ -247,6 +279,9 @@ class CalculatorTab(QWidget):
             n_positions = self.positions_spin.value()
             distribution_type = self._get_distribution_type()
             fee_tier = self._get_fee_tier()
+            t0_dec = self.token0_dec_spin.value()
+            t1_dec = self.token1_dec_spin.value()
+            decimal_offset = self._compute_decimal_offset()
 
             if self.percent_radio.isChecked():
                 # Percent-based range
@@ -263,7 +298,10 @@ class CalculatorTab(QWidget):
                     total_usd=total_usd,
                     n_positions=n_positions,
                     fee_tier=fee_tier,
-                    distribution_type=distribution_type
+                    distribution_type=distribution_type,
+                    token0_decimals=t0_dec,
+                    token1_decimals=t1_dec,
+                    decimal_tick_offset=decimal_offset,
                 )
             else:
                 # Absolute range
@@ -290,7 +328,10 @@ class CalculatorTab(QWidget):
                     total_usd=total_usd,
                     n_positions=n_positions,
                     fee_tier=fee_tier,
-                    distribution_type=distribution_type
+                    distribution_type=distribution_type,
+                    token0_decimals=t0_dec,
+                    token1_decimals=t1_dec,
+                    decimal_tick_offset=decimal_offset,
                 )
 
             # Update displays
