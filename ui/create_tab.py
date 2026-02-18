@@ -2320,11 +2320,18 @@ class CreateTab(QWidget):
                     except Exception:
                         pass
 
+            # Set network FIRST with signals blocked to avoid _on_network_changed
+            # overwriting the saved RPC with hardcoded defaults
+            if saved_network:
+                self.network_combo.blockSignals(True)
+                self.network_combo.setCurrentIndex(int(saved_network))
+                self.network_combo.blockSignals(False)
+                # Manually rebuild token combos (normally done by _on_network_changed)
+                self._rebuild_token_combos()
+
+            # Set saved RPC AFTER network change so it's not overwritten
             if saved_rpc:
                 self.rpc_input.setText(saved_rpc)
-
-            if saved_network:
-                self.network_combo.setCurrentIndex(int(saved_network))
 
         except Exception as e:
             logger.warning(f"Error loading saved wallet: {e}")

@@ -621,14 +621,13 @@ class ClosePositionsWorker(QThread):
     close_result = pyqtSignal(bool, str, dict)
 
     def __init__(self, provider, token_ids, positions_data=None,
-                 chain_id=56, initial_investment=0, record_balances=False):
+                 chain_id=56, initial_investment=0):
         super().__init__()
         self.provider = provider
         self.token_ids = token_ids
         self.positions_data = positions_data or {}
         self.chain_id = chain_id
         self.initial_investment = initial_investment
-        self.record_balances = record_balances
 
     def run(self):
         try:
@@ -756,11 +755,6 @@ class ClosePositionsWorker(QThread):
                 'token_ids': self.token_ids,
             }
 
-            # Record balances after close for swap preview
-            if all_success and self.record_balances:
-                self.progress.emit("Recording token balances...")
-                result_data['balances_before'] = self._get_token_balances()
-
             if all_success:
                 self.close_result.emit(True, "Positions closed successfully", result_data)
             else:
@@ -775,35 +769,6 @@ class ClosePositionsWorker(QThread):
             except Exception:
                 pass
 
-    def _get_token_balances(self) -> dict:
-        """Get current balances of tokens from positions."""
-        w3 = self.provider.w3
-        wallet = self.provider.account.address
-        erc20_abi = [
-            {"constant": True, "inputs": [{"name": "account", "type": "address"}],
-             "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "type": "function"}
-        ]
-        balances = {}
-        seen = set()
-        for tid in self.token_ids:
-            pos = self.positions_data.get(tid, {})
-            if not pos:
-                continue
-            for key in ['token0', 'token1']:
-                addr = pos.get(key, '')
-                if not addr or addr.lower() in seen:
-                    continue
-                seen.add(addr.lower())
-                try:
-                    contract = w3.eth.contract(address=Web3.to_checksum_address(addr), abi=erc20_abi)
-                    balance = contract.functions.balanceOf(Web3.to_checksum_address(wallet)).call()
-                    balances[addr.lower()] = balance
-                except Exception:
-                    balances[addr.lower()] = 0
-        return balances
-
-
-
 class BatchCloseWorker(QThread):
     """Worker thread for batch closing ALL V4 positions in ONE transaction."""
 
@@ -811,13 +776,12 @@ class BatchCloseWorker(QThread):
     close_result = pyqtSignal(bool, str, dict)
 
     def __init__(self, provider, positions: list,
-                 initial_investment=0, record_balances=False):
+                 initial_investment=0):
         super().__init__()
         self.provider = provider
         self.positions = positions  # List of position dicts
         self.initial_investment = initial_investment
         self.chain_id = getattr(provider, 'chain_id', 56)
-        self.record_balances = record_balances
 
     def run(self):
         try:
@@ -825,12 +789,6 @@ class BatchCloseWorker(QThread):
 
             w3 = self.provider.w3
             wallet = self.provider.account.address
-
-            # Record balances BEFORE close
-            balances_before = {}
-            if self.record_balances:
-                self.progress.emit("Recording balances before close...")
-                balances_before = self._get_token_balances()
 
             # Detect protocol from positions data (all positions in batch must be same protocol)
             proto_str = self.positions[0].get('protocol', 'v4') if self.positions else 'v4'
@@ -852,9 +810,6 @@ class BatchCloseWorker(QThread):
                 'positions': self.positions,
             }
 
-            if success and self.record_balances:
-                result_data['balances_before'] = balances_before
-
             if success:
                 self.close_result.emit(True, f"Closed {len(self.positions)} positions", result_data)
             else:
@@ -870,31 +825,6 @@ class BatchCloseWorker(QThread):
             except Exception:
                 pass
 
-    def _get_token_balances(self) -> dict:
-        """Get current balances of tokens from positions."""
-        w3 = self.provider.w3
-        wallet = self.provider.account.address
-        erc20_abi = [
-            {"constant": True, "inputs": [{"name": "account", "type": "address"}],
-             "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "type": "function"}
-        ]
-        balances = {}
-        seen = set()
-        for pos in self.positions:
-            for token_key in ['token0', 'token1']:
-                addr = pos.get(token_key, '')
-                if not addr or addr.lower() in seen:
-                    continue
-                seen.add(addr.lower())
-                try:
-                    contract = w3.eth.contract(address=Web3.to_checksum_address(addr), abi=erc20_abi)
-                    balance = contract.functions.balanceOf(Web3.to_checksum_address(wallet)).call()
-                    balances[addr.lower()] = balance
-                    self.progress.emit(f"  {addr[:10]}... balance before: {balance}")
-                except Exception as e:
-                    self.progress.emit(f"  Failed to get balance for {addr[:10]}...: {e}")
-                    balances[addr.lower()] = 0
-        return balances
 
 
 class SwapWorker(QThread):
@@ -1083,7 +1013,7 @@ class ManageTab(QWidget):
 
         # Filter options row
         filter_layout = QHBoxLayout()
-        self.hide_empty_cb = QCheckBox("Hide empty positions (liquidity = 0 or < $0.000001)")
+        self.hide_empty_cb = QCheckBox("Hide empty positions (liquidity = 0 or < $0.00001)")
         self.hide_empty_cb.setChecked(True)  # Hide empty by default
         self.hide_empty_cb.toggled.connect(self._on_filter_changed)
         filter_layout.addWidget(self.hide_empty_cb)
@@ -1176,6 +1106,13 @@ class ManageTab(QWidget):
         )
         self.auto_sell_cb.setChecked(False)
         close_settings_layout.addWidget(self.auto_sell_cb)
+
+        self.skip_preview_cb = QCheckBox("Skip preview")
+        self.skip_preview_cb.setToolTip(
+            "Skip swap preview dialog and sell immediately"
+        )
+        self.skip_preview_cb.setChecked(False)
+        close_settings_layout.addWidget(self.skip_preview_cb)
 
         close_settings_layout.addWidget(QLabel("Swap Slip:"))
         self.swap_slippage_spin = QDoubleSpinBox()
@@ -1690,7 +1627,7 @@ class ManageTab(QWidget):
                         if liquidity == 0:
                             hidden_count += 1
                             continue
-                        if usd_val is not None and 0 <= usd_val < 0.000001:
+                        if usd_val is not None and 0 <= usd_val < 0.00001:
                             hidden_count += 1
                             continue
                     self._update_table_row_inner(token_id, position)
@@ -2009,9 +1946,9 @@ class ManageTab(QWidget):
         # Store computed USD value for filtering
         position['_usd_value'] = usd_value
 
-        # Hide dust positions (< $0.000001) when filter is on
+        # Hide dust positions (< $0.00001) when filter is on
         if self.hide_empty_cb.isChecked():
-            if liquidity == 0 or (0 <= usd_value < 0.000001):
+            if liquidity == 0 or (0 <= usd_value < 0.00001):
                 # Remove the row if it was added
                 if row < self.positions_table.rowCount():
                     self.positions_table.removeRow(row)
@@ -2455,7 +2392,6 @@ class ManageTab(QWidget):
         self.worker = BatchCloseWorker(
             self.provider, v4_positions,
             initial_investment=initial_investment,
-            record_balances=auto_sell,
         )
         self.worker.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
         self.worker.close_result.connect(self._on_batch_close_finished, Qt.ConnectionType.QueuedConnection)
@@ -2569,7 +2505,6 @@ class ManageTab(QWidget):
             self.provider, token_ids, self.positions_data,
             chain_id=chain_id,
             initial_investment=initial_investment,
-            record_balances=auto_sell,
         )
         self.worker.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
         self.worker.close_result.connect(self._on_close_finished, Qt.ConnectionType.QueuedConnection)
@@ -2647,7 +2582,7 @@ class ManageTab(QWidget):
                             'address': addr,
                             'decimals': pos.get(dec_key, 18),
                             'symbol': pos.get(sym_key, 'TOKEN'),
-                            'amount': 0,  # Will be fetched by QuoteWorker
+                            'amount': 0,
                         })
 
             # From BatchCloseWorker (has positions list)
@@ -2680,29 +2615,21 @@ class ManageTab(QWidget):
                 self._refresh_all_positions()
                 return
 
-            # Fetch current balances
+            # Fetch current wallet balances (sell entire balance, like web version)
             erc20_abi = [
                 {"constant": True, "inputs": [{"name": "account", "type": "address"}],
                  "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "type": "function"}
             ]
             wallet = self.provider.account.address
-            balances_before = close_data.get('balances_before', {})
 
             for token in tokens_to_sell:
                 try:
                     contract = w3.eth.contract(
                         address=Web3.to_checksum_address(token['address']), abi=erc20_abi
                     )
-                    balance_now = contract.functions.balanceOf(
+                    token['amount'] = contract.functions.balanceOf(
                         Web3.to_checksum_address(wallet)
                     ).call()
-
-                    # If we have balances_before, sell only received amount
-                    bal_before = balances_before.get(token['address'].lower(), 0)
-                    if balances_before:
-                        token['amount'] = max(0, balance_now - bal_before)
-                    else:
-                        token['amount'] = balance_now
                 except Exception as e:
                     self._log(f"Failed to get balance for {token['symbol']}: {e}")
                     token['amount'] = 0
@@ -2726,6 +2653,12 @@ class ManageTab(QWidget):
 
             # Save close_data for PnL display after swap
             self._close_data = close_data
+
+            # Skip preview → sell immediately
+            if self.skip_preview_cb.isChecked():
+                self._log("Skipping preview, selling immediately...")
+                self._on_swap_confirmed(tokens_to_sell)
+                return
 
             # Show preview dialog
             dialog = SwapPreviewDialog(
