@@ -31,7 +31,7 @@ from src.math.distribution import calculate_bid_ask_from_percent
 from src.v4_liquidity_provider import V4LiquidityProvider, V4LadderConfig
 from src.contracts.v4.constants import V4Protocol
 from src.contracts.v4.subgraph import try_all_sources_with_web3 as query_v4_subgraph
-from config import BNB_CHAIN, BNB_TESTNET, ETHEREUM, BASE, TOKENS_BNB, TOKENS_BASE, STABLECOINS, is_stablecoin
+from config import BNB_CHAIN, ETHEREUM, BASE, TOKENS_BNB, TOKENS_BASE, STABLECOINS, is_stablecoin
 
 
 def _format_price(price: float) -> str:
@@ -896,7 +896,7 @@ class CreateTab(QWidget):
         network_row = QHBoxLayout()
         network_row.addWidget(QLabel("Network:"))
         self.network_combo = QComboBox()
-        self.network_combo.addItems(["BNB Mainnet", "BNB Testnet", "Ethereum Mainnet", "Base Mainnet"])
+        self.network_combo.addItems(["BNB Mainnet", "Ethereum Mainnet", "Base Mainnet"])
         network_row.addWidget(self.network_combo)
         wallet_layout.addLayout(network_row)
 
@@ -1292,9 +1292,9 @@ class CreateTab(QWidget):
     def _get_current_tokens(self) -> dict:
         """Get token dict for the currently selected network."""
         index = self.network_combo.currentIndex()
-        if index == 3:  # Base Mainnet
+        if index == 2:  # Base Mainnet
             return TOKENS_BASE
-        # BNB Mainnet, BNB Testnet, Ethereum — all use BNB tokens for now
+        # BNB Mainnet, Ethereum — all use BNB tokens
         return TOKENS_BNB
 
     def _rebuild_token_combos(self):
@@ -1304,7 +1304,7 @@ class CreateTab(QWidget):
 
         # Determine default selections and token1 list per network
         index = self.network_combo.currentIndex()
-        if index == 3:  # Base
+        if index == 2:  # Base
             default_token0 = "WETH"
             default_token1 = "USDC"
             token1_symbols = [s for s in symbols if s in ("USDC", "USDbC", "DAI", "WETH")]
@@ -1348,10 +1348,8 @@ class CreateTab(QWidget):
         if index == 0:
             self.rpc_input.setText(BNB_CHAIN.rpc_url)
         elif index == 1:
-            self.rpc_input.setText(BNB_TESTNET.rpc_url)
-        elif index == 2:
             self.rpc_input.setText(ETHEREUM.rpc_url)
-        elif index == 3:
+        elif index == 2:
             self.rpc_input.setText(BASE.rpc_url)
 
         # Rebuild token combos for the new network
@@ -1363,10 +1361,8 @@ class CreateTab(QWidget):
         if index == 0:
             return BNB_CHAIN
         elif index == 1:
-            return BNB_TESTNET
-        elif index == 2:
             return ETHEREUM
-        elif index == 3:
+        elif index == 2:
             return BASE
         return BNB_CHAIN  # Default
 
@@ -2323,8 +2319,18 @@ class CreateTab(QWidget):
             # Set network FIRST with signals blocked to avoid _on_network_changed
             # overwriting the saved RPC with hardcoded defaults
             if saved_network:
+                net_idx = int(saved_network)
+                # Migration: old indices had BNB Testnet at 1
+                # Old: BNB(0), Testnet(1), Ethereum(2), Base(3)
+                # New: BNB(0), Ethereum(1), Base(2)
+                if net_idx == 1:
+                    net_idx = 0  # Testnet removed → fallback to BNB
+                elif net_idx == 2:
+                    net_idx = 1  # Ethereum shifted
+                elif net_idx == 3:
+                    net_idx = 2  # Base shifted
                 self.network_combo.blockSignals(True)
-                self.network_combo.setCurrentIndex(int(saved_network))
+                self.network_combo.setCurrentIndex(net_idx)
                 self.network_combo.blockSignals(False)
                 # Manually rebuild token combos (normally done by _on_network_changed)
                 self._rebuild_token_combos()

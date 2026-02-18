@@ -150,7 +150,7 @@ ETHEREUM = ChainConfig(
 # - https://rpc.ankr.com/base
 BASE = ChainConfig(
     chain_id=8453,
-    rpc_url="https://base.llamarpc.com",
+    rpc_url="https://rpc.ankr.com/base/1677373bc1c6f2038245f65cc3cddd165531f1e95dd90d9aad42d0c4e494d40d",
     explorer_url="https://basescan.org",
     native_token="ETH",
     # Uniswap V3 NonfungiblePositionManager (Base)

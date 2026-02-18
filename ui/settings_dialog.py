@@ -59,7 +59,7 @@ class SettingsDialog(QDialog):
         network_row = QHBoxLayout()
         network_row.addWidget(QLabel("Default Network:"))
         self.network_combo = QComboBox()
-        self.network_combo.addItems(["BNB Mainnet", "BNB Testnet", "Base Mainnet", "Ethereum Mainnet"])
+        self.network_combo.addItems(["BNB Mainnet", "Ethereum Mainnet", "Base Mainnet"])
         self.network_combo.currentIndexChanged.connect(self.on_network_changed)
         network_row.addWidget(self.network_combo)
         network_row.addWidget(QLabel(""))
@@ -303,9 +303,8 @@ class SettingsDialog(QDialog):
         """Auto-update RPC URL when network changes."""
         rpc_urls = {
             0: "https://bsc-dataseed.binance.org/",              # BNB Mainnet
-            1: "https://data-seed-prebsc-1-s1.binance.org:8545/", # BNB Testnet
-            2: "https://base.llamarpc.com",                       # Base Mainnet
-            3: "https://eth.llamarpc.com"                         # Ethereum Mainnet
+            1: "https://eth.llamarpc.com",                        # Ethereum Mainnet
+            2: "https://rpc.ankr.com/base/1677373bc1c6f2038245f65cc3cddd165531f1e95dd90d9aad42d0c4e494d40d",  # Base Mainnet
         }
         if index in rpc_urls:
             self.rpc_input.setText(rpc_urls[index])
