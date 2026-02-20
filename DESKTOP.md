@@ -140,12 +140,20 @@ QTabWidget.currentChanged ──→ MainWindow._on_tab_changed() [mutex-protecte
 | CreateLadderWorkerV4 | Create | V4 ladder (modifyLiquidities) |
 | LoadPositionWorker | Manage | Загрузка позиции по token_id |
 | ScanWalletWorker | Manage | Сканирование всех позиций кошелька |
-| ClosePositionWorker | Manage | Закрытие позиции (decrease + collect + burn) |
-| SwapWorker | Manage | Своп через DexSwap |
+| ClosePositionWorker | Manage | Закрытие позиций (decrease + collect + burn) |
+| BatchCloseWorker | Manage | Batch-close V4 позиций в 1 TX (modifyLiquidities) |
+| SwapWorker | Manage | Своп через DexSwap (auto-sell после закрытия) |
 | QuoteWorker | SwapDialog | Получение котировок для preview |
 | LoadTokenWorker | Advanced | Загрузка информации о токене |
 | CreatePoolWorker | Advanced | Создание V3 пула |
 | CreateV4PoolWorker | Advanced | Создание V4 пула |
+
+**ManageTab — ключевые паттерны:**
+- `PriceProgressDelegate` — кастомный QStyledItemDelegate для Range Progress колонки (gradient bar + triangle marker)
+- `QTimer` debounce (200ms) — `_flush_table_updates()` для пакетного обновления таблицы (при загрузке 50+ позиций)
+- `_positions_mutex` (QMutex) — защита `positions_data` dict при конкурентных worker'ах
+- `_row_index` dict — O(1) маппинг token_id → row для быстрого обновления
+- PnL: `current_value + fees_earned - initial_investment`
 
 **Паттерн lifecycle:**
 ```python
@@ -163,12 +171,23 @@ worker.start()
 
 ### config.py — Центральная конфигурация
 
-**Сети:**
-- BNB Chain (56): PancakeSwap V3, Uniswap V3
-- Base (8453): Uniswap V3/V4, PancakeSwap V3
-- Ethereum (1): Uniswap V3, PancakeSwap V3
+**Сети и протоколы:**
 
-**STABLECOINS — единый реестр:**
+| Сеть | Chain ID | V3 DEXes | V4 DEXes |
+|------|----------|----------|----------|
+| BNB Chain | 56 | PancakeSwap V3, Uniswap V3 | Uniswap V4, PancakeSwap V4 (Infinity) |
+| Base | 8453 | Uniswap V3, PancakeSwap V3 | Uniswap V4 |
+| Ethereum | 1 | Uniswap V3, PancakeSwap V3 | Uniswap V4 |
+| BNB Testnet | 97 | PancakeSwap V3 | — |
+
+> **Примечание:** `get_tokens_for_chain(1)` возвращает `TOKENS_BNB` — для Ethereum нет отдельного набора токенов.
+
+**Два реестра стабильных токенов:**
+
+- `STABLECOINS: Dict[str, int]` — адрес → decimals (для расчёта ликвидности, определения invert_price)
+- `STABLE_TOKENS: Dict[str, str]` — адрес → символ (расширенный: включает WBNB, WETH — токены которые НЕ нужно продавать при auto-sell)
+
+**STABLECOINS — реестр decimals:**
 ```python
 STABLECOINS = {
     # BNB: все 18 decimals
@@ -185,9 +204,12 @@ STABLECOINS = {
 ```
 
 **Функции:**
-- `is_stablecoin(address)` — проверка адреса
+- `is_stablecoin(address)` — проверка адреса в STABLECOINS
+- `is_stable_token(address)` — проверка в STABLE_TOKENS (включает WBNB/WETH)
 - `get_stablecoin_decimals(address)` — decimals (default 18)
 - `detect_v3_dex_by_pool(w3, pool_addr, chain_id)` — определение DEX по factory
+- `get_chain_config(chain_id)` → ChainConfig
+- `get_v3_dex_config(dex_name, chain_id)` → V3DexConfig
 
 ---
 
@@ -276,6 +298,38 @@ class V4LiquidityProvider:
 - Action-based encoding (не multicall mint)
 - Custom fee tiers (0-100%, не только стандартные)
 - Разные pool_id формулы для Uniswap vs PancakeSwap
+- Чтение пула: StateView (Uniswap V4) vs прямой PoolManager (PancakeSwap V4)
+
+**V4 Contract Addresses** (из `src/contracts/v4/constants.py`):
+
+| Сеть | Protocol | PoolManager | PositionManager | StateView |
+|------|----------|-------------|-----------------|-----------|
+| BNB (56) | Uniswap | `0x28e2ea09...` | `0x7a4a5c91...` | `0xd13dd3d6...` |
+| BNB (56) | PancakeSwap | `0xa0FfB9c1...` | `0x55f4c8ab...` | — (Vault: `0x238a3588...`) |
+| ETH (1) | Uniswap | `0x00000000...4444c5` | `0xbd216513...` | — |
+| BASE (8453) | Uniswap | `0x498581ff...` | `0x7c5f5a4b...` | `0xa3c0c9b6...` |
+
+**Permit2 Addresses:**
+- Uniswap: `0x000000000022D473030F116dDEE9F6B43aC78BA3` (все сети)
+- PancakeSwap: `0x31c2F6fcFf4F8759b3Bd5Bf0e1084A055615c768`
+
+**V4 Action Codes** (action-based encoding в `modifyLiquidities`):
+```
+0x02 MINT_POSITION      — создание позиции
+0x00 INCREASE_LIQUIDITY  — увеличение ликвидности
+0x01 DECREASE_LIQUIDITY  — уменьшение ликвидности
+0x03 BURN_POSITION       — удаление позиции
+0x0d SETTLE_PAIR         — расчёт токен-пары
+0x11 TAKE_PAIR           — вывод токен-пары
+0x12 CLOSE_CURRENCY      — закрытие валюты
+```
+
+**V4 Position Info (packed bytes32):**
+Позиция хранится как packed bytes32, тики извлекаются через 3 fallback layout:
+1. Стандартный Uniswap: bits 8-32 = tickLower, 32-56 = tickUpper
+2. Альтернативный: bits 24-48, 48-72
+3. Top-down: bits 232-256, 208-232
+Валидация: MIN_TICK ≤ tl < tu ≤ MAX_TICK, оба кратны tick_spacing.
 
 ---
 
@@ -439,7 +493,52 @@ PCS V3 возвращает 8 полей (feeProtocol: uint32), Uniswap V3 — 7
 В отличие от бота (который логирует warning), desktop **бросает RuntimeError** при неудачном чтении decimals.
 Это **правильное поведение** — silent fallback на 18 приводит к 10^12x ошибке для USDC 6 dec.
 
-### 7. Worker lifecycle
+### 7. V4 Pool State — StateView vs PoolManager
+
+Uniswap V4 читает пул через **StateView** контракт (отдельный адрес `state_view` в constants).
+PancakeSwap V4 читает напрямую из **CLPoolManager** (нет StateView).
+`V4PoolManager.get_pool_state()` автоматически выбирает метод по `self.protocol`.
+
+### 8. V4 Position Info — 3 layout fallback
+
+`getPoolAndPositionInfo(tokenId)` возвращает packed bytes32. Тики извлекаются через `_extract_ticks()`:
+- Layout 1 (стандарт Uniswap): bits 8-32, 32-56
+- Layout 2: bits 24-48, 48-72
+- Layout 3 (top-down): bits 232-256, 208-232
+- Валидация: MIN_TICK ≤ tl < tu ≤ MAX_TICK + alignment к tick_spacing
+- Если все 3 layout провалились → запрос к Uniswap GraphQL API
+
+### 9. EIP-1559 gas pricing
+
+Все TX используют EIP-1559 с fallback на legacy:
+```python
+try:
+    max_priority_fee = w3.eth.max_priority_fee
+    base_fee = w3.eth.get_block('latest')['baseFeePerGas']
+    # maxFeePerGas = baseFee * 2 + maxPriorityFee
+except:
+    # Fallback на legacy gasPrice
+```
+`GasEstimator` умножает estimate на `gas_multiplier` (из настроек, default 1.3).
+
+### 10. Nonce pattern (tx_sent flag)
+
+Все 26+ мест отправки TX используют флаг `tx_sent`:
+```python
+tx_sent = False
+try:
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    tx_sent = True
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+    nonce_manager.confirm_transaction(nonce)  # ВСЕГДА после receipt (даже revert)
+except:
+    if tx_sent:
+        nonce_manager.confirm_transaction(nonce)  # TX ушла → nonce consumed
+    else:
+        nonce_manager.release_nonce(nonce)         # TX не ушла → переиспользовать
+```
+
+### 11. Worker lifecycle
 
 - `deleteLater()` на finished
 - `worker.wait(5000)` перед delete в closeEvent
@@ -469,7 +568,7 @@ PCS V3 возвращает 8 полей (feeProtocol: uint32), Uniswap V3 — 7
 
 | Файл | Использование |
 |------|-------------|
-| `config.py` | `STABLECOINS` dict, `is_stablecoin()`, `get_stablecoin_decimals()` |
+| `config.py` | `STABLECOINS` dict, `STABLE_TOKENS` dict, `is_stablecoin()`, `is_stable_token()`, `get_stablecoin_decimals()` |
 | `ui/create_tab.py` | `_should_invert_price()`, decimal offset, pool loading |
 | `ui/manage_tab.py` | USD value calculation, position display |
 | `ui/advanced_tab.py` | Swap token detection |
@@ -513,3 +612,33 @@ PCS V3 возвращает 8 полей (feeProtocol: uint32), Uniswap V3 — 7
 - [x] Contract coverage 100% (V3 PM, pool factory)
 - [ ] UI layer coverage 4-16% — **НИЗКОЕ**
 - [ ] okx_dex.py coverage 0% — **НЕ ТЕСТИРОВАНО**
+
+---
+
+## Wallet Scanning (обнаружение позиций)
+
+**V3:**
+1. `balanceOf(wallet)` → count, `tokenOfOwnerByIndex(wallet, i)` (ERC721Enumerable)
+2. Fallback: Transfer event scan + `ownerOf()` проверка
+
+**V4:**
+1. ERC721Enumerable (если поддерживается)
+2. Fallback: BSCScan/Basescan API `tokennfttx`
+3. Fallback: Transfer event scan с chunked RPC (блоки по 1000-200)
+
+---
+
+## V3 vs V4 Comparison Table
+
+| Аспект | V3 | V4 |
+|--------|----|----|
+| Пулы | Отдельные контракты + Factory | Singleton PoolManager |
+| Минт | `PositionManager.mint()` | Action encoding → `modifyLiquidities()` |
+| Апрувы | `ERC20.approve(PositionManager)` | `ERC20→Permit2→PositionManager` |
+| Комиссии | Фиксированные: 100, 500, 2500, 3000, 10000 | Кастомные 0-100% (hundredths of bip) |
+| Tick spacing | По таблице FEE→SPACING | `fee_percent × 200` |
+| Батчинг | Multicall3 обёртка | Нативный action batching |
+| Чтение пула | `Pool.slot0()` | StateView (Uni) / PoolManager (PCS) |
+| Pool ID | Нет (адрес пула) | `keccak256(PoolKey)` — разный формат для Uni и PCS |
+| Позиции | Полный struct | Packed bytes32 (3 fallback layout) |
+| Закрытие | decrease + collect + burn (3 calls) | DECREASE + BURN + TAKE_PAIR (packed) |
