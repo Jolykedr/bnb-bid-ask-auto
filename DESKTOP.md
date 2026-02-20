@@ -6,7 +6,7 @@
 Это **оригинальный** проект — веб-версия и бот портированы из него.
 
 - Интерактивный калькулятор позиций с визуализацией
-- Создание лестницы на блокчейне (V3: batch mint через Multicall3, V4: modifyLiquidities)
+- Создание лестницы на блокчейне (V3: batch mint через PositionManager.multicall, V4: modifyLiquidities)
 - Управление позициями (загрузка, закрытие, сбор комиссий, свопы)
 - Поддержка BNB Chain, Base, Ethereum
 - Лицензирование (Ed25519)
@@ -61,7 +61,7 @@ bnb/
 │   │       └── subgraph.py            # Uniswap V4 GraphQL API
 │   │
 │   └── multicall/
-│       └── batcher.py                 # Multicall3 (batch mint до 7 позиций в 1 TX)
+│       └── batcher.py                 # PositionManager.multicall (batch mint/close в 1 TX)
 │
 ├── ui/                                # ИНТЕРФЕЙС (PyQt6)
 │   ├── main_window.py                 # MainWindow (4 таба, меню, mutex, worker cleanup)
@@ -338,7 +338,7 @@ _secure_zero(bytearray_data) → None  # ctypes.memset
    a. Detect/create pool
    b. Approve tokens (ERC20 для V3, Permit2 для V4)
    c. Compute positions → MintParams[]
-   d. V3: batch mint через Multicall3 (до 7 за TX)
+   d. V3: batch mint через PositionManager.multicall
       V4: modifyLiquidities (action-based encoding)
    e. Parse receipt → token_ids
 6. Результат → ManageTab (positions_created signal)
@@ -458,7 +458,7 @@ PCS V3 возвращает 8 полей (feeProtocol: uint32), Uniswap V3 — 7
 | Token normalize | LiquidityLadderConfig | `_normalize_token_order()` | Нет ⚠️ |
 | KyberSwap thread | Однопоточный UI | Shared session ⚠️ | Thread-local ✓ |
 | NonceManager | Полноценный ✓ | Нет (pending nonce) | Per-wallet lock ✓ |
-| Multicall3 batch | До 7 mint/TX ✓ | Есть ✓ | Есть ✓ |
+| PM.multicall batch | Batch mint/close ✓ | Есть ✓ | Есть ✓ |
 | Tests | 1308 (80%) ✓ | Нет тестов ⚠️ | Нет тестов ⚠️ |
 
 ---
