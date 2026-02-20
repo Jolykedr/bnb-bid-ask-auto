@@ -6,7 +6,7 @@
 Это **оригинальный** проект — веб-версия и бот портированы из него.
 
 - Интерактивный калькулятор позиций с визуализацией
-- Создание лестницы на блокчейне (batch mint через Multicall3)
+- Создание лестницы на блокчейне (V3: batch mint через Multicall3, V4: modifyLiquidities)
 - Управление позициями (загрузка, закрытие, сбор комиссий, свопы)
 - Поддержка BNB Chain, Base, Ethereum
 - Лицензирование (Ed25519)
@@ -334,11 +334,12 @@ _secure_zero(bytearray_data) → None  # ctypes.memset
 2. Загружает пул (LoadPoolWorker → BatchRPC → fee, tokens, decimals, price)
 3. Вводит параметры: range, positions, USD, distribution
 4. Preview (calculate_bid_ask_distribution → таблица + chart)
-5. Create (CreateLadderWorker):
+5. Create:
    a. Detect/create pool
    b. Approve tokens (ERC20 для V3, Permit2 для V4)
    c. Compute positions → MintParams[]
-   d. Batch mint через Multicall3 (до 7 за TX)
+   d. V3: batch mint через Multicall3 (до 7 за TX)
+      V4: modifyLiquidities (action-based encoding)
    e. Parse receipt → token_ids
 6. Результат → ManageTab (positions_created signal)
 ```
