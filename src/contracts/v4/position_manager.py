@@ -734,7 +734,7 @@ class V4PositionManager:
         amount1_max: int,
         deadline: int = None,
         gas_limit: int = 500000,
-        timeout: int = 300
+        timeout: int = 600
     ) -> MintResult:
         """
         Mint a new position.
@@ -840,7 +840,7 @@ class V4PositionManager:
         recipient: str = None,
         deadline: int = None,
         gas_limit: int = 500000,
-        timeout: int = 300
+        timeout: int = 600
     ) -> Tuple[str, int, int]:
         """
         Close a position (remove liquidity, collect fees).
@@ -936,7 +936,7 @@ class V4PositionManager:
         recipient: str = None,
         deadline: int = None,
         gas_limit: int = 500000,
-        timeout: int = 300
+        timeout: int = 600
     ) -> Tuple[str, int, int]:
         """
         Close a position with explicitly provided token addresses.
@@ -1030,7 +1030,7 @@ class V4PositionManager:
         recipient: str = None,
         deadline: int = None,
         gas_limit: int = None,
-        timeout: int = 300
+        timeout: int = 600
     ) -> Tuple[str, bool, int]:
         """
         Close MULTIPLE positions in ONE transaction.
@@ -1145,7 +1145,7 @@ class V4PositionManager:
         payloads: List[List[bytes]],
         deadline: int = None,
         gas_limit: int = None,
-        timeout: int = 300
+        timeout: int = 600
     ) -> Tuple[str, List[bytes]]:
         """
         Execute multiple mint operations using modifyLiquidities.
@@ -1247,7 +1247,7 @@ class V4PositionManager:
         unlock_data: bytes,
         deadline: int = None,
         gas_limit: int = None,
-        timeout: int = 300
+        timeout: int = 600
     ) -> Tuple[str, List[bytes]]:
         """
         Execute modifyLiquidities with pre-encoded unlock_data.

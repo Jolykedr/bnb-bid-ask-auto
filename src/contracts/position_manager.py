@@ -312,7 +312,7 @@ class UniswapV3PositionManager:
         self,
         params: MintParams,
         gas_limit: int = 500000,
-        timeout: int = 300
+        timeout: int = 600
     ) -> MintResult:
         """
         Создание одной позиции.

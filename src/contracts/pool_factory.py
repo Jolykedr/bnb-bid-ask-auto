@@ -382,7 +382,7 @@ class PoolFactory:
         token0: str,
         token1: str,
         fee: int,
-        timeout: int = 300
+        timeout: int = 600
     ) -> Tuple[str, str]:
         """
         Создание нового пула.
@@ -469,7 +469,7 @@ class PoolFactory:
         initial_price: float,
         token0_decimals: int = 18,
         token1_decimals: int = 18,
-        timeout: int = 300
+        timeout: int = 600
     ) -> str:
         """
         Инициализация пула с начальной ценой.
@@ -544,7 +544,7 @@ class PoolFactory:
         initial_price: float,
         token0_decimals: int = 18,
         token1_decimals: int = 18,
-        timeout: int = 300
+        timeout: int = 600
     ) -> Tuple[str, str, str]:
         """
         Создание и инициализация пула в одном вызове.

@@ -428,7 +428,7 @@ class Multicall3Batcher:
         gas_limit: int = None,
         gas_price: int = None,
         max_priority_fee: int = None,
-        timeout: int = 300,
+        timeout: int = 600,
         position_manager_address: str = None
     ) -> Tuple[str, List[CallResult], TxReceipt, List[int]]:
         """

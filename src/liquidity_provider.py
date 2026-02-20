@@ -508,7 +508,7 @@ class LiquidityProvider:
         config: LiquidityLadderConfig,
         use_multicall: bool = True,
         simulate_first: bool = True,
-        timeout: int = 300,
+        timeout: int = 600,
         check_balance: bool = True,
         validated_pool_address: str = None
     ) -> LadderResult:
@@ -905,7 +905,7 @@ class LiquidityProvider:
         self,
         token_ids: List[int],
         recipient: str = None,
-        timeout: int = 300
+        timeout: int = 600
     ) -> Tuple[str, bool, Optional[int]]:
         """
         Закрытие нескольких позиций одной транзакцией.

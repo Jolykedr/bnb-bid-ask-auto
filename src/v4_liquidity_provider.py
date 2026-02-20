@@ -330,7 +330,7 @@ class V4LiquidityProvider:
         self,
         config: V4LadderConfig,
         initial_price: float = None,
-        timeout: int = 300
+        timeout: int = 600
     ) -> Tuple[str, bool]:
         """
         Create and initialize a V4 pool.
@@ -403,10 +403,14 @@ class V4LiquidityProvider:
         else:
             pool_price = price_for_init
 
+        # Map decimals to pool order (currency0 = lower address, not necessarily config.token0)
+        if pool_key.currency0.lower() == Web3.to_checksum_address(config.token0).lower():
+            c0_dec, c1_dec = config.token0_decimals, config.token1_decimals
+        else:
+            c0_dec, c1_dec = config.token1_decimals, config.token0_decimals
+
         sqrt_price_x96 = self.pool_manager.price_to_sqrt_price_x96(
-            pool_price,
-            config.token0_decimals,
-            config.token1_decimals
+            pool_price, c0_dec, c1_dec
         )
 
         # Sanity check: sqrtPriceX96 must be within Uniswap V4 bounds
@@ -478,7 +482,7 @@ class V4LiquidityProvider:
         token1_decimals: int = 18,
         hooks: str = None,
         invert_price: bool = True,
-        timeout: int = 300
+        timeout: int = 600
     ) -> Tuple[Optional[str], Optional[bytes], bool]:
         """
         Create a V4 pool without adding liquidity.
@@ -548,10 +552,14 @@ class V4LiquidityProvider:
         else:
             pool_price = initial_price
 
+        # Map decimals to pool order (currency0 = lower address, not necessarily token0 arg)
+        if pool_key.currency0.lower() == Web3.to_checksum_address(token0).lower():
+            c0_dec, c1_dec = token0_decimals, token1_decimals
+        else:
+            c0_dec, c1_dec = token1_decimals, token0_decimals
+
         sqrt_price_x96 = self.pool_manager.price_to_sqrt_price_x96(
-            pool_price,
-            token0_decimals,
-            token1_decimals
+            pool_price, c0_dec, c1_dec
         )
 
         logger.info(f"sqrtPriceX96: {sqrt_price_x96}")
@@ -1220,7 +1228,7 @@ class V4LiquidityProvider:
         auto_create_pool: bool = True,
         simulate_first: bool = True,
         skip_approvals: bool = False,
-        timeout: int = 300,
+        timeout: int = 600,
         gas_limit: int = None
     ) -> V4LadderResult:
         """
@@ -1878,7 +1886,7 @@ class V4LiquidityProvider:
         currency0: str = None,
         currency1: str = None,
         recipient: str = None,
-        timeout: int = 300,
+        timeout: int = 600,
         burn: bool = False
     ) -> Tuple[str, bool, Optional[int]]:
         """

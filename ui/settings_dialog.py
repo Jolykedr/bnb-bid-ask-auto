@@ -327,7 +327,7 @@ class SettingsDialog(QDialog):
             self.settings.value("tx/gas_limit_override", 0, type=float)
         )
         self.timeout_spin.setValue(
-            self.settings.value("tx/timeout", 300, type=float)
+            self.settings.value("tx/timeout", 600, type=float)
         )
         self.simulate_check.setChecked(
             self.settings.value("tx/simulate_first", True, type=bool)
