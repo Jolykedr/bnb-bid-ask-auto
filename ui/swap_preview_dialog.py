@@ -28,17 +28,18 @@ class QuoteWorker(QThread):
     all_done = pyqtSignal(float)           # total_usd
 
     def __init__(self, w3, chain_id: int, tokens: list, output_token: str,
-                 max_price_impact: float = 5.0):
+                 max_price_impact: float = 5.0, proxy: dict = None):
         super().__init__()
         self.w3 = w3
         self.chain_id = chain_id
         self.tokens = tokens
         self.output_token = output_token
         self.max_price_impact = max_price_impact
+        self.proxy = proxy
 
     def run(self):
         try:
-            swapper = DexSwap(self.w3, self.chain_id, max_price_impact=self.max_price_impact)
+            swapper = DexSwap(self.w3, self.chain_id, max_price_impact=self.max_price_impact, proxy=self.proxy)
             total_usd = 0.0
 
             for i, token in enumerate(self.tokens):
@@ -142,7 +143,7 @@ class SwapPreviewDialog(QDialog):
 
     def __init__(self, parent, tokens: list, chain_id: int, w3,
                  output_token: str, slippage: float = 3.0,
-                 max_price_impact: float = 5.0):
+                 max_price_impact: float = 5.0, proxy: dict = None):
         """
         Args:
             parent: Родительский виджет
@@ -152,6 +153,7 @@ class SwapPreviewDialog(QDialog):
             output_token: Адрес выходного токена (USDT/USDC)
             slippage: Slippage в %
             max_price_impact: Макс. price impact в %
+            proxy: Proxy config dict
         """
         super().__init__(parent)
         self.tokens = tokens
@@ -160,6 +162,7 @@ class SwapPreviewDialog(QDialog):
         self.output_token = output_token
         self.slippage = slippage
         self.max_price_impact = max_price_impact
+        self.proxy = proxy
         self.quotes = {}  # {row_index: quote_data}
         self.quote_worker = None
         self.total_usd = 0.0
@@ -254,7 +257,7 @@ class SwapPreviewDialog(QDialog):
         """Запустить загрузку котировок в фоне."""
         self.quote_worker = QuoteWorker(
             self.w3, self.chain_id, self.tokens, self.output_token,
-            self.max_price_impact
+            self.max_price_impact, proxy=self.proxy
         )
         self.quote_worker.quote_ready.connect(self._on_quote_ready, Qt.ConnectionType.QueuedConnection)
         self.quote_worker.all_done.connect(self._on_all_quotes_done, Qt.ConnectionType.QueuedConnection)

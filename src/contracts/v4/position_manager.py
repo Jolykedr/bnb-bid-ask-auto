@@ -56,13 +56,15 @@ class V4PositionManager:
         protocol: V4Protocol = V4Protocol.PANCAKESWAP,
         chain_id: int = 56,
         position_manager_address: str = None,
-        nonce_manager: 'NonceManager' = None
+        nonce_manager: 'NonceManager' = None,
+        proxy: dict = None
     ):
         self.w3 = w3
         self.account = account
         self.protocol = protocol
         self.chain_id = chain_id
         self.nonce_manager = nonce_manager
+        self.proxy = proxy
 
         # Get addresses
         if position_manager_address:
@@ -253,7 +255,7 @@ class V4PositionManager:
             pool_key = None
             try:
                 from .subgraph import query_uniswap_api
-                pool_info = query_uniswap_api(pool_id_hex, chain_id=self.chain_id)
+                pool_info = query_uniswap_api(pool_id_hex, chain_id=self.chain_id, proxy=self.proxy)
                 if pool_info:
                     logger.debug(f"[V4] Found pool via API: {pool_info.token0_symbol}/{pool_info.token1_symbol}")
                     pool_key = PoolKey(
@@ -1480,7 +1482,7 @@ class V4PositionManager:
             }
 
             logger.debug(f"[V4] Querying BSCScan API for NFTs...")
-            response = requests.get(api_url, params=params, timeout=10)
+            response = requests.get(api_url, params=params, timeout=10, proxies=self.proxy or {})
             data = response.json()
 
             if data.get('status') == '1' and data.get('result'):

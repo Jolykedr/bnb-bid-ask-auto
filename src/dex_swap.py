@@ -299,12 +299,13 @@ class DexSwap:
         )
     """
 
-    def __init__(self, w3: Web3, chain_id: int = 56, nonce_manager: 'NonceManager' = None, private_key: str = None, max_price_impact: float = 5.0, use_kyber: bool = True):
+    def __init__(self, w3: Web3, chain_id: int = 56, nonce_manager: 'NonceManager' = None, private_key: str = None, max_price_impact: float = 5.0, use_kyber: bool = True, proxy: dict = None):
         self.w3 = w3
         self.chain_id = chain_id
         self.nonce_manager = nonce_manager
         self.account = Account.from_key(private_key) if private_key else None
         self.max_price_impact = max_price_impact  # Max price impact in % (0 = disabled)
+        self.proxy = proxy
 
         if chain_id not in ROUTER_V2_ADDRESSES:
             raise ValueError(f"Unsupported chain ID: {chain_id}")
@@ -334,7 +335,7 @@ class DexSwap:
             try:
                 from .kyberswap import KyberSwapClient, KYBER_CHAIN_SLUGS
                 if chain_id in KYBER_CHAIN_SLUGS:
-                    self.kyber_client = KyberSwapClient(chain_id)
+                    self.kyber_client = KyberSwapClient(chain_id, proxy=self.proxy)
                     logger.info(f"KyberSwap Aggregator available for chain {chain_id}")
             except Exception as e:
                 logger.warning(f"KyberSwap unavailable: {e}")
@@ -1657,7 +1658,8 @@ def sell_tokens_after_close(
     wallet_address: str,
     private_key: str,
     slippage: float = 1.0,
-    max_price_impact: float = 5.0
+    max_price_impact: float = 5.0,
+    proxy: dict = None
 ) -> Dict[str, Any]:
     """
     Продать токены после закрытия позиции через DEX.
@@ -1679,7 +1681,7 @@ def sell_tokens_after_close(
         }
     """
     nonce_mgr = NonceManager(w3, Account.from_key(private_key).address)
-    swapper = DexSwap(w3, chain_id, nonce_manager=nonce_mgr, private_key=private_key, max_price_impact=max_price_impact)
+    swapper = DexSwap(w3, chain_id, nonce_manager=nonce_mgr, private_key=private_key, max_price_impact=max_price_impact, proxy=proxy)
     output_token = swapper.get_output_token()
 
     results = {

@@ -30,7 +30,7 @@ class V4PoolInfo:
     liquidity: str
 
 
-def query_uniswap_api(pool_id: str, chain_id: int = 56) -> Optional[V4PoolInfo]:
+def query_uniswap_api(pool_id: str, chain_id: int = 56, proxy: dict = None) -> Optional[V4PoolInfo]:
     """
     Query Uniswap's interface API for pool info.
 
@@ -69,7 +69,8 @@ query GetV4Pool {
                 "Content-Type": "application/json",
                 "Origin": "https://app.uniswap.org"
             },
-            timeout=10
+            timeout=10,
+            proxies=proxy or {}
         )
 
         logger.debug(f"[API] Response status: {response.status_code}")
@@ -114,12 +115,12 @@ query GetV4Pool {
     if pool_id_lower.endswith('00000000000000'):
         logger.debug(f"[API] Trying prefix search for truncated pool ID...")
         prefix = pool_id_lower[:52]  # 0x + 50 hex chars (25 bytes)
-        return query_pools_by_prefix(prefix, chain_id)
+        return query_pools_by_prefix(prefix, chain_id, proxy=proxy)
 
     return None
 
 
-def query_pools_by_prefix(prefix: str, chain_id: int = 56) -> Optional[V4PoolInfo]:
+def query_pools_by_prefix(prefix: str, chain_id: int = 56, proxy: dict = None) -> Optional[V4PoolInfo]:
     """
     Query V4 pools and find one matching the prefix.
 
@@ -151,7 +152,8 @@ query GetV4Pools {
                 "Content-Type": "application/json",
                 "Origin": "https://app.uniswap.org"
             },
-            timeout=15
+            timeout=15,
+            proxies=proxy or {}
         )
 
         if response.status_code == 200:
@@ -192,7 +194,8 @@ def try_all_sources_with_web3(
     chain_id: int = 56,
     api_key: str = None,
     rpc_url: str = None,
-    bscscan_api_key: str = None
+    bscscan_api_key: str = None,
+    proxy: dict = None
 ) -> Optional[V4PoolInfo]:
     """
     Try to get V4 pool info from various sources.
@@ -201,7 +204,7 @@ def try_all_sources_with_web3(
     2. Prefix search for truncated pool IDs (from positionInfo)
     """
     # Try Uniswap interface API (includes prefix search fallback)
-    result = query_uniswap_api(pool_id, chain_id)
+    result = query_uniswap_api(pool_id, chain_id, proxy=proxy)
     if result:
         return result
 
@@ -214,7 +217,7 @@ def try_all_sources_with_web3(
         stripped = pool_id_lower.rstrip('0')
         if len(stripped) >= 10:  # At least some meaningful prefix
             logger.debug(f"[API] Last resort: prefix search with {stripped[:20]}...")
-            result = query_pools_by_prefix(stripped, chain_id)
+            result = query_pools_by_prefix(stripped, chain_id, proxy=proxy)
             if result:
                 return result
 

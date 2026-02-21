@@ -98,7 +98,7 @@ class KyberSwapClient:
         # Отправить TX: {to: build.router_address, data: build.encoded_data}
     """
 
-    def __init__(self, chain_id: int, timeout: float = 15.0):
+    def __init__(self, chain_id: int, timeout: float = 15.0, proxy: dict = None):
         if chain_id not in KYBER_CHAIN_SLUGS:
             raise KyberSwapError(f"Unsupported chain_id: {chain_id}")
         self.chain_id = chain_id
@@ -109,6 +109,8 @@ class KyberSwapClient:
             "X-Client-Id": KYBER_CLIENT_ID,
             "Accept": "application/json",
         })
+        if proxy:
+            self.session.proxies.update(proxy)
 
     def get_quote(
         self,

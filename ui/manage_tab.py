@@ -43,14 +43,15 @@ def _resolve_v4_protocol(protocol_str: str) -> V4Protocol:
     return V4Protocol.UNISWAP
 
 
-def _create_v4_position_manager(w3, account, protocol_str: str, chain_id: int = 56) -> V4PositionManager:
+def _create_v4_position_manager(w3, account, protocol_str: str, chain_id: int = 56, proxy: dict = None) -> V4PositionManager:
     """Create V4PositionManager for the given protocol."""
     target_protocol = _resolve_v4_protocol(protocol_str)
     return V4PositionManager(
         w3,
         account=account,
         protocol=target_protocol,
-        chain_id=chain_id
+        chain_id=chain_id,
+        proxy=proxy
     )
 
 
@@ -450,7 +451,8 @@ class LoadPositionWorker(QThread):
 
             chain_id = getattr(self.provider, 'chain_id', 56)
             v4_pm = _create_v4_position_manager(
-                self.provider.w3, self.provider.account, self.protocol, chain_id
+                self.provider.w3, self.provider.account, self.protocol, chain_id,
+                proxy=getattr(self.provider, 'proxy', None)
             )
 
             # Check ownership
@@ -518,7 +520,8 @@ class ScanWalletWorker(QThread):
 
             if is_v4:
                 v4_pm = _create_v4_position_manager(
-                    self.provider.w3, self.provider.account, self.protocol, chain_id
+                    self.provider.w3, self.provider.account, self.protocol, chain_id,
+                    proxy=getattr(self.provider, 'proxy', None)
                 )
 
                 pm_addr = getattr(v4_pm, 'position_manager_address', 'unknown')
@@ -705,7 +708,8 @@ class ClosePositionsWorker(QThread):
                 for proto_str, tids in v4_by_protocol.items():
                     try:
                         v4_pm = _create_v4_position_manager(
-                            self.provider.w3, self.provider.account, proto_str, chain_id
+                            self.provider.w3, self.provider.account, proto_str, chain_id,
+                            proxy=getattr(self.provider, 'proxy', None)
                         )
 
                         for tid in tids:
@@ -792,7 +796,8 @@ class BatchCloseWorker(QThread):
 
             # Detect protocol from positions data (all positions in batch must be same protocol)
             proto_str = self.positions[0].get('protocol', 'v4') if self.positions else 'v4'
-            v4_pm = _create_v4_position_manager(w3, self.provider.account, proto_str, self.chain_id)
+            v4_pm = _create_v4_position_manager(w3, self.provider.account, proto_str, self.chain_id,
+                                                proxy=getattr(self.provider, 'proxy', None))
 
             self.progress.emit("Building batch transaction...")
 
@@ -835,7 +840,7 @@ class SwapWorker(QThread):
 
     def __init__(self, w3, chain_id: int, tokens: list, private_key: str,
                  output_token: str, slippage: float = 3.0, max_price_impact: float = 5.0,
-                 initial_investment: float = 0):
+                 initial_investment: float = 0, proxy: dict = None):
         super().__init__()
         self.w3 = w3
         self.chain_id = chain_id
@@ -845,10 +850,11 @@ class SwapWorker(QThread):
         self.slippage = slippage
         self.max_price_impact = max_price_impact
         self.initial_investment = initial_investment
+        self.proxy = proxy
 
     def run(self):
         try:
-            swapper = DexSwap(self.w3, self.chain_id, max_price_impact=self.max_price_impact)
+            swapper = DexSwap(self.w3, self.chain_id, max_price_impact=self.max_price_impact, proxy=self.proxy)
             wallet = swapper.w3.eth.account.from_key(self.private_key).address
             self.progress.emit(f"Selling tokens via KyberSwap/DEX (slippage: {self.slippage}%)...")
 
@@ -2659,7 +2665,8 @@ class ManageTab(QWidget):
                 return
 
             # Get output token
-            swapper = DexSwap(w3, chain_id, use_kyber=False)
+            proxy = getattr(self.provider, 'proxy', None)
+            swapper = DexSwap(w3, chain_id, use_kyber=False, proxy=proxy)
             output_token = swapper.get_output_token()
 
             # Save close_data for PnL display after swap
@@ -2677,6 +2684,7 @@ class ManageTab(QWidget):
                 output_token=output_token,
                 slippage=self._pending_swap_slippage,
                 max_price_impact=self._pending_max_price_impact,
+                proxy=proxy,
             )
             dialog.confirmed.connect(self._on_swap_confirmed)
             result = dialog.exec()
@@ -2700,7 +2708,8 @@ class ManageTab(QWidget):
         try:
             chain_id = getattr(self.provider, 'chain_id', 56)
             w3 = self.provider.w3
-            swapper = DexSwap(w3, chain_id, use_kyber=False)
+            proxy = getattr(self.provider, 'proxy', None)
+            swapper = DexSwap(w3, chain_id, use_kyber=False, proxy=proxy)
             output_token = swapper.get_output_token()
 
             self.progress_bar.show()
@@ -2717,6 +2726,7 @@ class ManageTab(QWidget):
                 slippage=self._pending_swap_slippage,
                 max_price_impact=self._pending_max_price_impact,
                 initial_investment=initial_investment,
+                proxy=proxy,
             )
             self._swap_worker.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
             self._swap_worker.swap_result.connect(self._on_swap_finished, Qt.ConnectionType.QueuedConnection)

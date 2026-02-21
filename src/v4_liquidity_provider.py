@@ -264,7 +264,8 @@ class V4LiquidityProvider:
             account=self.account,
             protocol=protocol,
             chain_id=chain_id,
-            nonce_manager=self.nonce_manager
+            nonce_manager=self.nonce_manager,
+            proxy=self.proxy
         )
 
     def disconnect(self):

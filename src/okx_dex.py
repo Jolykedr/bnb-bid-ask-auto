@@ -98,7 +98,8 @@ class OKXDexSwap:
         secret_key: str,
         passphrase: str,
         project_id: str = "",
-        nonce_manager: 'NonceManager' = None
+        nonce_manager: 'NonceManager' = None,
+        proxy: dict = None
     ):
         self.api_key = api_key
         self.secret_key = secret_key
@@ -106,6 +107,8 @@ class OKXDexSwap:
         self.project_id = project_id
         self.nonce_manager = nonce_manager
         self.session = requests.Session()
+        if proxy:
+            self.session.proxies.update(proxy)
 
     def _get_timestamp(self) -> str:
         """Получить timestamp в формате ISO 8601."""
@@ -578,7 +581,8 @@ def sell_tokens_after_close(
     okx_secret_key: str,
     okx_passphrase: str,
     okx_project_id: str = "",
-    slippage: float = 1.0
+    slippage: float = 1.0,
+    proxy: dict = None
 ) -> Dict[str, Any]:
     """
     Продать токены после закрытия позиции.
@@ -599,7 +603,7 @@ def sell_tokens_after_close(
             "skipped": [token_address]
         }
     """
-    swapper = OKXDexSwap(okx_api_key, okx_secret_key, okx_passphrase, okx_project_id)
+    swapper = OKXDexSwap(okx_api_key, okx_secret_key, okx_passphrase, okx_project_id, proxy=proxy)
 
     output_token = swapper.get_output_token(chain_id)
     results = {

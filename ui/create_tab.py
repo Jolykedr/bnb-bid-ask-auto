@@ -244,7 +244,7 @@ class LoadPoolWorker(QThread):
                     subgraph_info = None
                     try:
                         self.progress.emit("Querying subgraph for token addresses...")
-                        subgraph_info = query_v4_subgraph(self.pool_input, w3=w3, chain_id=self.chain_id)
+                        subgraph_info = query_v4_subgraph(self.pool_input, w3=w3, chain_id=self.chain_id, proxy=self.proxy)
                     except Exception as e:
                         self.progress.emit(f"Subgraph error: {e}")
 
@@ -286,7 +286,7 @@ class LoadPoolWorker(QThread):
             # Fallback: try subgraph only
             self.progress.emit("On-chain query failed, trying subgraph...")
             try:
-                subgraph_info = query_v4_subgraph(self.pool_input, w3=w3, chain_id=self.chain_id)
+                subgraph_info = query_v4_subgraph(self.pool_input, w3=w3, chain_id=self.chain_id, proxy=self.proxy)
                 if subgraph_info:
                     result['v4_protocol'] = V4Protocol.UNISWAP
                     result['v4_protocol_name'] = 'Subgraph'
