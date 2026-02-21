@@ -112,7 +112,11 @@ def _build_provider():
             'gasUsed': 300_000,
             'logs': [],
         })
-        p.w3.eth.contract = Mock()
+        # ERC20 mock: decimals().call() must return int (not Mock)
+        # create_pool verifies decimals on-chain; Mock != 18 → corrupts config
+        mock_erc20 = Mock()
+        mock_erc20.functions.decimals.return_value.call.return_value = 18
+        p.w3.eth.contract = Mock(return_value=mock_erc20)
         p.w3.to_checksum_address = Web3.to_checksum_address
 
         p.account = Mock()
@@ -279,6 +283,7 @@ class TestCreatePool:
         )
 
         mock_pool_key = Mock(spec=PoolKey)
+        mock_pool_key.currency0 = TOKEN_VOLATILE
         mock_pool_key.to_tuple = Mock(return_value=('0x1111', '0x9999', 3000, 60, ZERO_ADDRESS))
 
         with patch.object(provider, 'get_pool_key', return_value=mock_pool_key):
@@ -306,6 +311,7 @@ class TestCreatePool:
         })
 
         mock_pool_key = Mock(spec=PoolKey)
+        mock_pool_key.currency0 = TOKEN_VOLATILE
         mock_pool_key.to_tuple = Mock(return_value=('0x1111', '0x9999', 3000, 60, ZERO_ADDRESS))
 
         with patch.object(provider, 'get_pool_key', return_value=mock_pool_key):
@@ -328,6 +334,7 @@ class TestCreatePool:
         )
 
         mock_pool_key = Mock(spec=PoolKey)
+        mock_pool_key.currency0 = TOKEN_VOLATILE
         mock_pool_key.to_tuple = Mock(return_value=('0x1111', '0x9999', 3000, 60, ZERO_ADDRESS))
 
         with patch.object(provider, 'get_pool_key', return_value=mock_pool_key):
@@ -348,6 +355,7 @@ class TestCreatePool:
         )
 
         mock_pool_key = Mock(spec=PoolKey)
+        mock_pool_key.currency0 = TOKEN_VOLATILE
         mock_pool_key.to_tuple = Mock(return_value=('0x1111', '0x9999', 3000, 60, ZERO_ADDRESS))
 
         with patch.object(provider, 'get_pool_key', return_value=mock_pool_key):
@@ -367,6 +375,7 @@ class TestCreatePool:
         )
 
         mock_pool_key = Mock(spec=PoolKey)
+        mock_pool_key.currency0 = TOKEN_VOLATILE
         mock_pool_key.to_tuple = Mock(return_value=('0x1111', '0x9999', 3000, 60, ZERO_ADDRESS))
 
         with patch.object(provider, 'get_pool_key', return_value=mock_pool_key):
@@ -389,6 +398,7 @@ class TestCreatePool:
         )
 
         mock_pool_key = Mock(spec=PoolKey)
+        mock_pool_key.currency0 = TOKEN_VOLATILE
         mock_pool_key.to_tuple = Mock(return_value=('0x1111', '0x9999', 3000, 60, ZERO_ADDRESS))
 
         with patch.object(provider, 'get_pool_key', return_value=mock_pool_key):
@@ -411,6 +421,7 @@ class TestCreatePool:
         )
 
         mock_pool_key = Mock(spec=PoolKey)
+        mock_pool_key.currency0 = TOKEN_VOLATILE
         mock_pool_key.to_tuple = Mock(return_value=('0x1111', '0x9999', 3000, 60, ZERO_ADDRESS))
 
         with patch.object(provider, 'get_pool_key', return_value=mock_pool_key):
@@ -432,6 +443,7 @@ class TestCreatePool:
         )
 
         mock_pool_key = Mock(spec=PoolKey)
+        mock_pool_key.currency0 = TOKEN_VOLATILE
         mock_pool_key.to_tuple = Mock(return_value=('0x1111', '0x9999', 3000, 60, ZERO_ADDRESS))
 
         with patch.object(provider, 'get_pool_key', return_value=mock_pool_key):

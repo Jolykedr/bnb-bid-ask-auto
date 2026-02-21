@@ -347,6 +347,103 @@ class LoadPoolWorker(QThread):
             self.progress.emit(f"Token info from addresses: {sym0}/{sym1}")
 
 
+class BalanceWorker(QThread):
+    """Worker thread for fetching token balances without blocking UI."""
+
+    result = pyqtSignal(str)   # formatted balance string
+    error = pyqtSignal(str)
+
+    def __init__(self, rpc_url, wallet_address, tokens_dict, proxy=None):
+        super().__init__()
+        self.rpc_url = rpc_url
+        self.wallet_address = wallet_address
+        self.tokens_dict = tokens_dict  # {symbol: TokenConfig}
+        self.proxy = proxy
+
+    def run(self):
+        try:
+            from web3 import Web3
+            from src.contracts.abis import ERC20_ABI
+
+            if self.proxy:
+                w3 = Web3(Web3.HTTPProvider(self.rpc_url, request_kwargs={"proxies": self.proxy}))
+            else:
+                w3 = Web3(Web3.HTTPProvider(self.rpc_url))
+
+            address = Web3.to_checksum_address(self.wallet_address)
+            balances = []
+            for symbol, token in self.tokens_dict.items():
+                try:
+                    contract = w3.eth.contract(
+                        address=Web3.to_checksum_address(token.address),
+                        abi=ERC20_ABI
+                    )
+                    balance = contract.functions.balanceOf(address).call()
+                    formatted = f"{balance / (10 ** token.decimals):.4f}"
+                    balances.append(f"{symbol}: {formatted}")
+                except Exception:
+                    balances.append(f"{symbol}: ?")
+
+            self.result.emit(" | ".join(balances))
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class CreatePoolOnlyWorker(QThread):
+    """Worker thread for V4 pool creation without blocking UI."""
+
+    progress = pyqtSignal(str)
+    result = pyqtSignal(object, object, bool)  # tx_hash, pool_id, success
+    error = pyqtSignal(str)
+
+    def __init__(self, rpc_url, private_key, protocol, chain_id,
+                 token0, token1, fee_percent, initial_price,
+                 tick_spacing, token0_decimals, token1_decimals,
+                 invert_price, proxy=None):
+        super().__init__()
+        self.rpc_url = rpc_url
+        self.private_key = private_key
+        self.protocol = protocol
+        self.chain_id = chain_id
+        self.token0 = token0
+        self.token1 = token1
+        self.fee_percent = fee_percent
+        self.initial_price = initial_price
+        self.tick_spacing = tick_spacing
+        self.token0_decimals = token0_decimals
+        self.token1_decimals = token1_decimals
+        self.invert_price = invert_price
+        self.proxy = proxy
+
+    def run(self):
+        try:
+            self.progress.emit("Creating V4 provider...")
+            provider = V4LiquidityProvider(
+                rpc_url=self.rpc_url,
+                private_key=self.private_key,
+                protocol=self.protocol,
+                chain_id=self.chain_id
+            )
+
+            self.progress.emit("Sending pool creation TX...")
+            tx_hash, pool_id, success = provider.create_pool_only(
+                token0=self.token0,
+                token1=self.token1,
+                fee_percent=self.fee_percent,
+                initial_price=self.initial_price,
+                tick_spacing=self.tick_spacing,
+                token0_decimals=self.token0_decimals,
+                token1_decimals=self.token1_decimals,
+                invert_price=self.invert_price
+            )
+
+            self.result.emit(tx_hash, pool_id, success)
+        except BaseException as e:
+            self.error.emit(str(e))
+        finally:
+            self.private_key = None
+
+
 class CreateLadderWorkerV4(QThread):
     """Worker thread for V4 blockchain operations."""
 
@@ -851,6 +948,8 @@ class CreateTab(QWidget):
         self.provider = None
         self.positions = []
         self.worker = None
+        self._balance_worker = None
+        self._pool_create_worker = None
         self.custom_tokens = {}  # symbol -> address mapping
         self.loaded_v4_pool_id = None  # Store loaded V4 pool ID for verification
         self._detected_v3_dex = None  # Store detected V3 DEX config (Uniswap/PancakeSwap)
@@ -1700,21 +1799,40 @@ class CreateTab(QWidget):
             self._log(f"Connection failed: {e}")
 
     def _update_balances(self):
-        """Update token balances display."""
+        """Update token balances display (async — runs in worker thread)."""
         if not self.provider:
             return
 
-        try:
-            balances = []
-            tokens = self._get_current_tokens()
-            for symbol, token in tokens.items():
-                    balance = self.provider.get_token_balance(token.address)
-                    formatted = self.provider.format_amount(balance, token.decimals)
-                    balances.append(f"{symbol}: {formatted}")
+        rpc_url = self.rpc_input.text().strip()
+        wallet_address = self.provider.account.address
+        tokens = self._get_current_tokens()
+        proxy = self._get_proxy_config()
 
-            self.balance_label.setText(" | ".join(balances))
-        except Exception as e:
-            self.balance_label.setText(f"Error fetching balances: {e}")
+        self.balance_label.setText("Loading balances...")
+
+        # Clean up previous balance worker
+        if hasattr(self, '_balance_worker') and self._balance_worker is not None:
+            if self._balance_worker.isRunning():
+                self._balance_worker.quit()
+                self._balance_worker.wait(2000)
+            self._balance_worker.deleteLater()
+            self._balance_worker = None
+
+        self._balance_worker = BalanceWorker(rpc_url, wallet_address, tokens, proxy)
+        self._balance_worker.result.connect(self._on_balances_loaded)
+        self._balance_worker.error.connect(lambda e: self.balance_label.setText(f"Error: {e}"))
+        self._balance_worker.finished.connect(lambda: self._cleanup_balance_worker())
+        self._balance_worker.start()
+
+    def _on_balances_loaded(self, text: str):
+        """Handle balance worker result."""
+        self.balance_label.setText(text)
+
+    def _cleanup_balance_worker(self):
+        """Clean up balance worker after completion."""
+        if hasattr(self, '_balance_worker') and self._balance_worker is not None:
+            self._balance_worker.deleteLater()
+            self._balance_worker = None
 
     def _get_fee_tier(self) -> int:
         """Get fee tier from combo."""
@@ -2181,70 +2299,82 @@ class CreateTab(QWidget):
         self._log(f"Fee: {fee_percent}%")
         self._log(f"Initial Price: {initial_price}")
 
-        try:
-            network = self._get_current_network()
+        network = self._get_current_network()
+        invert_price = self._should_invert_price(token0, token1)
+        self._log(f"Auto-detected invert_price: {invert_price}")
+        proxy = self._get_proxy_config()
 
-            # Create V4 provider
-            provider = V4LiquidityProvider(
-                rpc_url=rpc_url,
-                private_key=private_key,
-                protocol=protocol,
-                chain_id=network.chain_id
+        # Clean up previous pool creation worker
+        if hasattr(self, '_pool_create_worker') and self._pool_create_worker is not None:
+            if self._pool_create_worker.isRunning():
+                self._pool_create_worker.quit()
+                self._pool_create_worker.wait(2000)
+            self._pool_create_worker.deleteLater()
+
+        self._pool_create_worker = CreatePoolOnlyWorker(
+            rpc_url=rpc_url,
+            private_key=private_key,
+            protocol=protocol,
+            chain_id=network.chain_id,
+            token0=token0,
+            token1=token1,
+            fee_percent=fee_percent,
+            initial_price=initial_price,
+            tick_spacing=tick_spacing,
+            token0_decimals=self._token0_decimals,
+            token1_decimals=self._token1_decimals,
+            invert_price=invert_price,
+            proxy=proxy if proxy else None
+        )
+        self._pool_create_worker.progress.connect(self._log)
+        self._pool_create_worker.result.connect(self._on_pool_created)
+        self._pool_create_worker.error.connect(self._on_pool_create_error)
+        self._pool_create_worker.finished.connect(lambda: self._cleanup_pool_create_worker())
+        self._pool_create_worker.start()
+
+    def _on_pool_created(self, tx_hash, pool_id, success):
+        """Handle pool creation result from worker."""
+        self.progress_bar.hide()
+        self.create_pool_only_btn.setEnabled(True)
+        self.create_btn.setEnabled(True)
+
+        if success:
+            pool_id_hex = f"0x{pool_id.hex()}" if pool_id else "N/A"
+            self._log(f"SUCCESS! Pool created.")
+            self._log(f"Pool ID: {pool_id_hex}")
+            self._log(f"TX: {tx_hash}")
+
+            self.loaded_v4_pool_id = pool_id
+            self._loaded_pool_id_bytes = pool_id
+
+            QMessageBox.information(
+                self, "Success",
+                f"V4 Pool created successfully!\n\n"
+                f"Pool ID: {pool_id_hex}\n"
+                f"TX: {tx_hash}\n\n"
+                f"You can now create positions in this pool."
+            )
+        else:
+            self._log(f"FAILED: Pool creation failed")
+            self._log(f"TX: {tx_hash}")
+            QMessageBox.critical(
+                self, "Error",
+                f"Failed to create pool.\n\nTX: {tx_hash}"
             )
 
-            # Auto-detect invert_price based on stablecoin position
-            invert_price = self._should_invert_price(token0, token1)
-            self._log(f"Auto-detected invert_price: {invert_price}")
+    def _on_pool_create_error(self, error_msg):
+        """Handle pool creation error from worker."""
+        self.progress_bar.hide()
+        self.create_pool_only_btn.setEnabled(True)
+        self.create_btn.setEnabled(True)
+        self._log(f"ERROR: {error_msg}")
+        QMessageBox.critical(self, "Error", f"Pool creation failed:\n{error_msg}")
 
-            # Create pool
-            tx_hash, pool_id, success = provider.create_pool_only(
-                token0=token0,
-                token1=token1,
-                fee_percent=fee_percent,
-                initial_price=initial_price,
-                tick_spacing=tick_spacing,
-                token0_decimals=self._token0_decimals,
-                token1_decimals=self._token1_decimals,
-                invert_price=invert_price
-            )
-
-            self.progress_bar.hide()
-            self.create_pool_only_btn.setEnabled(True)
-            self.create_btn.setEnabled(True)
-
-            if success:
-                pool_id_hex = f"0x{pool_id.hex()}" if pool_id else "N/A"
-                self._log(f"SUCCESS! Pool created.")
-                self._log(f"Pool ID: {pool_id_hex}")
-                self._log(f"TX: {tx_hash}")
-
-                # Store pool ID for later use
-                self.loaded_v4_pool_id = pool_id
-                self._loaded_pool_id_bytes = pool_id
-
-                QMessageBox.information(
-                    self, "Success",
-                    f"V4 Pool created successfully!\n\n"
-                    f"Pool ID: {pool_id_hex}\n"
-                    f"TX: {tx_hash}\n\n"
-                    f"You can now create positions in this pool."
-                )
-            else:
-                self._log(f"FAILED: Pool creation failed")
-                self._log(f"TX: {tx_hash}")
-                QMessageBox.critical(
-                    self, "Error",
-                    f"Failed to create pool.\n\nTX: {tx_hash}"
-                )
-
-        except Exception as e:
-            import traceback
-            self.progress_bar.hide()
-            self.create_pool_only_btn.setEnabled(True)
-            self.create_btn.setEnabled(True)
-            self._log(f"ERROR: {e}")
-            self._log(traceback.format_exc())
-            QMessageBox.critical(self, "Error", f"Pool creation failed:\n{e}")
+    def _cleanup_pool_create_worker(self):
+        """Clean up pool creation worker after completion."""
+        if hasattr(self, '_pool_create_worker') and self._pool_create_worker is not None:
+            self._pool_create_worker.deleteLater()
+            self._pool_create_worker = None
 
     def update_custom_tokens(self, tokens: list):
         """Update combo boxes with custom tokens from Advanced tab."""

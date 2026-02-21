@@ -992,13 +992,13 @@ class TestV4LiquidityProvider:
         # release НЕ должен вызываться
         provider.nonce_manager.release_nonce.assert_not_called()
 
-    def test_approve_on_permit2_zero_expiration_raises(self, provider):
-        """Если Permit2 allowance не установился (expiration=0), выбрасывает ошибку."""
+    def test_approve_on_permit2_zero_expiration_proceeds_with_warning(self, provider):
+        """Если Permit2 allowance не виден после retries (expiration=0), продолжает с warning (RPC lag)."""
         mock_contract = Mock()
         mock_approve_fn = Mock()
         mock_approve_fn.build_transaction = Mock(return_value={})
         mock_contract.functions.approve = Mock(return_value=mock_approve_fn)
-        # Мок allowance возвращает expiration=0
+        # Мок allowance всегда возвращает expiration=0 (имитация RPC lag)
         mock_contract.functions.allowance = Mock(
             return_value=Mock(call=Mock(return_value=(0, 0, 0)))
         )
@@ -1011,13 +1011,14 @@ class TestV4LiquidityProvider:
             'gasUsed': 50_000,
         })
 
-        with pytest.raises(Exception, match="Permit2 allowance NOT set"):
-            provider.approve_on_permit2(
-                token_address=TOKEN_VOLATILE,
-                spender="0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
-                amount=10**18,
-                permit2_address=PERMIT2_PANCAKESWAP,
-            )
+        # Should NOT raise — receipt.status=1 means TX was successful, RPC just lags
+        result = provider.approve_on_permit2(
+            token_address=TOKEN_VOLATILE,
+            spender="0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+            amount=10**18,
+            permit2_address=PERMIT2_PANCAKESWAP,
+        )
+        assert result is not None  # tx_hash returned
 
     # ----------------------------------------------------------
     # create_pool (unit-level)

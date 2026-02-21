@@ -1202,6 +1202,7 @@ class V4PositionManager:
                 self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
         tx_sent = False
+        nonce_handled = False
         try:
             tx = self.contract.functions.modifyLiquidities(
                 unlock_data,
@@ -1227,6 +1228,7 @@ class V4PositionManager:
             # Nonce использован on-chain (TX замайнена, даже если revert)
             if self.nonce_manager:
                 self.nonce_manager.confirm_transaction(nonce)
+                nonce_handled = True
 
             if receipt['status'] != 1:
                 raise Exception(
@@ -1239,9 +1241,11 @@ class V4PositionManager:
             return tx_hash.hex(), []
 
         except Exception as e:
-            # release только если TX не была отправлена в сеть
-            if self.nonce_manager and not tx_sent:
-                self.nonce_manager.release_nonce(nonce)
+            if self.nonce_manager and not nonce_handled:
+                if tx_sent:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
             raise
 
     def execute_modify_liquidities(
@@ -1298,6 +1302,7 @@ class V4PositionManager:
                 self.w3.eth.get_transaction_count(self.account.address, 'pending')
 
         tx_sent = False
+        nonce_handled = False
         try:
             tx = self.contract.functions.modifyLiquidities(
                 unlock_data,
@@ -1323,6 +1328,7 @@ class V4PositionManager:
             # Nonce использован on-chain (TX замайнена, даже если revert)
             if self.nonce_manager:
                 self.nonce_manager.confirm_transaction(nonce)
+                nonce_handled = True
 
             if receipt['status'] != 1:
                 raise Exception(
@@ -1335,9 +1341,11 @@ class V4PositionManager:
             return tx_hash.hex(), []
 
         except Exception as e:
-            # release только если TX не была отправлена в сеть
-            if self.nonce_manager and not tx_sent:
-                self.nonce_manager.release_nonce(nonce)
+            if self.nonce_manager and not nonce_handled:
+                if tx_sent:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
             raise
 
     # ============== Wallet Scanning Methods ==============

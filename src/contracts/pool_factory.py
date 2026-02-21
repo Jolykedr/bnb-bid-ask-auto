@@ -249,8 +249,11 @@ class PoolFactory:
         try:
             decimals = token.functions.decimals().call()
         except Exception as e:
-            logger.warning(f"Failed to get decimals for {address}: {e}, defaulting to 18")
-            decimals = 18
+            logger.error(f"Failed to get decimals for {address}: {e}")
+            raise RuntimeError(
+                f"Cannot read decimals for token {address}. "
+                f"RPC error: {e}. Silent fallback to 18 is disabled to prevent calculation errors."
+            )
 
         try:
             total_supply = token.functions.totalSupply().call()

@@ -103,16 +103,23 @@ class NonceManager:
         Returns:
             Next nonce to use
         """
+        # Check if sync is needed (under lock), then do RPC outside lock
+        need_sync = False
         with self._lock:
             current_time = time.time()
-
-            # Sync with blockchain if needed
             if (self._current_nonce is None or
                 force_sync or
                 current_time - self._last_sync_time > self._sync_interval):
+                need_sync = True
 
-                blockchain_nonce = self._sync_nonce()
+        # RPC call OUTSIDE lock to avoid blocking other threads
+        blockchain_nonce = None
+        if need_sync:
+            blockchain_nonce = self._sync_nonce()
 
+        # Apply sync result and allocate nonce (under lock)
+        with self._lock:
+            if blockchain_nonce is not None:
                 # Clean up stale pending nonces that have already been confirmed
                 # (nonces less than blockchain_nonce are already mined)
                 stale_count = len(self._pending_nonces)
@@ -131,7 +138,7 @@ class NonceManager:
                     # This handles cases where external transactions were sent
                     self._current_nonce = max(self._current_nonce, blockchain_nonce)
 
-                self._last_sync_time = current_time
+                self._last_sync_time = time.time()
                 logger.debug(f"Synced nonce with blockchain: {self._current_nonce}")
 
             # Get next nonce
@@ -187,9 +194,10 @@ class NonceManager:
         Returns:
             Number of stale nonces that were cleaned up
         """
-        with self._lock:
-            blockchain_nonce = self._sync_nonce()
+        # RPC call outside lock
+        blockchain_nonce = self._sync_nonce()
 
+        with self._lock:
             stale_count = len(self._pending_nonces)
             self._pending_nonces = {
                 n for n in self._pending_nonces

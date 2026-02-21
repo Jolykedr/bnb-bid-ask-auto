@@ -340,7 +340,7 @@ class TestPoolFactory:
 
     @patch('src.contracts.pool_factory.Web3.to_checksum_address', side_effect=lambda x: x)
     def test_get_token_info_decimals_fallback(self, _mock_checksum, factory):
-        """Ошибка при получении decimals -> 18 по умолчанию."""
+        """Ошибка при получении decimals -> RuntimeError (не silent fallback на 18)."""
         mock_token = Mock()
         mock_token.functions.symbol.return_value.call.return_value = "X"
         mock_token.functions.name.return_value.call.return_value = "X Token"
@@ -349,9 +349,8 @@ class TestPoolFactory:
 
         factory.w3.eth.contract.return_value = mock_token
 
-        result = factory.get_token_info(ADDR_LOW)
-
-        assert result.decimals == 18
+        with pytest.raises(RuntimeError, match="Cannot read decimals"):
+            factory.get_token_info(ADDR_LOW)
 
     @patch('src.contracts.pool_factory.Web3.to_checksum_address', side_effect=lambda x: x)
     def test_get_token_info_total_supply_fallback(self, _mock_checksum, factory):
@@ -370,7 +369,7 @@ class TestPoolFactory:
 
     @patch('src.contracts.pool_factory.Web3.to_checksum_address', side_effect=lambda x: x)
     def test_get_token_info_all_fallbacks(self, _mock_checksum, factory):
-        """Все вызовы падают -> все значения по умолчанию."""
+        """Все вызовы падают -> RuntimeError из-за decimals."""
         mock_token = Mock()
         mock_token.functions.symbol.return_value.call.side_effect = Exception("fail")
         mock_token.functions.name.return_value.call.side_effect = Exception("fail")
@@ -379,13 +378,8 @@ class TestPoolFactory:
 
         factory.w3.eth.contract.return_value = mock_token
 
-        result = factory.get_token_info(ADDR_LOW)
-
-        assert result.symbol == "UNKNOWN"
-        assert result.name == "Unknown Token"
-        assert result.decimals == 18
-        assert result.total_supply == 0
-        assert result.address == ADDR_LOW
+        with pytest.raises(RuntimeError, match="Cannot read decimals"):
+            factory.get_token_info(ADDR_LOW)
 
     # ----------------------------------------------------------
     # get_pool_address
@@ -758,8 +752,8 @@ class TestPoolFactory:
         assert create_tx == "0xCREATE_TX"
         assert init_tx == "0xINIT_TX"
         assert pool_address == ADDR_POOL
-        mock_create.assert_called_once_with(ADDR_LOW, ADDR_HIGH, 3000, 300)
-        mock_init.assert_called_once_with(ADDR_POOL, 1.0, 18, 18, 300)
+        mock_create.assert_called_once_with(ADDR_LOW, ADDR_HIGH, 3000, 600)
+        mock_init.assert_called_once_with(ADDR_POOL, 1.0, 18, 18, 600)
 
     def test_create_and_initialize_pool_no_pool_address(self, factory_with_account):
         """create_pool вернул None для адреса -> ValueError."""
