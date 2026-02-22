@@ -12,11 +12,14 @@ API flow:
 Docs: https://docs.kyberswap.com/kyberswap-solutions/kyberswap-aggregator
 """
 
+import base64
 import logging
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urlparse, unquote
 
 import requests
+from requests.adapters import HTTPAdapter
 from web3 import Web3
 
 logger = logging.getLogger(__name__)
@@ -84,6 +87,27 @@ class KyberBuildResult:
     gas_estimate: int         # Оценка газа (0 если не предоставлен)
 
 
+# ── Proxy auth adapter ──
+
+class _ProxyAuthAdapter(HTTPAdapter):
+    """HTTPAdapter с явной Proxy-Authorization для HTTPS CONNECT tunnel.
+
+    requests/urllib3 извлекают auth из proxy URL через urlparse,
+    но если в пароле есть спецсимволы (@, :, /) — парсинг ломается
+    и Proxy-Authorization не отправляется → 407.
+    """
+
+    def __init__(self, proxy_basic_auth: str = None, **kwargs):
+        self._proxy_basic_auth = proxy_basic_auth
+        super().__init__(**kwargs)
+
+    def proxy_headers(self, proxy):
+        headers = super().proxy_headers(proxy)
+        if self._proxy_basic_auth and 'Proxy-Authorization' not in headers:
+            headers['Proxy-Authorization'] = self._proxy_basic_auth
+        return headers
+
+
 # ── Client ──
 
 class KyberSwapClient:
@@ -105,12 +129,61 @@ class KyberSwapClient:
         self.chain_slug = KYBER_CHAIN_SLUGS[chain_id]
         self.timeout = timeout
         self.session = requests.Session()
+        self.session.trust_env = False  # Не использовать системные прокси (OS/env)
         self.session.headers.update({
             "X-Client-Id": KYBER_CLIENT_ID,
             "Accept": "application/json",
         })
         if proxy:
             self.session.proxies.update(proxy)
+            # Явно задать Proxy-Authorization для HTTPS CONNECT tunnel
+            auth_header = self._extract_proxy_auth(proxy)
+            if auth_header:
+                adapter = _ProxyAuthAdapter(proxy_basic_auth=auth_header)
+                self.session.mount('http://', adapter)
+                self.session.mount('https://', adapter)
+
+    @staticmethod
+    def _extract_proxy_auth(proxy: dict) -> Optional[str]:
+        """Извлечь Proxy-Authorization из proxy URL.
+
+        Парсит URL вида http://user:pass@host:port и возвращает
+        'Basic base64(user:pass)'. Работает даже если urlparse
+        не справляется — ищет @ как разделитель auth/host.
+        """
+        for proxy_url in proxy.values():
+            if not proxy_url or '@' not in str(proxy_url):
+                continue
+            try:
+                url_str = str(proxy_url)
+                # Попробовать стандартный urlparse
+                parsed = urlparse(url_str)
+                if parsed.username:
+                    username = unquote(parsed.username)
+                    password = unquote(parsed.password or '')
+                else:
+                    # Fallback: ручной парсинг (для спецсимволов в пароле)
+                    # http://user:p@ss@host:port → scheme://  +  user:p@ss  +  @host:port
+                    after_scheme = url_str.split('://', 1)[-1]
+                    # Последний @ — разделитель auth/host
+                    at_idx = after_scheme.rfind('@')
+                    if at_idx < 0:
+                        continue
+                    auth_part = after_scheme[:at_idx]
+                    colon_idx = auth_part.find(':')
+                    if colon_idx < 0:
+                        continue
+                    username = auth_part[:colon_idx]
+                    password = auth_part[colon_idx + 1:]
+
+                credentials = f"{username}:{password}"
+                encoded = base64.b64encode(credentials.encode('utf-8')).decode('ascii')
+                logger.debug(f"Extracted proxy auth for user '{username}'")
+                return f"Basic {encoded}"
+            except Exception as e:
+                logger.warning(f"Failed to extract proxy auth: {e}")
+                continue
+        return None
 
     def get_quote(
         self,

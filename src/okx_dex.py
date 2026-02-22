@@ -14,7 +14,9 @@ import logging
 from typing import Optional, Dict, Any, Tuple, List
 from dataclasses import dataclass
 from decimal import Decimal
+from urllib.parse import urlparse, unquote
 import requests
+from requests.adapters import HTTPAdapter
 from web3 import Web3
 from .utils import NonceManager
 
@@ -107,8 +109,46 @@ class OKXDexSwap:
         self.project_id = project_id
         self.nonce_manager = nonce_manager
         self.session = requests.Session()
+        self.session.trust_env = False
         if proxy:
             self.session.proxies.update(proxy)
+            # Явно задать Proxy-Authorization для HTTPS CONNECT tunnel
+            auth_header = self._extract_proxy_auth(proxy)
+            if auth_header:
+                from .kyberswap import _ProxyAuthAdapter
+                adapter = _ProxyAuthAdapter(proxy_basic_auth=auth_header)
+                self.session.mount('http://', adapter)
+                self.session.mount('https://', adapter)
+
+    @staticmethod
+    def _extract_proxy_auth(proxy: dict):
+        """Извлечь Proxy-Authorization из proxy URL."""
+        for proxy_url in proxy.values():
+            if not proxy_url or '@' not in str(proxy_url):
+                continue
+            try:
+                url_str = str(proxy_url)
+                parsed = urlparse(url_str)
+                if parsed.username:
+                    username = unquote(parsed.username)
+                    password = unquote(parsed.password or '')
+                else:
+                    after_scheme = url_str.split('://', 1)[-1]
+                    at_idx = after_scheme.rfind('@')
+                    if at_idx < 0:
+                        continue
+                    auth_part = after_scheme[:at_idx]
+                    colon_idx = auth_part.find(':')
+                    if colon_idx < 0:
+                        continue
+                    username = auth_part[:colon_idx]
+                    password = auth_part[colon_idx + 1:]
+                credentials = f"{username}:{password}"
+                encoded = base64.b64encode(credentials.encode('utf-8')).decode('ascii')
+                return f"Basic {encoded}"
+            except Exception:
+                continue
+        return None
 
     def _get_timestamp(self) -> str:
         """Получить timestamp в формате ISO 8601."""

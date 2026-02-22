@@ -1525,9 +1525,10 @@ class CreateTab(QWidget):
         proxy_user = self.proxy_user_input.text().strip()
         proxy_pass = self.proxy_pass_input.text().strip()
 
-        # Build proxy URL
+        # Build proxy URL (URL-encode credentials — спецсимволы @:/ ломают urlparse)
+        from urllib.parse import quote
         if proxy_user and proxy_pass:
-            auth = f"{proxy_user}:{proxy_pass}@"
+            auth = f"{quote(proxy_user, safe='')}:{quote(proxy_pass, safe='')}@"
         else:
             auth = ""
 
