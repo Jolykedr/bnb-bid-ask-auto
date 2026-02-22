@@ -253,7 +253,7 @@ class PoolFactory:
             raise RuntimeError(
                 f"Cannot read decimals for token {address}. "
                 f"RPC error: {e}. Silent fallback to 18 is disabled to prevent calculation errors."
-            )
+            ) from e
 
         try:
             total_supply = token.functions.totalSupply().call()
