@@ -678,7 +678,8 @@ class ClosePositionsWorker(QThread):
                             rpc_url=self.provider.w3.provider.endpoint_uri,
                             private_key=self.provider.account.key.hex() if hasattr(self.provider.account, 'key') else None,
                             position_manager_address=uniswap_config.position_manager,
-                            chain_id=chain_id
+                            chain_id=chain_id,
+                            proxy=getattr(self.provider, 'proxy', None)
                         )
 
                         tx_hash, success, gas_used = uniswap_provider.close_positions(
