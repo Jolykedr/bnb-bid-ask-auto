@@ -952,6 +952,7 @@ class ManageTab(QWidget):
         self.scan_worker = None
         self._worker_queue = []  # [(token_id, protocol)] pending work
         self._active_workers = []  # Currently running workers
+        self._dying_workers = []  # Cancelled workers still running — prevent GC segfault
         self.MAX_CONCURRENT_WORKERS = 8
         # Batch table update state
         self._pending_updates = {}  # {token_id: position} — accumulated for batch flush
@@ -1067,8 +1068,9 @@ class ManageTab(QWidget):
         header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
 
-        # Set custom delegate for progress bar column
-        self.positions_table.setItemDelegateForColumn(8, PriceProgressDelegate())
+        # Set custom delegate for progress bar column (keep reference to prevent GC)
+        self._price_progress_delegate = PriceProgressDelegate(self.positions_table)
+        self.positions_table.setItemDelegateForColumn(8, self._price_progress_delegate)
 
         self.positions_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.positions_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -1414,7 +1416,9 @@ class ManageTab(QWidget):
         # Clear pending queue first
         self._worker_queue.clear()
 
-        # Disconnect signals and schedule deletion — do NOT block UI with wait()
+        # Disconnect signals and move to _dying_workers to prevent GC while running.
+        # CRITICAL: If Python GC collects a QThread while it's running,
+        # QThread::~QThread() triggers a segfault ("destroyed while running").
         for w in self._active_workers:
             try:
                 w.position_loaded.disconnect()
@@ -1423,17 +1427,40 @@ class ManageTab(QWidget):
                 w.finished.disconnect()
             except (TypeError, RuntimeError):
                 pass
-            # Connect finished to deleteLater so cleanup happens when thread actually ends
-            try:
-                w.finished.connect(w.deleteLater)
-            except (TypeError, RuntimeError):
-                pass
-            # Non-blocking: quit() for event-loop threads; run()-based threads
-            # will finish naturally. Do NOT wait() on UI thread.
             if w.isRunning():
+                # Keep Python reference alive until thread finishes
+                self._dying_workers.append(w)
+                try:
+                    w.finished.connect(lambda dead_w=w: self._cleanup_dead_worker(dead_w))
+                except (TypeError, RuntimeError):
+                    pass
                 w.quit()
+            else:
+                # Thread already finished — safe to delete
+                w.deleteLater()
         self._active_workers.clear()
         self.load_workers.clear()  # keep in sync
+
+    def _cleanup_dead_worker(self, worker):
+        """Remove a cancelled worker from _dying_workers after it finishes."""
+        try:
+            self._dying_workers.remove(worker)
+        except ValueError:
+            pass
+        worker.deleteLater()
+
+    def _safe_cleanup_worker(self, worker):
+        """Safely cleanup a worker — keep Python reference if still running.
+
+        CRITICAL: If Python GC collects a QThread while it's running,
+        QThread::~QThread() triggers a C++ segfault. We must keep a Python
+        reference alive until the thread's finished signal fires.
+        """
+        if worker.isRunning():
+            self._dying_workers.append(worker)
+            worker.finished.connect(lambda w=worker: self._cleanup_dead_worker(w))
+        else:
+            worker.deleteLater()
 
     def _load_positions_by_ids(self, token_ids: list, protocol: str = None, cancel_existing: bool = True):
         """Load specific positions by their IDs using a worker queue."""
@@ -1603,14 +1630,20 @@ class ManageTab(QWidget):
         # Stop previous scan if still running
         if hasattr(self, 'scan_worker') and self.scan_worker is not None:
             try:
-                self.scan_worker.scan_finished.disconnect()
+                self.scan_worker.scan_result.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                self.scan_worker.progress.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                self.scan_worker.position_found.disconnect()
             except (TypeError, RuntimeError):
                 pass
             if self.scan_worker.isRunning():
                 self.scan_worker.quit()
-                self.scan_worker.finished.connect(self.scan_worker.deleteLater)
-            else:
-                self.scan_worker.deleteLater()
+            self._safe_cleanup_worker(self.scan_worker)
             self.scan_worker = None
 
         # Start scan worker with selected protocol
@@ -1688,8 +1721,8 @@ class ManageTab(QWidget):
     def _on_scan_finished(self, total_found: int, token_ids: list, protocol: str = "v3"):
         """Handle scan completion."""
         if self.scan_worker is not None:
-            # Don't wait() — signal means thread is done or finishing
-            self.scan_worker.deleteLater()
+            # scan_result is emitted from run() — thread may still be finishing.
+            self._safe_cleanup_worker(self.scan_worker)
             self.scan_worker = None
         self.progress_bar.hide()
         self.scan_btn.setEnabled(True)
@@ -2446,7 +2479,7 @@ class ManageTab(QWidget):
         """Handle batch close completion. Shows swap preview if auto-sell enabled."""
         try:
             if self.worker is not None:
-                self.worker.deleteLater()
+                self._safe_cleanup_worker(self.worker)
                 self.worker = None
             self.progress_bar.hide()
             self.close_selected_btn.setEnabled(True)
@@ -2562,7 +2595,7 @@ class ManageTab(QWidget):
         """Handle close completion. Shows swap preview if auto-sell enabled."""
         try:
             if self.worker is not None:
-                self.worker.deleteLater()
+                self._safe_cleanup_worker(self.worker)
                 self.worker = None
             self.progress_bar.hide()
             self.close_selected_btn.setEnabled(True)
@@ -2767,7 +2800,7 @@ class ManageTab(QWidget):
         """Handle swap completion — show results."""
         try:
             if hasattr(self, '_swap_worker') and self._swap_worker is not None:
-                self._swap_worker.deleteLater()
+                self._safe_cleanup_worker(self._swap_worker)
                 self._swap_worker = None
             self.progress_bar.hide()
             self.close_selected_btn.setEnabled(True)

@@ -208,14 +208,15 @@ class MainWindow(QMainWindow):
                 self.manage_tab.worker.deleteLater()
                 self.manage_tab.worker = None
 
-            # Load position workers (list)
-            if hasattr(self.manage_tab, 'load_workers'):
-                for w in self.manage_tab.load_workers:
+            # Load position workers (active + dying)
+            for w_list in ('_active_workers', 'load_workers', '_dying_workers'):
+                workers = getattr(self.manage_tab, w_list, [])
+                for w in workers:
                     if w.isRunning():
                         w.quit()
                         w.wait(2000)
                     w.deleteLater()
-                self.manage_tab.load_workers.clear()
+                workers.clear()
 
             # Scan worker
             if hasattr(self.manage_tab, 'scan_worker') and self.manage_tab.scan_worker is not None:
