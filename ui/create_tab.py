@@ -962,6 +962,7 @@ class CreateTab(QWidget):
         self._loaded_pool_id_bytes = None
         self.setup_ui()
         self._load_saved_wallet()
+        self._load_proxy_from_settings()
 
     def _reset_pool_state(self):
         """Reset all pool-related state variables. Call when switching tokens/protocols."""
@@ -2432,6 +2433,23 @@ class CreateTab(QWidget):
             self.gas_limit_spin.setValue(gas_override)
         slippage = tx_settings.value("tx/slippage", 0.5, type=float)
         self.slippage_spin.setValue(slippage)
+        self._load_proxy_from_settings()
+
+    def _load_proxy_from_settings(self):
+        """Load proxy config from QSettings into UI fields (if not overridden by user)."""
+        s = QSettings("BNBLiquidityLadder", "Settings")
+        saved_type = s.value("proxy/type", 0, type=int)
+        saved_addr = s.value("proxy/address", "")
+        saved_user = s.value("proxy/username", "")
+        saved_pass = s.value("proxy/password", "")
+
+        # Only apply if UI proxy is currently empty (don't overwrite user's manual input)
+        current_addr = self.proxy_input.text().strip()
+        if not current_addr and saved_addr:
+            self.proxy_type_combo.setCurrentIndex(saved_type)
+            self.proxy_input.setText(saved_addr)
+            self.proxy_user_input.setText(saved_user)
+            self.proxy_pass_input.setText(saved_pass)
 
     def _load_saved_wallet(self):
         """Load saved wallet from settings (with master password decryption)."""

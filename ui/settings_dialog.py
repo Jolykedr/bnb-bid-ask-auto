@@ -66,6 +66,49 @@ class SettingsDialog(QDialog):
         network_group_layout.addLayout(network_row)
 
         network_layout.addWidget(network_group)
+
+        # --- Proxy Settings ---
+        proxy_group = QGroupBox("Proxy (сохраняется между сессиями)")
+        proxy_group_layout = QVBoxLayout(proxy_group)
+
+        # Proxy type
+        proxy_type_row = QHBoxLayout()
+        proxy_type_row.addWidget(QLabel("Type:"))
+        self.proxy_type_combo = QComboBox()
+        self.proxy_type_combo.addItems(["None", "SOCKS5", "HTTP"])
+        self.proxy_type_combo.setMaximumWidth(100)
+        self.proxy_type_combo.currentIndexChanged.connect(self._on_proxy_type_changed)
+        proxy_type_row.addWidget(self.proxy_type_combo)
+        proxy_type_row.addStretch()
+        proxy_group_layout.addLayout(proxy_type_row)
+
+        # Proxy address
+        proxy_addr_row = QHBoxLayout()
+        proxy_addr_row.addWidget(QLabel("Address:"))
+        self.proxy_addr_input = QLineEdit()
+        self.proxy_addr_input.setPlaceholderText("host:port (e.g. 127.0.0.1:1080)")
+        self.proxy_addr_input.setEnabled(False)
+        proxy_addr_row.addWidget(self.proxy_addr_input)
+        proxy_group_layout.addLayout(proxy_addr_row)
+
+        # Proxy auth
+        proxy_auth_row = QHBoxLayout()
+        proxy_auth_row.addWidget(QLabel("Auth:"))
+        self.proxy_user_input = QLineEdit()
+        self.proxy_user_input.setPlaceholderText("username")
+        self.proxy_user_input.setEnabled(False)
+        self.proxy_user_input.setMaximumWidth(150)
+        proxy_auth_row.addWidget(self.proxy_user_input)
+        self.proxy_pass_input = QLineEdit()
+        self.proxy_pass_input.setPlaceholderText("password")
+        self.proxy_pass_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.proxy_pass_input.setEnabled(False)
+        self.proxy_pass_input.setMaximumWidth(150)
+        proxy_auth_row.addWidget(self.proxy_pass_input)
+        proxy_auth_row.addStretch()
+        proxy_group_layout.addLayout(proxy_auth_row)
+
+        network_layout.addWidget(proxy_group)
         network_layout.addStretch()
         tabs.addTab(network_tab, "Network")
 
@@ -299,6 +342,13 @@ class SettingsDialog(QDialog):
 
         layout.addLayout(button_layout)
 
+    def _on_proxy_type_changed(self, index):
+        """Enable/disable proxy inputs based on type."""
+        enabled = index > 0
+        self.proxy_addr_input.setEnabled(enabled)
+        self.proxy_user_input.setEnabled(enabled)
+        self.proxy_pass_input.setEnabled(enabled)
+
     def on_network_changed(self, index):
         """Auto-update RPC URL when network changes."""
         rpc_urls = {
@@ -350,6 +400,19 @@ class SettingsDialog(QDialog):
         self.font_combo.setCurrentIndex(
             self.settings.value("appearance/font_size", 1, type=int)
         )
+        # Proxy settings
+        self.proxy_type_combo.setCurrentIndex(
+            self.settings.value("proxy/type", 0, type=int)
+        )
+        self.proxy_addr_input.setText(
+            self.settings.value("proxy/address", "")
+        )
+        self.proxy_user_input.setText(
+            self.settings.value("proxy/username", "")
+        )
+        self.proxy_pass_input.setText(
+            self.settings.value("proxy/password", "")
+        )
         # OKX DEX settings
         self.okx_api_key_input.setText(
             self.settings.value("okx/api_key", "")
@@ -382,6 +445,11 @@ class SettingsDialog(QDialog):
         self.settings.setValue("calc/positions", self.positions_spin.value())
         self.settings.setValue("appearance/theme", self.theme_combo.currentIndex())
         self.settings.setValue("appearance/font_size", self.font_combo.currentIndex())
+        # Proxy settings
+        self.settings.setValue("proxy/type", self.proxy_type_combo.currentIndex())
+        self.settings.setValue("proxy/address", self.proxy_addr_input.text().strip())
+        self.settings.setValue("proxy/username", self.proxy_user_input.text().strip())
+        self.settings.setValue("proxy/password", self.proxy_pass_input.text())
         # OKX DEX settings
         self.settings.setValue("okx/api_key", self.okx_api_key_input.text())
         self.settings.setValue("okx/secret_key", self.okx_secret_input.text())
