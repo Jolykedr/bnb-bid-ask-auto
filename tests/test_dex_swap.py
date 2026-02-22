@@ -967,25 +967,37 @@ class TestSwap:
         # Should have called swap_v3 with reduced amount
         assert result.success is True
 
-    def test_v3_preferred_when_better_quote(self):
-        """V3 is used when its quote >= V2 quote."""
+    def test_auto_mode_v2_tried_first(self):
+        """Auto mode: V2 is tried before V3 (after Kyber fails)."""
         swapper, w3 = self._setup_swap()
         result = swapper.swap(TOKEN_VOLATILE, USDT_BSC, 10**18, WALLET, PRIVATE_KEY)
         assert result.success is True
-        swapper.swap_v3.assert_called_once()
+        # V2 succeeds first, so V3 is never called
+        swapper._swap_v2.assert_called_once()
+        swapper.swap_v3.assert_not_called()
 
-    def test_v2_used_when_better_quote(self):
-        """V2 is used when V2 quote > V3 quote."""
+    def test_v2_fails_falls_back_to_v3(self):
+        """When V2 swap fails, falls back to V3."""
         swapper, w3 = self._setup_swap()
-        swapper.get_quote_v3 = MagicMock(return_value=(3 * 10**18, 500, 0))
-        swapper.get_quote = MagicMock(return_value=5 * 10**18)
+        swapper._swap_v2 = MagicMock(return_value=SwapResult(
+            success=False, tx_hash=None, from_token=TOKEN_VOLATILE, to_token=USDT_BSC,
+            from_amount=10**18, to_amount=0, to_amount_usd=0, gas_used=0,
+            error="V2 reverted"
+        ))
 
         result = swapper.swap(TOKEN_VOLATILE, USDT_BSC, 10**18, WALLET, PRIVATE_KEY)
+        assert result.success is True
         swapper._swap_v2.assert_called_once()
+        swapper.swap_v3.assert_called_once()
 
-    def test_v3_fails_falls_back_to_v2(self):
-        """When V3 swap fails, falls back to V2."""
+    def test_v2_and_v3_both_fail(self):
+        """When both V2 and V3 fail, returns V2 error."""
         swapper, w3 = self._setup_swap()
+        swapper._swap_v2 = MagicMock(return_value=SwapResult(
+            success=False, tx_hash=None, from_token=TOKEN_VOLATILE, to_token=USDT_BSC,
+            from_amount=10**18, to_amount=0, to_amount_usd=0, gas_used=0,
+            error="V2 no liquidity"
+        ))
         swapper.swap_v3 = MagicMock(return_value=SwapResult(
             success=False, tx_hash=None, from_token=TOKEN_VOLATILE, to_token=USDT_BSC,
             from_amount=10**18, to_amount=0, to_amount_usd=0, gas_used=0,
@@ -993,26 +1005,27 @@ class TestSwap:
         ))
 
         result = swapper.swap(TOKEN_VOLATILE, USDT_BSC, 10**18, WALLET, PRIVATE_KEY)
-        swapper._swap_v2.assert_called_once()
+        assert result.success is False
 
-    def test_no_v3_liquidity_falls_to_v2(self):
-        """When V3 quote is 0, goes directly to V2."""
-        swapper, w3 = self._setup_swap()
-        swapper.get_quote_v3 = MagicMock(return_value=(0, 0, 0))
-
-        result = swapper.swap(TOKEN_VOLATILE, USDT_BSC, 10**18, WALLET, PRIVATE_KEY)
-        swapper.swap_v3.assert_not_called()
-        swapper._swap_v2.assert_called_once()
-
-    def test_prefer_v3_false_skips_v3(self):
-        """When prefer_v3=False, goes directly to V2."""
+    def test_swap_mode_v2_only(self):
+        """swap_mode='v2' only tries V2."""
         swapper, w3 = self._setup_swap()
         result = swapper.swap(
             TOKEN_VOLATILE, USDT_BSC, 10**18, WALLET, PRIVATE_KEY,
-            prefer_v3=False
+            swap_mode="v2"
         )
-        swapper.swap_v3.assert_not_called()
         swapper._swap_v2.assert_called_once()
+        swapper.swap_v3.assert_not_called()
+
+    def test_swap_mode_v3_only(self):
+        """swap_mode='v3' only tries V3."""
+        swapper, w3 = self._setup_swap()
+        result = swapper.swap(
+            TOKEN_VOLATILE, USDT_BSC, 10**18, WALLET, PRIVATE_KEY,
+            swap_mode="v3"
+        )
+        swapper.swap_v3.assert_called_once()
+        swapper._swap_v2.assert_not_called()
 
     def test_exception_returns_swap_result(self):
         """Exception in swap returns a SwapResult with error."""
@@ -1415,12 +1428,11 @@ class TestEdgeCases:
         expected = Web3.keccak(text="Transfer(address,address,uint256)")
         assert DexSwap.TRANSFER_TOPIC == expected
 
-    def test_swap_multi_hop_passes_none_fee(self):
-        """When V3 quote is multi-hop, swap is called with fee=None."""
+    def test_v3_fallback_called_when_v2_fails(self):
+        """Auto mode: V3 is called as fallback when V2 has no liquidity."""
         swapper, w3 = _make_swapper(56)
         swapper.get_token_balance = MagicMock(return_value=10**18)
-        swapper.get_quote_v3 = MagicMock(return_value=(10**18, 500, 100))  # multi-hop
-        swapper.get_quote = MagicMock(return_value=0)
+        swapper.get_quote = MagicMock(return_value=0)  # V2 no liquidity
 
         swap_v3_result = SwapResult(
             success=True, tx_hash="0x", from_token=TOKEN_VOLATILE, to_token=USDT_BSC,
@@ -1428,23 +1440,15 @@ class TestEdgeCases:
         )
         swapper.swap_v3 = MagicMock(return_value=swap_v3_result)
 
-        swapper.swap(TOKEN_VOLATILE, USDT_BSC, 10**18, WALLET, PRIVATE_KEY)
+        result = swapper.swap(TOKEN_VOLATILE, USDT_BSC, 10**18, WALLET, PRIVATE_KEY)
+        assert result.success is True
+        swapper.swap_v3.assert_called_once()
 
-        # swap_v3 should have been called with fee=None for multi-hop
-        call_args = swapper.swap_v3.call_args
-        # fee is the 8th positional arg (index 7) or keyword 'fee'
-        if 'fee' in (call_args.kwargs or {}):
-            assert call_args.kwargs['fee'] is None
-        else:
-            # positional: from_token, to_token, amount_in, wallet, pk, slippage, deadline, fee
-            assert call_args[0][7] is None
-
-    def test_swap_direct_passes_best_fee(self):
-        """When V3 quote is direct, swap is called with the best_fee."""
+    def test_v3_fallback_receives_basic_args(self):
+        """Auto mode: V3 fallback receives correct basic args (no pre-computed fee)."""
         swapper, w3 = _make_swapper(56)
         swapper.get_token_balance = MagicMock(return_value=10**18)
-        swapper.get_quote_v3 = MagicMock(return_value=(10**18, 2500, 0))  # direct
-        swapper.get_quote = MagicMock(return_value=0)
+        swapper.get_quote = MagicMock(return_value=0)  # V2 no liquidity
 
         swap_v3_result = SwapResult(
             success=True, tx_hash="0x", from_token=TOKEN_VOLATILE, to_token=USDT_BSC,
@@ -1455,10 +1459,9 @@ class TestEdgeCases:
         swapper.swap(TOKEN_VOLATILE, USDT_BSC, 10**18, WALLET, PRIVATE_KEY)
 
         call_args = swapper.swap_v3.call_args
-        if 'fee' in (call_args.kwargs or {}):
-            assert call_args.kwargs['fee'] == 2500
-        else:
-            assert call_args[0][7] == 2500
+        # V3 fallback called with 7 positional args, no fee kwarg
+        assert len(call_args[0]) == 7
+        assert 'fee' not in (call_args.kwargs or {})
 
 
 if __name__ == "__main__":
