@@ -840,7 +840,8 @@ class SwapWorker(QThread):
 
     def __init__(self, w3, chain_id: int, tokens: list, private_key: str,
                  output_token: str, slippage: float = 3.0, max_price_impact: float = 5.0,
-                 initial_investment: float = 0, proxy: dict = None):
+                 initial_investment: float = 0, proxy: dict = None,
+                 swap_mode: str = "auto"):
         super().__init__()
         self.w3 = w3
         self.chain_id = chain_id
@@ -851,6 +852,7 @@ class SwapWorker(QThread):
         self.max_price_impact = max_price_impact
         self.initial_investment = initial_investment
         self.proxy = proxy
+        self.swap_mode = swap_mode
 
     def run(self):
         try:
@@ -883,7 +885,8 @@ class SwapWorker(QThread):
                     amount_in=amount,
                     wallet_address=wallet,
                     private_key=self.private_key,
-                    slippage=self.slippage
+                    slippage=self.slippage,
+                    swap_mode=self.swap_mode
                 )
 
                 if result.success:
@@ -1149,6 +1152,18 @@ class ManageTab(QWidget):
         )
         self.initial_investment_spin.setFixedWidth(85)
         close_settings_layout.addWidget(self.initial_investment_spin)
+
+        close_settings_layout.addWidget(QLabel("Swap DEX:"))
+        self.swap_mode_combo = QComboBox()
+        self.swap_mode_combo.addItem("Авто (Kyber→V2→V3)", "auto")
+        self.swap_mode_combo.addItem("KyberSwap", "kyber")
+        self.swap_mode_combo.addItem("V2", "v2")
+        self.swap_mode_combo.addItem("V3", "v3")
+        self.swap_mode_combo.setCurrentIndex(0)
+        self.swap_mode_combo.setToolTip("Метод свапа: Авто = Kyber→V2→V3 по приоритету")
+        self.swap_mode_combo.setFixedWidth(150)
+        close_settings_layout.addWidget(self.swap_mode_combo)
+
         close_settings_layout.addStretch()
         actions_layout.addLayout(close_settings_layout)
 
@@ -1216,6 +1231,9 @@ class ManageTab(QWidget):
 
     def set_provider(self, provider):
         """Set the liquidity provider instance."""
+        # Skip full reload if same provider is already set
+        if provider and provider is self.provider:
+            return
         self.provider = provider
         if provider:
             # Detect V4 provider and its specific protocol
@@ -1396,7 +1414,7 @@ class ManageTab(QWidget):
         # Clear pending queue first
         self._worker_queue.clear()
 
-        # Stop active workers
+        # Disconnect signals and schedule deletion — do NOT block UI with wait()
         for w in self._active_workers:
             try:
                 w.position_loaded.disconnect()
@@ -1405,10 +1423,15 @@ class ManageTab(QWidget):
                 w.finished.disconnect()
             except (TypeError, RuntimeError):
                 pass
+            # Connect finished to deleteLater so cleanup happens when thread actually ends
+            try:
+                w.finished.connect(w.deleteLater)
+            except (TypeError, RuntimeError):
+                pass
+            # Non-blocking: quit() for event-loop threads; run()-based threads
+            # will finish naturally. Do NOT wait() on UI thread.
             if w.isRunning():
                 w.quit()
-                w.wait(3000)
-            w.deleteLater()
         self._active_workers.clear()
         self.load_workers.clear()  # keep in sync
 
@@ -1579,10 +1602,15 @@ class ManageTab(QWidget):
 
         # Stop previous scan if still running
         if hasattr(self, 'scan_worker') and self.scan_worker is not None:
+            try:
+                self.scan_worker.scan_finished.disconnect()
+            except (TypeError, RuntimeError):
+                pass
             if self.scan_worker.isRunning():
                 self.scan_worker.quit()
-                self.scan_worker.wait(3000)
-            self.scan_worker.deleteLater()
+                self.scan_worker.finished.connect(self.scan_worker.deleteLater)
+            else:
+                self.scan_worker.deleteLater()
             self.scan_worker = None
 
         # Start scan worker with selected protocol
@@ -1660,8 +1688,7 @@ class ManageTab(QWidget):
     def _on_scan_finished(self, total_found: int, token_ids: list, protocol: str = "v3"):
         """Handle scan completion."""
         if self.scan_worker is not None:
-            if self.scan_worker.isRunning():
-                self.scan_worker.wait(5000)
+            # Don't wait() — signal means thread is done or finishing
             self.scan_worker.deleteLater()
             self.scan_worker = None
         self.progress_bar.hide()
@@ -2378,6 +2405,7 @@ class ManageTab(QWidget):
         self._pending_auto_sell = auto_sell
         self._pending_swap_slippage = swap_slippage
         self._pending_max_price_impact = self.max_impact_spin.value()
+        self._pending_swap_mode = self.swap_mode_combo.currentData() or "auto"
         self._pending_private_key = None
 
         if auto_sell:
@@ -2418,8 +2446,6 @@ class ManageTab(QWidget):
         """Handle batch close completion. Shows swap preview if auto-sell enabled."""
         try:
             if self.worker is not None:
-                if self.worker.isRunning():
-                    self.worker.wait(10000)
                 self.worker.deleteLater()
                 self.worker = None
             self.progress_bar.hide()
@@ -2486,6 +2512,7 @@ class ManageTab(QWidget):
         self._pending_auto_sell = auto_sell
         self._pending_swap_slippage = swap_slippage
         self._pending_max_price_impact = self.max_impact_spin.value()
+        self._pending_swap_mode = self.swap_mode_combo.currentData() or "auto"
         self._pending_private_key = None
 
         if auto_sell:
@@ -2535,8 +2562,6 @@ class ManageTab(QWidget):
         """Handle close completion. Shows swap preview if auto-sell enabled."""
         try:
             if self.worker is not None:
-                if self.worker.isRunning():
-                    self.worker.wait(10000)
                 self.worker.deleteLater()
                 self.worker = None
             self.progress_bar.hide()
@@ -2685,6 +2710,7 @@ class ManageTab(QWidget):
                 slippage=self._pending_swap_slippage,
                 max_price_impact=self._pending_max_price_impact,
                 proxy=proxy,
+                swap_mode=self._pending_swap_mode,
             )
             dialog.confirmed.connect(self._on_swap_confirmed)
             result = dialog.exec()
@@ -2718,6 +2744,7 @@ class ManageTab(QWidget):
             self.batch_close_btn.setEnabled(False)
 
             initial_investment = self.initial_investment_spin.value()
+            swap_mode = getattr(self, '_pending_swap_mode', 'auto')
 
             self._swap_worker = SwapWorker(
                 w3, chain_id, tokens,
@@ -2727,6 +2754,7 @@ class ManageTab(QWidget):
                 max_price_impact=self._pending_max_price_impact,
                 initial_investment=initial_investment,
                 proxy=proxy,
+                swap_mode=swap_mode,
             )
             self._swap_worker.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
             self._swap_worker.swap_result.connect(self._on_swap_finished, Qt.ConnectionType.QueuedConnection)
@@ -2739,8 +2767,6 @@ class ManageTab(QWidget):
         """Handle swap completion — show results."""
         try:
             if hasattr(self, '_swap_worker') and self._swap_worker is not None:
-                if self._swap_worker.isRunning():
-                    self._swap_worker.wait(10000)
                 self._swap_worker.deleteLater()
                 self._swap_worker = None
             self.progress_bar.hide()

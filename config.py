@@ -281,6 +281,7 @@ STABLECOINS: Dict[str, int] = {
     "0xe9e7cea3dedca5984780bafc599bd69add087d56": 18,  # BUSD (BSC)
     "0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3": 18,  # DAI (BSC)
     "0xc5f0f7b66764f6ec8c8dff7ba683102295e16409": 18,  # FDUSD (BSC)
+    "0x8d0d000ee44948fc98c9b98a4fa4921476f08b0d": 18,  # USD1 (BSC)
     # Base (8453)
     "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": 6,   # USDC (Base)
     "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca": 6,   # USDbC bridged (Base)
@@ -315,6 +316,7 @@ STABLE_TOKENS: Dict[str, str] = {
     "0xe9e7cea3dedca5984780bafc599bd69add087d56": "BUSD",  # BUSD
     "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c": "WBNB",  # Wrapped BNB
     "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee": "BNB",   # Native BNB
+    "0x8d0d000ee44948fc98c9b98a4fa4921476f08b0d": "USD1",  # USD1 (BSC)
 
     # Ethereum (1)
     "0xdac17f958d2ee523a2206206994597c13d831ec7": "USDT",  # ETH USDT

@@ -1,7 +1,7 @@
 """
 Swap Preview Dialog
 
-Диалог предпросмотра свапа — показывает котировки KyberSwap перед выполнением.
+Диалог предпросмотра свапа — показывает котировки перед выполнением.
 Появляется после закрытия позиций, перед свапом токенов.
 """
 
@@ -22,13 +22,14 @@ logger = logging.getLogger(__name__)
 
 
 class QuoteWorker(QThread):
-    """Фоновый поток для загрузки котировок KyberSwap."""
+    """Фоновый поток для загрузки котировок."""
 
     quote_ready = pyqtSignal(int, dict)   # (row_index, quote_data)
     all_done = pyqtSignal(float)           # total_usd
 
     def __init__(self, w3, chain_id: int, tokens: list, output_token: str,
-                 max_price_impact: float = 5.0, proxy: dict = None):
+                 max_price_impact: float = 5.0, proxy: dict = None,
+                 swap_mode: str = "auto"):
         super().__init__()
         self.w3 = w3
         self.chain_id = chain_id
@@ -36,6 +37,7 @@ class QuoteWorker(QThread):
         self.output_token = output_token
         self.max_price_impact = max_price_impact
         self.proxy = proxy
+        self.swap_mode = swap_mode
 
     def run(self):
         try:
@@ -52,69 +54,15 @@ class QuoteWorker(QThread):
                         })
                         continue
 
-                    # Попробовать KyberSwap
-                    kyber_quote = swapper.get_kyber_quote(
-                        token['address'], self.output_token, amount
-                    )
-
-                    if kyber_quote and kyber_quote.amount_out > 0:
-                        out_human = kyber_quote.amount_out_human
-                        total_usd += out_human
-                        self.quote_ready.emit(i, {
-                            'status': 'ok',
-                            'amount_out': kyber_quote.amount_out,
-                            'amount_out_human': out_human,
-                            'route': kyber_quote.route_description,
-                            'price_impact': kyber_quote.price_impact,
-                            'source': 'KyberSwap',
-                        })
+                    result = self._get_best_quote(swapper, token['address'], amount)
+                    if result:
+                        total_usd += result['amount_out_human']
+                        self.quote_ready.emit(i, result)
                     else:
-                        # Fallback: V3 quote
-                        if swapper.v3_available:
-                            v3_out, fee, _ = swapper.get_quote_v3(
-                                token['address'], self.output_token, amount
-                            )
-                            if v3_out > 0:
-                                try:
-                                    out_decimals = swapper.get_token_decimals(self.output_token)
-                                    out_human = v3_out / (10 ** out_decimals)
-                                except Exception:
-                                    out_human = 0.0
-                                total_usd += out_human
-                                self.quote_ready.emit(i, {
-                                    'status': 'ok',
-                                    'amount_out': v3_out,
-                                    'amount_out_human': out_human,
-                                    'route': f'V3 (fee {fee/10000:.2f}%)',
-                                    'price_impact': 0,
-                                    'source': 'V3 fallback',
-                                })
-                                continue
-
-                        # Fallback: V2 quote
-                        v2_out = swapper.get_quote(
-                            token['address'], self.output_token, amount
-                        )
-                        if v2_out > 0:
-                            try:
-                                out_decimals = swapper.get_token_decimals(self.output_token)
-                                out_human = v2_out / (10 ** out_decimals)
-                            except Exception:
-                                out_human = 0.0
-                            total_usd += out_human
-                            self.quote_ready.emit(i, {
-                                'status': 'ok',
-                                'amount_out': v2_out,
-                                'amount_out_human': out_human,
-                                'route': 'V2 fallback',
-                                'price_impact': 0,
-                                'source': 'V2 fallback',
-                            })
-                        else:
-                            self.quote_ready.emit(i, {
-                                'status': 'error',
-                                'reason': 'No liquidity',
-                            })
+                        self.quote_ready.emit(i, {
+                            'status': 'error',
+                            'reason': 'No liquidity',
+                        })
 
                 except Exception as e:
                     logger.warning(f"Quote failed for {token.get('symbol', '?')}: {e}")
@@ -128,6 +76,68 @@ class QuoteWorker(QThread):
         except Exception as e:
             logger.error(f"QuoteWorker error: {e}", exc_info=True)
             self.all_done.emit(0.0)
+
+    def _get_best_quote(self, swapper: DexSwap, token_address: str, amount: int) -> Optional[dict]:
+        """Получить лучшую котировку в зависимости от swap_mode."""
+
+        def _make_result(amount_out: int, route: str, source: str, price_impact: float = 0) -> Optional[dict]:
+            if amount_out <= 0:
+                return None
+            try:
+                out_decimals = swapper.get_token_decimals(self.output_token)
+                out_human = amount_out / (10 ** out_decimals)
+            except Exception:
+                out_human = 0.0
+            return {
+                'status': 'ok',
+                'amount_out': amount_out,
+                'amount_out_human': out_human,
+                'route': route,
+                'price_impact': price_impact,
+                'source': source,
+            }
+
+        def _try_kyber():
+            kyber_quote = swapper.get_kyber_quote(token_address, self.output_token, amount)
+            if kyber_quote and kyber_quote.amount_out > 0:
+                return {
+                    'status': 'ok',
+                    'amount_out': kyber_quote.amount_out,
+                    'amount_out_human': kyber_quote.amount_out_human,
+                    'route': kyber_quote.route_description,
+                    'price_impact': kyber_quote.price_impact,
+                    'source': 'KyberSwap',
+                }
+            return None
+
+        def _try_v2():
+            v2_out = swapper.get_quote(token_address, self.output_token, amount)
+            return _make_result(v2_out, 'V2', 'V2')
+
+        def _try_v3():
+            if not swapper.v3_available:
+                return None
+            v3_out, fee, _ = swapper.get_quote_v3(token_address, self.output_token, amount)
+            return _make_result(v3_out, f'V3 (fee {fee/10000:.2f}%)', 'V3')
+
+        # Принудительный режим
+        if self.swap_mode == "kyber":
+            return _try_kyber()
+        if self.swap_mode == "v2":
+            return _try_v2()
+        if self.swap_mode == "v3":
+            return _try_v3()
+
+        # Auto: Kyber → V2 → V3
+        result = _try_kyber()
+        if result:
+            return result
+
+        result = _try_v2()
+        if result:
+            return result
+
+        return _try_v3()
 
 
 class SwapPreviewDialog(QDialog):
@@ -143,7 +153,8 @@ class SwapPreviewDialog(QDialog):
 
     def __init__(self, parent, tokens: list, chain_id: int, w3,
                  output_token: str, slippage: float = 3.0,
-                 max_price_impact: float = 5.0, proxy: dict = None):
+                 max_price_impact: float = 5.0, proxy: dict = None,
+                 swap_mode: str = "auto"):
         """
         Args:
             parent: Родительский виджет
@@ -154,6 +165,7 @@ class SwapPreviewDialog(QDialog):
             slippage: Slippage в %
             max_price_impact: Макс. price impact в %
             proxy: Proxy config dict
+            swap_mode: Режим свапа (auto/kyber/v2/v3)
         """
         super().__init__(parent)
         self.tokens = tokens
@@ -163,6 +175,7 @@ class SwapPreviewDialog(QDialog):
         self.slippage = slippage
         self.max_price_impact = max_price_impact
         self.proxy = proxy
+        self.swap_mode = swap_mode
         self.quotes = {}  # {row_index: quote_data}
         self.quote_worker = None
         self.total_usd = 0.0
@@ -224,8 +237,10 @@ class SwapPreviewDialog(QDialog):
         self.total_label.setFont(total_font)
         layout.addWidget(self.total_label)
 
-        # Slippage
-        info_label = QLabel(f"Slippage: {self.slippage}%  |  Max price impact: {self.max_price_impact}%")
+        # Slippage + swap mode info
+        mode_names = {"auto": "Авто (Kyber→V2→V3)", "kyber": "KyberSwap", "v2": "V2", "v3": "V3"}
+        mode_name = mode_names.get(self.swap_mode, self.swap_mode)
+        info_label = QLabel(f"Slippage: {self.slippage}%  |  Max impact: {self.max_price_impact}%  |  DEX: {mode_name}")
         info_label.setStyleSheet("color: gray;")
         layout.addWidget(info_label)
 
@@ -257,7 +272,8 @@ class SwapPreviewDialog(QDialog):
         """Запустить загрузку котировок в фоне."""
         self.quote_worker = QuoteWorker(
             self.w3, self.chain_id, self.tokens, self.output_token,
-            self.max_price_impact, proxy=self.proxy
+            self.max_price_impact, proxy=self.proxy,
+            swap_mode=self.swap_mode
         )
         self.quote_worker.quote_ready.connect(self._on_quote_ready, Qt.ConnectionType.QueuedConnection)
         self.quote_worker.all_done.connect(self._on_all_quotes_done, Qt.ConnectionType.QueuedConnection)

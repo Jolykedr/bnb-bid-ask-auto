@@ -1341,6 +1341,12 @@ class DexSwap:
                 error=f"KyberSwap: {e}"
             )
 
+    # Режимы свапа
+    SWAP_MODE_AUTO = "auto"       # Kyber → V2 → V3
+    SWAP_MODE_KYBER = "kyber"     # Только KyberSwap
+    SWAP_MODE_V2 = "v2"           # Только V2
+    SWAP_MODE_V3 = "v3"           # Только V3
+
     def swap(
         self,
         from_token: str,
@@ -1351,11 +1357,12 @@ class DexSwap:
         slippage: float = 1.0,
         deadline_minutes: int = 20,
         use_fee_on_transfer: bool = True,
-        prefer_v3: bool = True
+        prefer_v3: bool = True,
+        swap_mode: str = "auto"
     ) -> SwapResult:
         """
         Выполнить своп токена.
-        Приоритет: KyberSwap → V3 → V2.
+        Приоритет (auto): KyberSwap → V2 → V3.
 
         Args:
             from_token: Адрес токена для продажи
@@ -1366,7 +1373,8 @@ class DexSwap:
             slippage: Проскальзывание в % (1.0 = 1%)
             deadline_minutes: Дедлайн в минутах
             use_fee_on_transfer: Использовать метод для токенов с комиссией (V2)
-            prefer_v3: Пробовать V3 сначала (по умолчанию True)
+            prefer_v3: Пробовать V3 сначала (устарело, используйте swap_mode)
+            swap_mode: Режим свапа: "auto" (Kyber→V2→V3), "kyber", "v2", "v3"
 
         Returns:
             SwapResult с результатом операции
@@ -1409,6 +1417,32 @@ class DexSwap:
                     error="Zero balance"
                 )
 
+            # Принудительный режим: только один метод
+            if swap_mode == self.SWAP_MODE_KYBER:
+                if not self.kyber_client:
+                    return SwapResult(
+                        success=False, tx_hash=None, from_token=from_token, to_token=to_token,
+                        from_amount=amount_in, to_amount=0, to_amount_usd=0, gas_used=0,
+                        error="KyberSwap не доступен для этой сети"
+                    )
+                return self.swap_kyber(from_token, to_token, amount_in, wallet_address, private_key, slippage)
+
+            if swap_mode == self.SWAP_MODE_V2:
+                return self._swap_v2(
+                    from_token, to_token, amount_in,
+                    wallet_address, private_key,
+                    slippage, deadline_minutes, use_fee_on_transfer
+                )
+
+            if swap_mode == self.SWAP_MODE_V3:
+                return self.swap_v3(
+                    from_token, to_token, amount_in,
+                    wallet_address, private_key,
+                    slippage, deadline_minutes
+                )
+
+            # ── Auto режим: Kyber → V2 → V3 ──
+
             # Приоритет 1: KyberSwap Aggregator
             if self.kyber_client:
                 logger.info("Trying KyberSwap Aggregator first...")
@@ -1418,50 +1452,33 @@ class DexSwap:
                 )
                 if result.success:
                     return result
-                logger.warning(f"KyberSwap failed: {result.error}, falling back to V3/V2...")
+                logger.warning(f"KyberSwap failed: {result.error}, falling back to V2/V3...")
 
-            # Приоритет 2: V3 (если доступен и prefer_v3=True)
-            if prefer_v3 and self.v3_available:
-                logger.info("Trying V3 swap...")
-                v3_quote, best_fee, multi_hop_fee2 = self.get_quote_v3(from_token, to_token, amount_in)
-
-                if v3_quote > 0:
-                    is_multi_hop = multi_hop_fee2 > 0
-                    logger.info(f"V3 quote found: {v3_quote} (fee: {best_fee/10000}%{f', hop2={multi_hop_fee2/10000}%' if is_multi_hop else ''})")
-
-                    # Сравнить с V2 котировкой
-                    v2_quote = self.get_quote(from_token, to_token, amount_in)
-
-                    # Cross-source divergence check
-                    if v3_quote > 0 and v2_quote > 0:
-                        higher = max(v3_quote, v2_quote)
-                        lower = min(v3_quote, v2_quote)
-                        divergence = (higher - lower) / higher * 100
-                        if divergence > 10:
-                            logger.warning(f"V2/V3 quote divergence: {divergence:.1f}% (V3={v3_quote}, V2={v2_quote}) — possible pool manipulation")
-
-                    if v3_quote >= v2_quote or v2_quote == 0:
-                        logger.info(f"Using V3 (V3: {v3_quote} vs V2: {v2_quote})")
-                        result = self.swap_v3(
-                            from_token, to_token, amount_in,
-                            wallet_address, private_key,
-                            slippage, deadline_minutes, best_fee if not is_multi_hop else None
-                        )
-                        if result.success:
-                            return result
-                        else:
-                            logger.warning(f"V3 swap failed: {result.error}, trying V2...")
-                    else:
-                        logger.info(f"V2 has better price (V2: {v2_quote} vs V3: {v3_quote})")
-                else:
-                    logger.info("No V3 liquidity found, falling back to V2")
-
-            # Приоритет 3: V2 Swap
-            return self._swap_v2(
+            # Приоритет 2: V2 Swap
+            logger.info("Trying V2 swap...")
+            v2_result = self._swap_v2(
                 from_token, to_token, amount_in,
                 wallet_address, private_key,
                 slippage, deadline_minutes, use_fee_on_transfer
             )
+            if v2_result.success:
+                return v2_result
+            logger.warning(f"V2 swap failed: {v2_result.error}, trying V3...")
+
+            # Приоритет 3: V3 (последний вариант)
+            if self.v3_available:
+                logger.info("Trying V3 swap as last resort...")
+                v3_result = self.swap_v3(
+                    from_token, to_token, amount_in,
+                    wallet_address, private_key,
+                    slippage, deadline_minutes
+                )
+                if v3_result.success:
+                    return v3_result
+                logger.warning(f"V3 swap also failed: {v3_result.error}")
+
+            # Все методы не сработали — возвращаем ошибку V2 (наиболее релевантную)
+            return v2_result
 
         except Exception as e:
             logger.error(f"Swap failed: {e}")
