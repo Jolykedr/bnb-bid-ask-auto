@@ -621,13 +621,36 @@ except:
 - [ ] okx_dex.py coverage 0% — **НЕ ТЕСТИРОВАНО**
 
 ### Известные нефиксированные баги
+
+**CRITICAL:**
+- [ ] **C1: PCS V4 PoolKey format** — `v4/abis.py` PANCAKE_V4_POSITION_MANAGER_ABI определяет initializePool/positions с Uniswap-style PoolKey (c0,c1,fee,tickSpacing,hooks). PCS V4 ожидает (c0,c1,hooks,poolManager,fee,parameters). Неверный function selector → revert. Также encode_mint_position кодирует PoolKey в Uniswap-формате для PCS V4 actions. Создание пулов PCS V4, минт позиций, чтение позиций — всё сломано.
+
+**HIGH:**
 - [ ] **H1: PCS V3 swap ABI mismatch** — `dex_swap.py` использует Uniswap ABI (7-field struct + multicall с deadline), PCS SmartRouter ожидает 8-field struct + multicall без deadline. V3 свапы на BSC ревертятся. Замаскировано auto-режимом (V3 = последний fallback). Исправлено в web версии (v22 #4), НЕ портировано в десктоп.
+- [ ] **H2: V3 close_positions теряет fees при liquidity=0** — `liquidity_provider.py:978` пропускает позиции с liquidity==0, но у них могут быть uncollected fees (tokensOwed0/tokensOwed1 > 0).
+
+**MEDIUM:**
+- [ ] **M1: V4 close_position не burn-ит NFT** — `build_close_position_payload(burn=False)` по умолчанию. Orphan NFT + dust lock.
+- [ ] **M2: Batcher EIP-1559 maxFeePerGas** — `batcher.py:530` использует `gas_price*2` вместо `baseFee*2+priorityFee`. Сейчас не триггерится.
+- [ ] **M3: advanced_tab deleteLater на running worker** — result signal handler вызывает deleteLater() до завершения run() → потенциальный segfault.
+- [x] **M4: BaseException handlers** — 8 workers без BaseException handler → UI freeze. **ИСПРАВЛЕНО 2026-02-28.**
+- [ ] **M5: _pending_private_key не зерится** — manage_tab.py: приватный ключ остаётся в памяти после swap.
+- [ ] **M6: SwapPreviewDialog QThread segfault** — deleteLater + ref drop при timeout QuoteWorker.wait().
 - [ ] **M8: _secure_zero на immutable bytes** — `crypto.py` вызывает ctypes.memset на `bytes` (CPython хак, может сломаться в 3.12+)
+- [ ] **M9: V3 in-range filter tick=0** — liquidity_provider.py:660 читает slot0 из неинициализированного пула → tick=0 → фильтрует все позиции.
 - [ ] **M10: GraphQL injection** — `subgraph.py` интерполирует pool_id в запрос без валидации
+- [ ] **M11: decrypt_key str не зерируется** — crypto.py:238 возвращает immutable str с приватным ключом.
+
+**LOW:**
 - [ ] **L1: calculate_liquidity returns None** — `liquidity0 or liquidity1` = None когда liquidity0=0
 - [ ] **L2: negative tick_spacing OverflowError** — `to_pancake_tuple()` использует `1<<256` вместо `1<<24`
+- [ ] **L3: sell_tokens_after_close session leak** — dex_swap.py: swapper.close() не вызовется при exception (нет try/finally)
+- [ ] **L4: OKX session never closed** — okx_dex.py sell_tokens_after_close не вызывает swapper.close()
 - [ ] **L5: OKX sell_tokens без NonceManager** — nonce collision при multi-token sell
 - [ ] **L6: KyberSwap slippage floor 3%** — десктоп 3%, веб 0.5%
+- [ ] **L7: V3 pool init по upper bound** — config.current_price = верхняя граница, не реальная цена
+- [ ] **L8: Missing chainId** — transaction params без chainId (defense-in-depth)
+- [ ] **L9: create_tab lambda late binding** — _load_pool_worker.finished lambda захватывает stale reference
 
 ---
 

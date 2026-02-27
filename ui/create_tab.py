@@ -114,6 +114,9 @@ class LoadPoolWorker(QThread):
             import traceback
             self.progress.emit(f"Failed to load pool: {e}")
             self.error.emit(str(e))
+        except BaseException as e:
+            logger.critical(f"BaseException in LoadPoolWorker: {e}", exc_info=True)
+            self.error.emit(f"Fatal: {e}")
 
     def _load_v3(self, w3, result):
         """Load V3 pool data (runs in worker thread)."""
@@ -387,6 +390,9 @@ class BalanceWorker(QThread):
             self.result.emit(" | ".join(balances))
         except Exception as e:
             self.error.emit(str(e))
+        except BaseException as e:
+            logger.critical(f"BaseException in BalanceWorker: {e}", exc_info=True)
+            self.error.emit(f"Fatal: {e}")
 
 
 class CreatePoolOnlyWorker(QThread):
@@ -526,6 +532,12 @@ class CreateLadderWorkerV4(QThread):
 
         except Exception as e:
             self.create_result.emit(False, str(e), {})
+        except BaseException as e:
+            logger.critical(f"BaseException in CreateLadderWorkerV4: {e}", exc_info=True)
+            try:
+                self.create_result.emit(False, f"Fatal: {e}", {})
+            except Exception:
+                pass
         finally:
             # Zero private key from memory
             self.private_key = None
@@ -901,6 +913,12 @@ class CreateLadderWorker(QThread):
 
         except Exception as e:
             self.create_result.emit(False, str(e), {})
+        except BaseException as e:
+            logger.critical(f"BaseException in CreateLadderWorker: {e}", exc_info=True)
+            try:
+                self.create_result.emit(False, f"Fatal: {e}", {})
+            except Exception:
+                pass
         finally:
             # Cleanup temporary resources (PoolFactory etc.)
             pool_factory = None

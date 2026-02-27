@@ -38,6 +38,9 @@ class LoadTokenWorker(QThread):
             self.load_result.emit(True, "Success", info)
         except Exception as e:
             self.load_result.emit(False, str(e), None)
+        except BaseException as e:
+            logger.critical(f"BaseException in LoadTokenWorker: {e}", exc_info=True)
+            self.load_result.emit(False, f"Fatal: {e}", None)
 
 
 class CreatePoolWorker(QThread):
@@ -80,6 +83,12 @@ class CreatePoolWorker(QThread):
                 })
         except Exception as e:
             self.create_result.emit(False, str(e), {})
+        except BaseException as e:
+            logger.critical(f"BaseException in CreatePoolWorker: {e}", exc_info=True)
+            try:
+                self.create_result.emit(False, f"Fatal: {e}", {})
+            except Exception:
+                pass
 
 
 class CreateV4PoolWorker(QThread):
@@ -137,8 +146,14 @@ class CreateV4PoolWorker(QThread):
                 })
 
         except Exception as e:
-            logger.exception(f"Error in LoadPoolWorker: {e}")
+            logger.exception(f"Error in CreateV4PoolWorker: {e}")
             self.create_result.emit(False, str(e), {})
+        except BaseException as e:
+            logger.critical(f"BaseException in CreateV4PoolWorker: {e}", exc_info=True)
+            try:
+                self.create_result.emit(False, f"Fatal: {e}", {})
+            except Exception:
+                pass
 
 
 class AdvancedTab(QWidget):

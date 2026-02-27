@@ -76,6 +76,12 @@ class QuoteWorker(QThread):
         except Exception as e:
             logger.error(f"QuoteWorker error: {e}", exc_info=True)
             self.all_done.emit(0.0)
+        except BaseException as e:
+            logger.critical(f"BaseException in QuoteWorker: {e}", exc_info=True)
+            try:
+                self.all_done.emit(0.0)
+            except Exception:
+                pass
 
     def _get_best_quote(self, swapper: DexSwap, token_address: str, amount: int) -> Optional[dict]:
         """Получить лучшую котировку в зависимости от swap_mode."""
