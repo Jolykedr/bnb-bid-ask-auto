@@ -314,17 +314,23 @@ STABLE_TOKENS: Dict[str, str] = {
     "0x55d398326f99059ff775485246999027b3197955": "USDT",  # BSC USDT
     "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": "USDC",  # BSC USDC
     "0xe9e7cea3dedca5984780bafc599bd69add087d56": "BUSD",  # BUSD
+    "0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3": "DAI",   # BSC DAI
+    "0xc5f0f7b66764f6ec8c8dff7ba683102295e16409": "FDUSD", # BSC FDUSD
+    "0x8d0d000ee44948fc98c9b98a4fa4921476f08b0d": "USD1",  # USD1 (BSC)
     "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c": "WBNB",  # Wrapped BNB
     "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee": "BNB",   # Native BNB
-    "0x8d0d000ee44948fc98c9b98a4fa4921476f08b0d": "USD1",  # USD1 (BSC)
 
     # Ethereum (1)
     "0xdac17f958d2ee523a2206206994597c13d831ec7": "USDT",  # ETH USDT
     "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": "USDC",  # ETH USDC
+    "0x6b175474e89094c44da98b954eedeac495271d0f": "DAI",   # ETH DAI
     "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": "WETH",  # WETH
 
     # Base (8453)
     "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": "USDC",  # Base USDC
+    "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca": "USDbC", # Base USDbC bridged
+    "0x50c5725949a6f0c72e6c4a641f24049a917db0cb": "DAI",   # Base DAI
+    "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2": "USDT",  # Base USDT
     "0x4200000000000000000000000000000000000006": "WETH",  # Base WETH
 }
 

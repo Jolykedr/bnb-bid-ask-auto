@@ -37,6 +37,27 @@ class PoolKey:
             Web3.to_checksum_address(self.hooks)
         )
 
+    def to_pancake_tuple(self, pool_manager_address: str) -> tuple:
+        """Convert to PancakeSwap V4 PoolKey tuple.
+
+        PancakeSwap V4 PoolKey: (currency0, currency1, hooks, poolManager, fee, parameters)
+        where parameters = bytes32(tickSpacing << 16)
+        """
+        ts = self.tick_spacing
+        if ts >= 0:
+            params_int = ts << 16
+        else:
+            params_int = ((1 << 256) + ts) << 16
+        parameters = params_int.to_bytes(32, 'big')
+        return (
+            Web3.to_checksum_address(self.currency0),
+            Web3.to_checksum_address(self.currency1),
+            Web3.to_checksum_address(self.hooks),
+            Web3.to_checksum_address(pool_manager_address),
+            self.fee,
+            parameters
+        )
+
     def get_pool_id(self) -> bytes:
         """Calculate pool ID for Uniswap V4 (keccak256 of encoded pool key).
         NOTE: For PancakeSwap V4, use V4PoolManager._compute_pool_id() instead —
@@ -142,15 +163,17 @@ class V4PoolManager:
 
         Uniswap V4 PoolKey:     (currency0, currency1, fee, tickSpacing, hooks)
         PancakeSwap V4 PoolKey:  (currency0, currency1, hooks, poolManager, fee, parameters)
-            where parameters = bytes32(uint256(int256(tickSpacing)))
+            where parameters = bytes32(uint256(int256(tickSpacing)) << 16)
         """
         if self.protocol == V4Protocol.PANCAKESWAP:
             # PancakeSwap V4: PoolKey has different field order and includes poolManager + parameters
+            # IMPORTANT: parameters = bytes32(tickSpacing << 16), NOT just tickSpacing!
+            # Must match to_pancake_tuple() encoding for consistent pool ID computation.
             tick_spacing = pool_key.tick_spacing
             if tick_spacing >= 0:
-                params_int = tick_spacing
+                params_int = tick_spacing << 16
             else:
-                params_int = (1 << 256) + tick_spacing
+                params_int = ((1 << 256) + tick_spacing) << 16
             parameters = params_int.to_bytes(32, 'big')
 
             encoded = encode(
