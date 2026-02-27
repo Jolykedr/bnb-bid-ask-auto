@@ -226,6 +226,26 @@ class MainWindow(QMainWindow):
                 self.manage_tab.scan_worker.deleteLater()
                 self.manage_tab.scan_worker = None
 
+        # Manage tab swap worker
+        if hasattr(self, 'manage_tab'):
+            if hasattr(self.manage_tab, '_swap_worker') and self.manage_tab._swap_worker is not None:
+                if self.manage_tab._swap_worker.isRunning():
+                    self.manage_tab._swap_worker.quit()
+                    self.manage_tab._swap_worker.wait(3000)
+                self.manage_tab._swap_worker.deleteLater()
+                self.manage_tab._swap_worker = None
+
+        # Create tab extra workers
+        if hasattr(self, 'create_tab'):
+            for attr in ('_load_pool_worker', '_balance_worker', '_pool_create_worker'):
+                w = getattr(self.create_tab, attr, None)
+                if w is not None:
+                    if w.isRunning():
+                        w.quit()
+                        w.wait(3000)
+                    w.deleteLater()
+                    setattr(self.create_tab, attr, None)
+
         # Advanced tab worker
         if hasattr(self, 'advanced_tab') and hasattr(self.advanced_tab, 'worker'):
             if self.advanced_tab.worker is not None:

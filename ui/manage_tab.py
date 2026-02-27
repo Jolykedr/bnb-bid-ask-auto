@@ -437,6 +437,7 @@ class LoadPositionWorker(QThread):
             self.error.emit(self.token_id, str(e))
         except BaseException as e:
             logger.critical(f"BaseException in LoadPositionWorker: {e}", exc_info=True)
+            self.error.emit(self.token_id, f"BaseException: {e}")
 
     def _load_v4_position(self):
         """Load a V4 position using shared helper."""
@@ -615,6 +616,7 @@ class ScanWalletWorker(QThread):
             self.scan_result.emit(0, [], self.protocol)
         except BaseException as e:
             logger.critical(f"BaseException in ScanWalletWorker: {e}", exc_info=True)
+            self.scan_result.emit(0, [], self.protocol)
 
 
 class ClosePositionsWorker(QThread):
@@ -2336,6 +2338,7 @@ class ManageTab(QWidget):
 
         # Rebuild table
         self.positions_table.setRowCount(0)
+        self._row_index.clear()
         for token_id, position in self.positions_data.items():
             if position:
                 self._update_table_row(token_id, position)
@@ -2862,6 +2865,7 @@ class ManageTab(QWidget):
 
         self.positions_table.setRowCount(0)
         self.positions_data = {}
+        self._row_index.clear()
         self.token_ids_input.clear()
         self.close_selected_btn.setEnabled(False)
         self.close_all_btn.setEnabled(False)

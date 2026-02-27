@@ -1927,7 +1927,7 @@ class V4LiquidityProvider:
             # Execute: if pool needs creation, batch initializePool + modifyLiquidities
             if pool_init_sqrt_price is not None:
                 logger.info("Executing batched initializePool + modifyLiquidities...")
-                tx_hash, results = self.position_manager.execute_init_and_modify(
+                tx_hash, results, receipt = self.position_manager.execute_init_and_modify(
                     pool_key_tuple=pool_key.to_tuple(),
                     sqrt_price_x96=pool_init_sqrt_price,
                     unlock_data=unlock_data,
@@ -1936,30 +1936,15 @@ class V4LiquidityProvider:
                     timeout=timeout
                 )
             else:
-                tx_hash, results = self.position_manager.execute_modify_liquidities(
+                tx_hash, results, receipt = self.position_manager.execute_modify_liquidities(
                     unlock_data=unlock_data,
                     deadline=deadline,
                     gas_limit=gas_limit,
                     timeout=timeout
                 )
 
-            # Parse token IDs from receipt
-            receipt = self.w3.eth.get_transaction_receipt(tx_hash)
+            # Receipt already verified by execute_modify_liquidities (raises on revert)
             gas_used = receipt.get('gasUsed', 0)
-
-            # ВАЖНО: Проверяем статус транзакции
-            if receipt['status'] != 1:
-                logger.error(f"Transaction REVERTED! TX: {tx_hash}")
-                logger.error(f"Check: https://bscscan.com/tx/{tx_hash}")
-                return V4LadderResult(
-                    positions=positions,
-                    tx_hash=tx_hash,
-                    gas_used=gas_used,
-                    token_ids=[],
-                    pool_created=pool_created,
-                    success=False,
-                    error=f"Transaction reverted. Check https://bscscan.com/tx/{tx_hash}"
-                )
 
             # Parse Transfer events for token IDs
             token_ids = []
@@ -2075,22 +2060,17 @@ class V4LiquidityProvider:
         )
 
         try:
-            tx_hash, _ = self.position_manager.execute_modify_liquidities(
+            tx_hash, _, receipt = self.position_manager.execute_modify_liquidities(
                 unlock_data=unlock_data,
                 deadline=deadline,
                 timeout=timeout
             )
 
-            receipt = self.w3.eth.get_transaction_receipt(tx_hash)
+            # Receipt already verified (execute_modify_liquidities raises on revert)
             gas_used = receipt.get('gasUsed', 0)
+            logger.info(f"Positions closed successfully! TX: {tx_hash}")
 
-            success = receipt['status'] == 1
-            if success:
-                logger.info(f"Positions closed successfully! TX: {tx_hash}")
-            else:
-                logger.error(f"Transaction failed (reverted)! TX: {tx_hash}")
-
-            return tx_hash, success, gas_used
+            return tx_hash, True, gas_used
         except Exception as e:
             logger.error(f"close_positions failed: {e}")
             return None, False, None

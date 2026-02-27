@@ -1078,7 +1078,7 @@ class TestV4PositionManager:
                 build_transaction=MagicMock(return_value={}),
             )
         )
-        tx_hash, results = pm.execute_modify_liquidities(unlock_data=b'\xaa' * 64)
+        tx_hash, results, _receipt = pm.execute_modify_liquidities(unlock_data=b'\xaa' * 64)
         assert isinstance(tx_hash, str)
         pm.w3.eth.send_raw_transaction.assert_called_once()
 

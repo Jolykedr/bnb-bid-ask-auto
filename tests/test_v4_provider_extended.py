@@ -143,7 +143,7 @@ def _build_provider():
         p.position_manager.encode_settle_pair = Mock(return_value=b'\x01' * 32)
         p.position_manager._encode_actions = Mock(return_value=b'\x02' * 128)
         p.position_manager.execute_modify_liquidities = Mock(
-            return_value=(FAKE_TX_HASH.hex(), [])
+            return_value=(FAKE_TX_HASH.hex(), [], {'status': 1, 'gasUsed': 200_000})
         )
 
         p.decimals_cache = Mock()
@@ -1223,7 +1223,7 @@ class TestCreateLadderExtended:
         provider._compute_sqrt_price_x96 = Mock(return_value=79228162514264337593543950336)
 
         provider.position_manager.execute_init_and_modify = Mock(
-            return_value=("0xbatched_tx_hash", [])
+            return_value=("0xbatched_tx_hash", [], {'status': 1, 'gasUsed': 300_000})
         )
         mock_receipt = {
             'status': 1,
@@ -1370,12 +1370,15 @@ class TestCreateLadderExtended:
         positions, mock_pool_key, mock_batch = self._setup_create_ladder(provider, config)
         config.pool_id = None
 
-        # Mock receipt with Transfer events
-        provider.w3.eth.get_transaction_receipt = Mock(return_value={
+        # Receipt is now returned by execute_modify_liquidities (3rd element)
+        mock_receipt = {
             'status': 1,
             'gasUsed': 500_000,
             'logs': [],
-        })
+        }
+        provider.position_manager.execute_modify_liquidities = Mock(
+            return_value=(FAKE_TX_HASH.hex(), [], mock_receipt)
+        )
 
         provider.position_manager.contract.events.Transfer = Mock(
             return_value=Mock(
@@ -1401,11 +1404,10 @@ class TestCreateLadderExtended:
         positions, mock_pool_key, mock_batch = self._setup_create_ladder(provider, config)
         config.pool_id = None
 
-        provider.w3.eth.get_transaction_receipt = Mock(return_value={
-            'status': 0,
-            'gasUsed': 500_000,
-            'logs': [],
-        })
+        # execute_modify_liquidities raises on revert (receipt check is inside)
+        provider.position_manager.execute_modify_liquidities = Mock(
+            side_effect=Exception("Transaction reverted! TX: 0xabc")
+        )
 
         with patch('src.v4_liquidity_provider.BatchRPC', return_value=mock_batch), \
              patch('src.v4_liquidity_provider.compute_decimal_tick_offset', return_value=0), \
@@ -1721,7 +1723,7 @@ class TestClosePositions:
 
         provider.position_manager.build_batch_close_payload = Mock(return_value=b'\x00' * 64)
         provider.position_manager.execute_modify_liquidities = Mock(
-            return_value=(FAKE_TX_HASH.hex(), [])
+            return_value=(FAKE_TX_HASH.hex(), [], {'status': 1, 'gasUsed': 200_000})
         )
 
         provider.w3.eth.get_transaction_receipt = Mock(return_value={
@@ -1740,7 +1742,7 @@ class TestClosePositions:
         assert tx_hash is not None
 
     def test_close_positions_reverted(self, provider):
-        """Reverted TX returns (hash, False, gas_used)."""
+        """Reverted TX returns (None, False, None) via exception."""
         mock_position = Mock()
         mock_position.liquidity = 1000000
         mock_position.tick_lower = -100
@@ -1748,14 +1750,10 @@ class TestClosePositions:
         provider.position_manager.get_position = Mock(return_value=mock_position)
 
         provider.position_manager.build_batch_close_payload = Mock(return_value=b'\x00' * 64)
+        # execute_modify_liquidities raises on revert
         provider.position_manager.execute_modify_liquidities = Mock(
-            return_value=(FAKE_TX_HASH.hex(), [])
+            side_effect=Exception("Transaction reverted! TX: 0xabc")
         )
-
-        provider.w3.eth.get_transaction_receipt = Mock(return_value={
-            'status': 0,
-            'gasUsed': 21_000,
-        })
 
         tx_hash, success, gas_used = provider.close_positions(
             token_ids=[101],
@@ -1764,7 +1762,7 @@ class TestClosePositions:
         )
 
         assert success is False
-        assert gas_used == 21_000
+        assert tx_hash is None
 
     def test_close_positions_zero_liquidity_skipped(self, provider):
         """Positions with zero liquidity are skipped."""
@@ -1810,7 +1808,7 @@ class TestClosePositions:
 
         provider.position_manager.build_batch_close_payload = Mock(return_value=b'\x00' * 64)
         provider.position_manager.execute_modify_liquidities = Mock(
-            return_value=(FAKE_TX_HASH.hex(), [])
+            return_value=(FAKE_TX_HASH.hex(), [], {'status': 1, 'gasUsed': 200_000})
         )
 
         provider.w3.eth.get_transaction_receipt = Mock(return_value={
@@ -1844,7 +1842,7 @@ class TestClosePositions:
 
         provider.position_manager.build_batch_close_payload = Mock(return_value=b'\x00' * 64)
         provider.position_manager.execute_modify_liquidities = Mock(
-            return_value=(FAKE_TX_HASH.hex(), [])
+            return_value=(FAKE_TX_HASH.hex(), [], {'status': 1, 'gasUsed': 200_000})
         )
         provider.w3.eth.get_transaction_receipt = Mock(return_value={
             'status': 1, 'gasUsed': 200_000
@@ -1872,7 +1870,7 @@ class TestClosePositions:
 
         provider.position_manager.build_batch_close_payload = Mock(return_value=b'\x00' * 64)
         provider.position_manager.execute_modify_liquidities = Mock(
-            return_value=(FAKE_TX_HASH.hex(), [])
+            return_value=(FAKE_TX_HASH.hex(), [], {'status': 1, 'gasUsed': 200_000})
         )
         provider.w3.eth.get_transaction_receipt = Mock(return_value={
             'status': 1, 'gasUsed': 200_000
@@ -1907,7 +1905,7 @@ class TestClosePositions:
 
         provider.position_manager.build_batch_close_payload = Mock(return_value=b'\x00' * 64)
         provider.position_manager.execute_modify_liquidities = Mock(
-            return_value=(FAKE_TX_HASH.hex(), [])
+            return_value=(FAKE_TX_HASH.hex(), [], {'status': 1, 'gasUsed': 200_000})
         )
         provider.w3.eth.get_transaction_receipt = Mock(return_value={
             'status': 1, 'gasUsed': 200_000
@@ -1935,7 +1933,7 @@ class TestClosePositions:
 
         provider.position_manager.build_batch_close_payload = Mock(return_value=b'\x00' * 64)
         provider.position_manager.execute_modify_liquidities = Mock(
-            return_value=(FAKE_TX_HASH.hex(), [])
+            return_value=(FAKE_TX_HASH.hex(), [], {'status': 1, 'gasUsed': 200_000})
         )
         provider.w3.eth.get_transaction_receipt = Mock(return_value={
             'status': 1, 'gasUsed': 200_000

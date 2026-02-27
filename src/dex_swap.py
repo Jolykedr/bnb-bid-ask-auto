@@ -340,6 +340,11 @@ class DexSwap:
             except Exception as e:
                 logger.warning(f"KyberSwap unavailable: {e}")
 
+    def close(self):
+        """Close all HTTP sessions to release resources."""
+        if self.kyber_client:
+            self.kyber_client.close()
+
     def _resolve_account(self, private_key: str = None):
         """Resolve account from private_key arg or stored self.account."""
         if private_key:
@@ -614,9 +619,12 @@ class DexSwap:
             logger.debug(f"Failed to calc sqrtPriceLimitX96: {e}")
             return 0
 
-    def get_quote(self, from_token: str, to_token: str, amount_in: int) -> int:
+    def get_quote(self, from_token: str, to_token: str, amount_in: int, path: list = None) -> int:
         """
         Получить котировку для свопа.
+
+        Args:
+            path: Pre-computed swap path (optional, avoids redundant RPC calls)
 
         Returns:
             Количество токенов на выходе (0 если путь не найден)
@@ -625,8 +633,9 @@ class DexSwap:
             from_token = Web3.to_checksum_address(from_token)
             to_token = Web3.to_checksum_address(to_token)
 
-            # Построить путь
-            path = self._build_path(from_token, to_token)
+            # Построить путь (use pre-computed if available)
+            if path is None:
+                path = self._build_path(from_token, to_token)
             if not path:
                 return 0
 
@@ -1523,8 +1532,8 @@ class DexSwap:
                     error="No V2 swap path found"
                 )
 
-            # Получить ожидаемое количество
-            expected_out = self.get_quote(from_token, to_token, amount_in)
+            # Получить ожидаемое количество (reuse pre-computed path)
+            expected_out = self.get_quote(from_token, to_token, amount_in, path=path)
             if expected_out == 0:
                 return SwapResult(
                     success=False,
@@ -1750,4 +1759,5 @@ def sell_tokens_after_close(
         else:
             logger.error(f"Failed to sell {token.get('symbol', '')}: {result.error}")
 
+    swapper.close()
     return results

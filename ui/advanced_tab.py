@@ -807,6 +807,9 @@ class AdvancedTab(QWidget):
         self.v4_create_pool_btn.setEnabled(False)
 
         if self.worker is not None:
+            if self.worker.isRunning():
+                self.worker.quit()
+                self.worker.wait(3000)
             self.worker.deleteLater()
             self.worker = None
 
@@ -923,6 +926,9 @@ class AdvancedTab(QWidget):
 
         self.load_token_btn.setEnabled(False)
         if self.worker is not None:
+            if self.worker.isRunning():
+                self.worker.quit()
+                self.worker.wait(3000)
             self.worker.deleteLater()
             self.worker = None
         self.worker = LoadTokenWorker(self.factory, address)
@@ -1222,6 +1228,9 @@ class AdvancedTab(QWidget):
         self.create_pool_btn.setEnabled(False)
 
         if self.worker is not None:
+            if self.worker.isRunning():
+                self.worker.quit()
+                self.worker.wait(3000)
             self.worker.deleteLater()
             self.worker = None
 

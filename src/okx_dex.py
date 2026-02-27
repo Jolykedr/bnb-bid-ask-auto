@@ -120,6 +120,11 @@ class OKXDexSwap:
                 self.session.mount('http://', adapter)
                 self.session.mount('https://', adapter)
 
+    def close(self):
+        """Close the HTTP session to release resources."""
+        if self.session:
+            self.session.close()
+
     @staticmethod
     def _extract_proxy_auth(proxy: dict):
         """Извлечь Proxy-Authorization из proxy URL."""

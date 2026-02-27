@@ -984,19 +984,23 @@ class LiquidityProvider:
                 )
 
         logger.info(f"Closing {len(token_ids)} positions...")
-        tx_hash, _, receipt, _ = self.batcher.execute(
-            timeout=timeout,
-            position_manager_address=self.position_manager_address
-        )
-        gas_used = receipt.get('gasUsed', None)
-        success = receipt.get('status', 0) == 1
+        try:
+            tx_hash, _, receipt, _ = self.batcher.execute(
+                timeout=timeout,
+                position_manager_address=self.position_manager_address
+            )
+            gas_used = receipt.get('gasUsed', None)
+            success = receipt.get('status', 0) == 1
 
-        if success:
-            logger.info(f"Positions closed successfully! TX: {tx_hash}")
-        else:
-            logger.error(f"Close positions TX reverted! TX: {tx_hash}")
+            if success:
+                logger.info(f"Positions closed successfully! TX: {tx_hash}")
+            else:
+                logger.error(f"Close positions TX reverted! TX: {tx_hash}")
 
-        return tx_hash, success, gas_used
+            return tx_hash, success, gas_used
+        except Exception as e:
+            logger.error(f"close_positions failed: {e}", exc_info=True)
+            return None, False, None
 
     def get_token_balance(self, token_address: str, address: str = None) -> int:
         """Получение баланса токена."""

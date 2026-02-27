@@ -205,7 +205,7 @@ class TestNonceOnRevertedTx:
             'status': 1, 'gasUsed': 200_000, 'logs': [],
         })
 
-        tx_hash, _ = pm.execute_modify_liquidities(unlock_data=b'\x00' * 64)
+        tx_hash, _, _receipt = pm.execute_modify_liquidities(unlock_data=b'\x00' * 64)
         pm.nonce_manager.confirm_transaction.assert_called_once_with(1)
         pm.nonce_manager.release_nonce.assert_not_called()
 

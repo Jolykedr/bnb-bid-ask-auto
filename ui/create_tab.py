@@ -2171,10 +2171,11 @@ class CreateTab(QWidget):
         self.create_btn.setEnabled(True)
         self.preview_btn.setEnabled(True)
 
-        # Cleanup worker thread to prevent memory leak
+        # Defer cleanup to finished signal (thread may still be running when create_result emits)
         if self.worker is not None:
-            self.worker.deleteLater()
+            w = self.worker
             self.worker = None
+            w.finished.connect(w.deleteLater)
 
         if success:
             self._log(f"SUCCESS: {message}")
@@ -2617,6 +2618,15 @@ class CreateTab(QWidget):
         existing_t0 = self.token0_input.text().strip()
         existing_t1 = self.token1_input.text().strip()
 
+        # Cleanup previous worker to prevent GC segfault on running QThread
+        if hasattr(self, '_load_pool_worker') and self._load_pool_worker is not None:
+            old = self._load_pool_worker
+            self._load_pool_worker = None
+            if old.isRunning():
+                old.quit()
+                old.wait(3000)
+            old.deleteLater()
+
         self._load_pool_worker = LoadPoolWorker(
             rpc_url, pool_input, network.chain_id, proxy,
             existing_token0=existing_t0, existing_token1=existing_t1
@@ -2625,6 +2635,7 @@ class CreateTab(QWidget):
         self._load_pool_worker.progress.connect(self._log)
         self._load_pool_worker.error.connect(self._on_pool_load_error)
         self._load_pool_worker.finished.connect(lambda: self.load_pool_btn.setEnabled(True))
+        self._load_pool_worker.finished.connect(lambda: self._load_pool_worker.deleteLater() if self._load_pool_worker else None)
         self._load_pool_worker.start()
 
     def _on_pool_load_error(self, error_msg):

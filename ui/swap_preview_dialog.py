@@ -257,7 +257,7 @@ class SwapPreviewDialog(QDialog):
         btn_layout.addStretch()
 
         self.cancel_btn = QPushButton("Отмена")
-        self.cancel_btn.clicked.connect(self.reject)
+        self.cancel_btn.clicked.connect(self._on_cancel)
         btn_layout.addWidget(self.cancel_btn)
 
         self.confirm_btn = QPushButton("Подтвердить свап")
@@ -342,11 +342,21 @@ class SwapPreviewDialog(QDialog):
         self.confirmed.emit(confirmed_tokens)
         self.accept()
 
-    def closeEvent(self, event):
-        """Очистка при закрытии."""
+    def _on_cancel(self):
+        """Handle cancel button — stop worker and reject dialog."""
+        self._cleanup_quote_worker()
+        self.reject()
+
+    def _cleanup_quote_worker(self):
+        """Stop and clean up the quote worker if running."""
         if self.quote_worker and self.quote_worker.isRunning():
+            self.quote_worker.quit()
             self.quote_worker.wait(5000)
         if self.quote_worker:
             self.quote_worker.deleteLater()
             self.quote_worker = None
+
+    def closeEvent(self, event):
+        """Очистка при закрытии."""
+        self._cleanup_quote_worker()
         super().closeEvent(event)
