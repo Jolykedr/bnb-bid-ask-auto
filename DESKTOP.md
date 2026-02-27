@@ -620,6 +620,12 @@ except:
 - [ ] UI layer coverage 4-16% — **НИЗКОЕ**
 - [ ] okx_dex.py coverage 0% — **НЕ ТЕСТИРОВАНО**
 
+### Исправлено в Audit v3 (2026-02-28)
+- [x] **V4 liquidity invert_price** — `distribution.py` использовал human prices (invert=True) для `calculate_liquidity_from_usd` → неправильное определение направления позиции → недофинансированные V4 позиции на BNB (invert_price=True). Fix: всегда raw prices (invert=False) для liquidity calc.
+- [x] **H1: V4 pool state query до создания** — `v4_liquidity_provider.py` запрашивал pool state даже при auto_create_pool=True (пул ещё не существует). Fix: `if not pool_created:`.
+- [x] **H2: pool_factory decimal swap** — `pool_factory.py` `create_and_initialize_pool()` не менял decimals/price при реордеринге токенов в `create_pool()`. Fix: сравнение адресов, swap при необходимости.
+- [x] **L9+Worker reload** — Lambda late-binding fix вызывал `deleteLater` → C++ объект удалён, Python ref остаётся. Второй load pool → RuntimeError. Fix: `_on_load_pool_worker_done()` + try/except RuntimeError.
+
 ### Известные нефиксированные баги
 
 **CRITICAL:**
@@ -650,7 +656,7 @@ except:
 - [ ] **L6: KyberSwap slippage floor 3%** — десктоп 3%, веб 0.5%
 - [ ] **L7: V3 pool init по upper bound** — config.current_price = верхняя граница, не реальная цена
 - [ ] **L8: Missing chainId** — transaction params без chainId (defense-in-depth)
-- [ ] **L9: create_tab lambda late binding** — _load_pool_worker.finished lambda захватывает stale reference
+- [x] **L9: create_tab lambda late binding** — _load_pool_worker.finished lambda → worker reload crash. **ИСПРАВЛЕНО 2026-02-28 (audit v3).**
 
 ---
 

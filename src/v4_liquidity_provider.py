@@ -1552,11 +1552,6 @@ class V4LiquidityProvider:
         logger.info(f"Pool currency1: {pool_key.currency1}")
         logger.info(f"Quote is token0: {quote_is_token0}")
 
-        # Get current tick from pool state (for reference/logging only)
-        pool_state = self.pool_manager.get_pool_state_by_id(computed_pool_id)
-        pool_current_tick = pool_state.tick
-        logger.info(f"Pool's current tick: {pool_current_tick}")
-
         # Calculate expected current tick from user's ACTUAL input price
 
         # Use actual_current_price if provided, otherwise fall back to current_price
@@ -1583,25 +1578,33 @@ class V4LiquidityProvider:
 
         logger.info(f"Expected tick from user's price: {expected_current_tick} (includes dec_offset={dec_offset})")
 
-        # Calculate pool's price from tick for comparison
-        pool_price_from_tick = tick_to_price(pool_current_tick, invert=config.invert_price)
-        logger.info(f"Pool's price from tick: {pool_price_from_tick:.8f}")
+        # Compare with on-chain pool tick (only if pool already exists)
+        if not pool_created:
+            pool_state = self.pool_manager.get_pool_state_by_id(computed_pool_id)
+            pool_current_tick = pool_state.tick
+            logger.info(f"Pool's current tick: {pool_current_tick}")
 
-        # Compare pool tick vs expected tick
-        tick_difference = abs(pool_current_tick - expected_current_tick)
+            # Calculate pool's price from tick for comparison
+            pool_price_from_tick = tick_to_price(pool_current_tick, invert=config.invert_price)
+            logger.info(f"Pool's price from tick: {pool_price_from_tick:.8f}")
 
-        if tick_difference > 1000:  # Significant difference (roughly 10% price difference)
-            logger.warning("=" * 50)
-            logger.warning("PRICE MISMATCH DETECTED!")
-            logger.warning(f"  Your input price: {user_price}")
-            logger.warning(f"  Pool's actual price: {pool_price_from_tick:.8f}")
-            logger.warning(f"  Expected tick: {expected_current_tick}")
-            logger.warning(f"  Pool's tick: {pool_current_tick}")
-            logger.warning(f"  Difference: {tick_difference} ticks")
-            logger.warning("=" * 50)
-            logger.warning("Using YOUR INPUT PRICE for position calculations.")
-            logger.warning("Pool might have low liquidity or stale price.")
-            logger.warning("=" * 50)
+            # Compare pool tick vs expected tick
+            tick_difference = abs(pool_current_tick - expected_current_tick)
+
+            if tick_difference > 1000:  # Significant difference (roughly 10% price difference)
+                logger.warning("=" * 50)
+                logger.warning("PRICE MISMATCH DETECTED!")
+                logger.warning(f"  Your input price: {user_price}")
+                logger.warning(f"  Pool's actual price: {pool_price_from_tick:.8f}")
+                logger.warning(f"  Expected tick: {expected_current_tick}")
+                logger.warning(f"  Pool's tick: {pool_current_tick}")
+                logger.warning(f"  Difference: {tick_difference} ticks")
+                logger.warning("=" * 50)
+                logger.warning("Using YOUR INPUT PRICE for position calculations.")
+                logger.warning("Pool might have low liquidity or stale price.")
+                logger.warning("=" * 50)
+        else:
+            logger.info("Pool will be created in batched TX — skipping on-chain state query")
 
         # IMPORTANT: Use expected tick from user's price, NOT pool's tick
         # This ensures positions are created where the user intends them to be

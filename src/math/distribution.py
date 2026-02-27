@@ -275,17 +275,18 @@ def calculate_bid_ask_distribution(
         pool_tick_lower = pos_tick_lower + aligned_offset
         pool_tick_upper = pos_tick_upper + aligned_offset
 
-        # For liquidity calculation, use pool-space prices when decimal offset is non-zero
+        # For liquidity calculation, ALWAYS use raw pool-space prices (invert=False).
+        # The V4 contract computes amounts from sqrtPrice = sqrt(1.0001^tick).
+        # Using invert=True would give 1/raw_price, causing wrong liquidity for
+        # pairs where stablecoin has the lower address (invert_price=True).
+        # Human-readable prices (lines 262-267) are only for display.
         if decimal_tick_offset != 0:
-            # Pool-space prices for correct liquidity computation
-            pool_price_lower = tick_to_price(pool_tick_lower, invert=invert_price)
-            pool_price_upper = tick_to_price(pool_tick_upper, invert=invert_price)
-            if invert_price:
-                pool_price_lower, pool_price_upper = pool_price_upper, pool_price_lower
+            # Pool-space raw prices for correct liquidity computation
+            pool_price_lower = tick_to_price(pool_tick_lower, invert=False)
+            pool_price_upper = tick_to_price(pool_tick_upper, invert=False)
 
-            # Current price also needs adjustment for correct position-side detection
             pool_current_tick = price_to_tick(current_price, invert=invert_price) + aligned_offset
-            pool_current_price = tick_to_price(pool_current_tick, invert=invert_price)
+            pool_current_price = tick_to_price(pool_current_tick, invert=False)
 
             liquidity = calculate_liquidity_from_usd(
                 usd_amount=usd_amount,
@@ -297,12 +298,16 @@ def calculate_bid_ask_distribution(
                 token1_is_stable=token1_is_stable
             )
         else:
-            # No decimal adjustment needed (same decimals, e.g. BNB chain 18/18)
+            # Same decimals (e.g. BNB chain 18/18) — still use raw prices from ticks
+            raw_price_lower = tick_to_price(pos_tick_lower, invert=False)
+            raw_price_upper = tick_to_price(pos_tick_upper, invert=False)
+            raw_current_price = tick_to_price(tick_current, invert=False)
+
             liquidity = calculate_liquidity_from_usd(
                 usd_amount=usd_amount,
-                price_lower=pos_price_lower,
-                price_upper=pos_price_upper,
-                current_price=current_price,
+                price_lower=raw_price_lower,
+                price_upper=raw_price_upper,
+                current_price=raw_current_price,
                 token0_decimals=token0_decimals,
                 token1_decimals=token1_decimals,
                 token1_is_stable=token1_is_stable

@@ -564,6 +564,15 @@ class PoolFactory:
         Returns:
             (create_tx_hash, init_tx_hash, pool_address)
         """
+        # create_pool() reorders tokens by address — match decimals/price to pool order
+        addr0 = Web3.to_checksum_address(token0)
+        addr1 = Web3.to_checksum_address(token1)
+        if int(addr0, 16) > int(addr1, 16):
+            # Tokens will be swapped inside create_pool, adjust decimals and invert price
+            token0_decimals, token1_decimals = token1_decimals, token0_decimals
+            if initial_price > 0:
+                initial_price = 1.0 / initial_price
+
         # Create pool
         create_tx, pool_address = self.create_pool(token0, token1, fee, timeout)
 

@@ -2640,21 +2640,32 @@ class CreateTab(QWidget):
         if hasattr(self, '_load_pool_worker') and self._load_pool_worker is not None:
             old = self._load_pool_worker
             self._load_pool_worker = None
-            if old.isRunning():
-                old.quit()
-                old.wait(3000)
-            old.deleteLater()
+            try:
+                if old.isRunning():
+                    old.quit()
+                    old.wait(3000)
+                old.deleteLater()
+            except RuntimeError:
+                pass  # C++ object already deleted by previous deleteLater
 
-        self._load_pool_worker = LoadPoolWorker(
+        w = LoadPoolWorker(
             rpc_url, pool_input, network.chain_id, proxy,
             existing_token0=existing_t0, existing_token1=existing_t1
         )
-        self._load_pool_worker.pool_loaded.connect(self._on_pool_data_loaded)
-        self._load_pool_worker.progress.connect(self._log)
-        self._load_pool_worker.error.connect(self._on_pool_load_error)
-        self._load_pool_worker.finished.connect(lambda: self.load_pool_btn.setEnabled(True))
-        self._load_pool_worker.finished.connect(lambda: self._load_pool_worker.deleteLater() if self._load_pool_worker else None)
-        self._load_pool_worker.start()
+        self._load_pool_worker = w
+        w.pool_loaded.connect(self._on_pool_data_loaded)
+        w.progress.connect(self._log)
+        w.error.connect(self._on_pool_load_error)
+        w.finished.connect(lambda: self.load_pool_btn.setEnabled(True))
+        w.finished.connect(lambda dead=w: self._on_load_pool_worker_done(dead))
+        w.start()
+
+    def _on_load_pool_worker_done(self, worker):
+        """Clean up finished load-pool worker and clear reference."""
+        # Only clear if this is still the current worker (not replaced by a new one)
+        if self._load_pool_worker is worker:
+            self._load_pool_worker = None
+        worker.deleteLater()
 
     def _on_pool_load_error(self, error_msg):
         """Handle pool loading error."""
