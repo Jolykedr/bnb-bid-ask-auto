@@ -327,6 +327,56 @@ class V4LiquidityProvider:
         pool_key = self.get_pool_key(config)
         return self.pool_manager.is_pool_initialized(pool_key)
 
+    def _compute_sqrt_price_x96(
+        self,
+        config: V4LadderConfig,
+        pool_key: 'PoolKey',
+        initial_price: float = None
+    ) -> int:
+        """
+        Compute sqrtPriceX96 from config price for pool initialization.
+
+        Extracted from create_pool() so it can be reused for batched init+mint.
+
+        Args:
+            config: Ladder configuration
+            pool_key: Pool key (for currency order)
+            initial_price: Explicit price override (optional)
+
+        Returns:
+            sqrtPriceX96 value
+        """
+        price_for_init = initial_price
+        if price_for_init is None:
+            price_for_init = config.actual_current_price or config.current_price
+
+        if config.invert_price:
+            pool_price = 1.0 / price_for_init
+        else:
+            pool_price = price_for_init
+
+        # Map decimals to pool order (currency0 = lower address)
+        if pool_key.currency0.lower() == Web3.to_checksum_address(config.token0).lower():
+            c0_dec, c1_dec = config.token0_decimals, config.token1_decimals
+        else:
+            c0_dec, c1_dec = config.token1_decimals, config.token0_decimals
+
+        sqrt_price_x96 = self.pool_manager.price_to_sqrt_price_x96(
+            pool_price, c0_dec, c1_dec
+        )
+
+        # Sanity check
+        MIN_SQRT_PRICE = 4295128739
+        MAX_SQRT_PRICE = 1461446703485210103287273052203988822378723970342
+        if sqrt_price_x96 < MIN_SQRT_PRICE or sqrt_price_x96 > MAX_SQRT_PRICE:
+            raise ValueError(
+                f"Computed sqrtPriceX96 ({sqrt_price_x96:.2e}) is outside valid range. "
+                f"Likely wrong token decimals: t0_dec={config.token0_decimals}, t1_dec={config.token1_decimals}, "
+                f"pool_price={pool_price}"
+            )
+
+        return sqrt_price_x96
+
     def create_pool(
         self,
         config: V4LadderConfig,
@@ -392,38 +442,7 @@ class V4LiquidityProvider:
             except Exception as e:
                 logger.warning(f"[create_pool] Could not verify {label} decimals: {e}")
 
-        # Convert price to sqrtPriceX96
-        # If invert_price=True, the user's price is TOKEN/USD (e.g., 0.005 USD per token)
-        # But sqrtPriceX96 uses pool price format: token1/token0
-        # We need to check which token is which in the pool
-        if config.invert_price:
-            # User price is TOKEN/USD, need to invert to USD/TOKEN for pool format
-            # (assuming stablecoin is token1 or token0 based on address order)
-            pool_price = 1.0 / price_for_init
-            logger.info(f"  Inverted price for pool: {pool_price}")
-        else:
-            pool_price = price_for_init
-
-        # Map decimals to pool order (currency0 = lower address, not necessarily config.token0)
-        if pool_key.currency0.lower() == Web3.to_checksum_address(config.token0).lower():
-            c0_dec, c1_dec = config.token0_decimals, config.token1_decimals
-        else:
-            c0_dec, c1_dec = config.token1_decimals, config.token0_decimals
-
-        sqrt_price_x96 = self.pool_manager.price_to_sqrt_price_x96(
-            pool_price, c0_dec, c1_dec
-        )
-
-        # Sanity check: sqrtPriceX96 must be within Uniswap V4 bounds
-        MIN_SQRT_PRICE = 4295128739
-        MAX_SQRT_PRICE = 1461446703485210103287273052203988822378723970342
-        if sqrt_price_x96 < MIN_SQRT_PRICE or sqrt_price_x96 > MAX_SQRT_PRICE:
-            raise ValueError(
-                f"Computed sqrtPriceX96 ({sqrt_price_x96:.2e}) is outside valid range. "
-                f"Likely wrong token decimals: t0_dec={config.token0_decimals}, t1_dec={config.token1_decimals}, "
-                f"pool_price={pool_price}"
-            )
-
+        sqrt_price_x96 = self._compute_sqrt_price_x96(config, pool_key, initial_price)
         logger.info(f"Initializing pool with sqrtPriceX96: {sqrt_price_x96}")
         logger.debug(f"Pool key: {pool_key.to_tuple()}")
 
@@ -1339,6 +1358,7 @@ class V4LiquidityProvider:
         # Check if pool exists
         pool_created = False
         pool_exists = False
+        pool_init_sqrt_price = None  # Set when pool needs creation (batched with mint)
 
         # If pool_id was pre-loaded (from UI), verify it matches computed pool_id
         if config.pool_id:
@@ -1469,21 +1489,13 @@ class V4LiquidityProvider:
                     error=f"Pool does not exist for fee {config.fee_percent}%. Enable auto_create_pool."
                 )
 
-            logger.info("Creating new pool...")
+            # Don't create pool in a separate TX — compute sqrtPriceX96 and
+            # batch initializePool + modifyLiquidities in a single TX later.
+            logger.info("Pool does not exist — will batch initializePool + mint in one TX")
             try:
-                tx_hash, success = self.create_pool(config, timeout=timeout)
-                if not success:
-                    return V4LadderResult(
-                        positions=positions,
-                        tx_hash=tx_hash,
-                        gas_used=None,
-                        token_ids=[],
-                        pool_created=False,
-                        success=False,
-                        error="Failed to create pool"
-                    )
-                pool_created = True
-                logger.info(f"Pool created: {tx_hash}")
+                pool_init_sqrt_price = self._compute_sqrt_price_x96(config, pool_key)
+                pool_created = True  # Will be created in the batched TX
+                logger.info(f"Prepared sqrtPriceX96 for pool init: {pool_init_sqrt_price}")
             except Exception as e:
                 return V4LadderResult(
                     positions=positions,
@@ -1492,7 +1504,7 @@ class V4LiquidityProvider:
                     token_ids=[],
                     pool_created=False,
                     success=False,
-                    error=f"Pool creation failed: {e}"
+                    error=f"Pool price computation failed: {e}"
                 )
 
         # Validate balances
@@ -1912,13 +1924,24 @@ class V4LiquidityProvider:
             unlock_data = self.position_manager._encode_actions(all_actions)
             logger.debug(f"unlockData size: {len(unlock_data)} bytes")
 
-            # Execute directly via modifyLiquidities
-            tx_hash, results = self.position_manager.execute_modify_liquidities(
-                unlock_data=unlock_data,
-                deadline=deadline,
-                gas_limit=gas_limit,
-                timeout=timeout
-            )
+            # Execute: if pool needs creation, batch initializePool + modifyLiquidities
+            if pool_init_sqrt_price is not None:
+                logger.info("Executing batched initializePool + modifyLiquidities...")
+                tx_hash, results = self.position_manager.execute_init_and_modify(
+                    pool_key_tuple=pool_key.to_tuple(),
+                    sqrt_price_x96=pool_init_sqrt_price,
+                    unlock_data=unlock_data,
+                    deadline=deadline,
+                    gas_limit=gas_limit,
+                    timeout=timeout
+                )
+            else:
+                tx_hash, results = self.position_manager.execute_modify_liquidities(
+                    unlock_data=unlock_data,
+                    deadline=deadline,
+                    gas_limit=gas_limit,
+                    timeout=timeout
+                )
 
             # Parse token IDs from receipt
             receipt = self.w3.eth.get_transaction_receipt(tx_hash)

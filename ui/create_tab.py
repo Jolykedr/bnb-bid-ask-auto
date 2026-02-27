@@ -697,32 +697,8 @@ class CreateLadderWorker(QThread):
                     )
                     return
 
-                # Create the pool
-                self.progress.emit("Pool not found. Creating new pool...")
-
-                try:
-                    create_tx, pool_address = pool_factory.create_pool(
-                        self.config.token0,
-                        self.config.token1,
-                        self.config.fee_tier,
-                        timeout=300
-                    )
-                    self.progress.emit(f"Pool created: {pool_address[:20]}...")
-
-                    # Initialize pool with current price
-                    self.progress.emit("Initializing pool with price...")
-                    init_tx = pool_factory.initialize_pool(
-                        pool_address,
-                        self.config.current_price,
-                        self.config.token0_decimals,
-                        self.config.token1_decimals,
-                        timeout=300
-                    )
-                    self.progress.emit("Pool initialized successfully!")
-
-                except Exception as e:
-                    self.create_result.emit(False, f"Failed to create pool: {e}", {})
-                    return
+                # Pool will be created in the same TX as mint (via batched multicall)
+                self.progress.emit("Pool not found — will batch pool creation + mint in one TX")
             else:
                 self.progress.emit(f"Pool found: {pool_address[:20]}...")
 
@@ -910,7 +886,8 @@ class CreateLadderWorker(QThread):
                 self.config,
                 simulate_first=True,
                 timeout=300,
-                validated_pool_address=pool_address  # Skip validation if already found
+                validated_pool_address=pool_address,  # Skip validation if already found
+                auto_create_pool=self.auto_create_pool
             )
 
             if result.success:

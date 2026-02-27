@@ -6,7 +6,7 @@
 Это **оригинальный** проект — веб-версия и бот портированы из него.
 
 - Интерактивный калькулятор позиций с визуализацией
-- Создание лестницы на блокчейне (V3: batch mint через PositionManager.multicall, V4: modifyLiquidities)
+- Создание лестницы на блокчейне (V3/V4: pool init + batch mint в 1 TX через PositionManager.multicall)
 - Управление позициями (загрузка, закрытие, сбор комиссий, свопы)
 - Поддержка BNB Chain, Base, Ethereum
 - Лицензирование (Ed25519)
@@ -21,7 +21,7 @@
 | Блокчейн | Web3.py 6+ |
 | Шифрование | AES-256-GCM + PBKDF2 (600k итераций) |
 | Математика | Python Decimal (50-digit precision) |
-| Тесты | pytest (1308 тестов, ~80% покрытие src/) |
+| Тесты | pytest (1312 тестов, ~80% покрытие src/) |
 | Пакеты | uv (pyproject.toml + uv.lock) |
 | DEX агрегатор | KyberSwap, OKX DEX |
 
@@ -57,11 +57,11 @@ bnb/
 │   │       ├── constants.py           # V4Protocol enum, адреса, fee conversion
 │   │       ├── abis.py               # V4 ABI (StateView, Actions)
 │   │       ├── pool_manager.py        # PoolKey, pool state, pool_id (Uni vs PCS)
-│   │       ├── position_manager.py    # V4 PositionManager (modifyLiquidities)
+│   │       ├── position_manager.py    # V4 PositionManager (modifyLiquidities, initPool+mint)
 │   │       └── subgraph.py            # Uniswap V4 GraphQL API
 │   │
 │   └── multicall/
-│       └── batcher.py                 # PositionManager.multicall (batch mint/close в 1 TX)
+│       └── batcher.py                 # PM.multicall (batch create+mint/close в 1 TX)
 │
 ├── ui/                                # ИНТЕРФЕЙС (PyQt6)
 │   ├── main_window.py                 # MainWindow (4 таба, меню, mutex, worker cleanup)
@@ -78,7 +78,7 @@ bnb/
 │   └── styles/
 │       └── dark_theme.qss             # Dark theme
 │
-├── tests/                             # ТЕСТЫ (1308 штук)
+├── tests/                             # ТЕСТЫ (1312 штук)
 │   ├── test_ticks.py                  # 711 строк, tick math
 │   ├── test_liquidity.py              # 1135 строк, liquidity formulas
 │   ├── test_distribution.py           # 1091 строк, distribution + offset
@@ -389,11 +389,11 @@ _secure_zero(bytearray_data) → None  # ctypes.memset
 3. Вводит параметры: range, positions, USD, distribution
 4. Preview (calculate_bid_ask_distribution → таблица + chart)
 5. Create:
-   a. Detect/create pool
+   a. Detect pool (or batch createAndInitializePoolIfNecessary / initializePool)
    b. Approve tokens (ERC20 для V3, Permit2 для V4)
    c. Compute positions → MintParams[]
-   d. V3: batch mint через PositionManager.multicall
-      V4: modifyLiquidities (action-based encoding)
+   d. V3: batch [createPool +] mint через PositionManager.multicall
+      V4: [initializePool +] modifyLiquidities через PM.multicall
    e. Parse receipt → token_ids
 6. Результат → ManageTab (positions_created signal)
 ```
@@ -424,7 +424,7 @@ pytest tests/ --cov=src --cov-report=term-missing
 | crypto.py | ~95% | test_crypto.py (376 строк) |
 | UI layer | 4-16% | Минимальные |
 | okx_dex.py | 0% | — |
-| **Итого** | **~80%** | **1308 тестов** |
+| **Итого** | **~80%** | **1312 тестов** |
 
 ---
 
@@ -607,7 +607,7 @@ except:
 - [x] Live settings reload
 
 ### Тесты
-- [x] 1308 тестов, все passing
+- [x] 1312 тестов, все passing
 - [x] Math coverage 99-100%
 - [x] Contract coverage 100% (V3 PM, pool factory)
 - [ ] UI layer coverage 4-16% — **НИЗКОЕ**
@@ -637,7 +637,7 @@ except:
 | Апрувы | `ERC20.approve(PositionManager)` | `ERC20→Permit2→PositionManager` |
 | Комиссии | Фиксированные: 100, 500, 2500, 3000, 10000 | Кастомные 0-100% (hundredths of bip) |
 | Tick spacing | По таблице FEE→SPACING | `fee_percent × 200` |
-| Батчинг | Multicall3 обёртка | Нативный action batching |
+| Батчинг | PM.multicall (create pool + mint) | PM.multicall (initPool + modifyLiq) |
 | Чтение пула | `Pool.slot0()` | StateView (Uni) / PoolManager (PCS) |
 | Pool ID | Нет (адрес пула) | `keccak256(PoolKey)` — разный формат для Uni и PCS |
 | Позиции | Полный struct | Packed bytes32 (3 fallback layout) |

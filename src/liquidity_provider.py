@@ -510,7 +510,8 @@ class LiquidityProvider:
         simulate_first: bool = True,
         timeout: int = 600,
         check_balance: bool = True,
-        validated_pool_address: str = None
+        validated_pool_address: str = None,
+        auto_create_pool: bool = False
     ) -> LadderResult:
         """
         Создание bid-ask лесенки ликвидности.
@@ -535,6 +536,8 @@ class LiquidityProvider:
                 success=False,
                 error="Account not configured"
             )
+
+        pool_create_sqrt_price = None  # Set when pool needs creation (batched with mint)
 
         # Расчёт позиций
         positions = self.preview_ladder(config)
@@ -591,28 +594,61 @@ class LiquidityProvider:
             )
 
             if not pool_exists:
-                if pool_address:
-                    # Pool exists but not initialized
-                    error_msg = (
-                        f"Pool exists at {pool_address} but is NOT INITIALIZED. "
-                        f"You need to initialize the pool with a starting price first."
+                if not auto_create_pool:
+                    if pool_address:
+                        error_msg = (
+                            f"Pool exists at {pool_address} but is NOT INITIALIZED. "
+                            f"Enable 'Auto-create pool' to initialize it automatically."
+                        )
+                    else:
+                        error_msg = (
+                            f"Pool does NOT EXIST for tokens {config.token0[:10]}.../{config.token1[:10]}... "
+                            f"with fee tier {config.fee_tier}. "
+                            f"Enable 'Auto-create pool' to create it automatically."
+                        )
+                    logger.error(error_msg)
+                    return LadderResult(
+                        positions=positions,
+                        tx_hash=None,
+                        gas_used=None,
+                        token_ids=[],
+                        success=False,
+                        error=error_msg
                     )
-                else:
-                    # Pool doesn't exist at all
-                    error_msg = (
-                        f"Pool does NOT EXIST for tokens {config.token0[:10]}.../{config.token1[:10]}... "
-                        f"with fee tier {config.fee_tier}. "
-                        f"You need to CREATE the pool first before adding liquidity."
+
+                # Will batch createAndInitializePoolIfNecessary with mint calls
+                logger.info("Pool does not exist — will batch createAndInitializePoolIfNecessary + mint in one TX")
+                try:
+                    import math
+                    # current_price is user price (USD/volatile)
+                    # Pool price = token1/token0 (sorted by address)
+                    stablecoin_is_sorted_token0 = config.token1.lower() < config.token0.lower()
+                    if stablecoin_is_sorted_token0:
+                        # stablecoin = token0 in pool → pool price = volatile/stablecoin = 1/user_price
+                        pool_price = 1.0 / config.current_price
+                        t0_dec = config.token1_decimals  # stablecoin
+                        t1_dec = config.token0_decimals  # volatile
+                    else:
+                        # stablecoin = token1 in pool → pool price = stablecoin/volatile = user_price
+                        pool_price = config.current_price
+                        t0_dec = config.token0_decimals  # volatile
+                        t1_dec = config.token1_decimals  # stablecoin
+
+                    adjusted_price = pool_price * (10 ** (t1_dec - t0_dec))
+                    if adjusted_price <= 0:
+                        raise ValueError(f"Invalid pool price: {pool_price}")
+                    sqrt_price = math.sqrt(adjusted_price)
+                    pool_create_sqrt_price = int(sqrt_price * (2 ** 96))
+                    logger.info(f"Computed sqrtPriceX96 for pool init: {pool_create_sqrt_price}")
+                except Exception as e:
+                    return LadderResult(
+                        positions=positions,
+                        tx_hash=None,
+                        gas_used=None,
+                        token_ids=[],
+                        success=False,
+                        error=f"Failed to compute pool init price: {e}"
                     )
-                logger.error(error_msg)
-                return LadderResult(
-                    positions=positions,
-                    tx_hash=None,
-                    gas_used=None,
-                    token_ids=[],
-                    success=False,
-                    error=error_msg
-                )
 
             if pool_info:
                 logger.info(f"Pool found at {pool_address}")
@@ -700,6 +736,17 @@ class LiquidityProvider:
         self.batcher.clear()
 
         deadline = int(time.time()) + 3600
+
+        # Если нужно создать пул — добавляем в батч первым
+        if pool_create_sqrt_price is not None:
+            logger.info("Adding createAndInitializePoolIfNecessary to batch...")
+            self.batcher.add_create_pool_call(
+                position_manager=self.position_manager_address,
+                token0=token0,
+                token1=token1,
+                fee=config.fee_tier,
+                sqrt_price_x96=pool_create_sqrt_price
+            )
 
         # Добавляем mint вызовы
         for pos in positions:

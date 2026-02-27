@@ -120,6 +120,45 @@ class Multicall3Batcher:
             call_data=call_data
         ))
 
+    def add_create_pool_call(
+        self,
+        position_manager: str,
+        token0: str,
+        token1: str,
+        fee: int,
+        sqrt_price_x96: int,
+        allow_failure: bool = False
+    ):
+        """
+        Добавление createAndInitializePoolIfNecessary в начало batch.
+
+        Создаёт пул и инициализирует его с заданной ценой.
+        Если пул уже существует — вызов не revert-ит, просто возвращает адрес.
+        Вставляется в НАЧАЛО списка вызовов, чтобы пул существовал до mint.
+
+        Args:
+            position_manager: Адрес NonfungiblePositionManager
+            token0, token1: Адреса токенов (должны быть в правильном порядке: token0 < token1)
+            fee: Fee tier (например, 3000 = 0.3%)
+            sqrt_price_x96: Начальная цена в формате sqrtPriceX96
+            allow_failure: Разрешить ли провал
+        """
+        pm = self._get_pm_contract(position_manager)
+
+        call_data = pm.functions.createAndInitializePoolIfNecessary(
+            Web3.to_checksum_address(token0),
+            Web3.to_checksum_address(token1),
+            fee,
+            sqrt_price_x96
+        )._encode_transaction_data()
+
+        # Вставляем в НАЧАЛО — пул должен быть создан до mint-ов
+        self.calls.insert(0, Call3(
+            target=position_manager,
+            allow_failure=allow_failure,
+            call_data=call_data
+        ))
+
     def add_mint_call(
         self,
         position_manager: str,

@@ -1348,6 +1348,109 @@ class V4PositionManager:
                     self.nonce_manager.release_nonce(nonce)
             raise
 
+    def execute_init_and_modify(
+        self,
+        pool_key_tuple: tuple,
+        sqrt_price_x96: int,
+        unlock_data: bytes,
+        deadline: int = None,
+        gas_limit: int = None,
+        timeout: int = 600
+    ) -> Tuple[str, List[bytes]]:
+        """
+        Initialize pool + modifyLiquidities in ONE TX via multicall.
+
+        Combines initializePool and modifyLiquidities into a single
+        atomic transaction. If either fails, the whole TX reverts.
+
+        Args:
+            pool_key_tuple: PoolKey as tuple (for ABI encoding)
+            sqrt_price_x96: Initial pool price as sqrtPriceX96
+            unlock_data: Pre-encoded actions via _encode_actions()
+            deadline: Transaction deadline
+            gas_limit: Gas limit
+            timeout: Transaction timeout
+
+        Returns:
+            (tx_hash, results)
+        """
+        if not self.account:
+            raise ValueError("Account not set")
+
+        if deadline is None:
+            deadline = int(time.time()) + 3600
+
+        # Encode both calls for multicall
+        init_data = self.contract.encode_abi(
+            "initializePool", args=[pool_key_tuple, sqrt_price_x96]
+        )
+        modify_data = self.contract.encode_abi(
+            "modifyLiquidities", args=[unlock_data, deadline]
+        )
+
+        logger.info(f"[V4] Batching initializePool + modifyLiquidities via multicall")
+
+        # Estimate gas
+        if gas_limit is None:
+            try:
+                estimated = self.contract.functions.multicall(
+                    [init_data, modify_data]
+                ).estimate_gas({
+                    'from': self.account.address
+                })
+                gas_limit = int(estimated * 1.3)
+                logger.debug(f"[V4] Estimated gas: {estimated}, using {gas_limit}")
+            except Exception as e:
+                logger.error(f"[V4] Gas estimation failed (tx would revert): {e}")
+                raise Exception(f"Gas estimation failed (tx would revert): {e}")
+
+        # Build transaction
+        nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
+                self.w3.eth.get_transaction_count(self.account.address, 'pending')
+
+        tx_sent = False
+        nonce_handled = False
+        try:
+            tx = self.contract.functions.multicall(
+                [init_data, modify_data]
+            ).build_transaction({
+                'from': self.account.address,
+                'nonce': nonce,
+                'gas': gas_limit,
+                'gasPrice': self.w3.eth.gas_price,
+                'value': 0
+            })
+
+            signed = self.account.sign_transaction(tx)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_sent = True
+
+            logger.info(f"[V4] Batched TX sent: {tx_hash.hex()}")
+
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+
+            if self.nonce_manager:
+                self.nonce_manager.confirm_transaction(nonce)
+                nonce_handled = True
+
+            if receipt['status'] != 1:
+                raise Exception(
+                    f"Transaction reverted! TX: {tx_hash.hex()}. "
+                    f"Pool init + mint batch failed."
+                )
+
+            logger.info(f"[V4] Batched TX confirmed, gas used: {receipt.get('gasUsed', 'unknown')}")
+
+            return tx_hash.hex(), []
+
+        except Exception as e:
+            if self.nonce_manager and not nonce_handled:
+                if tx_sent:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
+            raise
+
     # ============== Wallet Scanning Methods ==============
 
     def get_owner_of(self, token_id: int) -> Optional[str]:

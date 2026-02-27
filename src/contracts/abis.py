@@ -135,6 +135,19 @@ POSITION_MANAGER_ABI = [
         "stateMutability": "payable",
         "type": "function"
     },
+    # Create and initialize pool if necessary (V3)
+    {
+        "inputs": [
+            {"name": "token0", "type": "address"},
+            {"name": "token1", "type": "address"},
+            {"name": "fee", "type": "uint24"},
+            {"name": "sqrtPriceX96", "type": "uint160"}
+        ],
+        "name": "createAndInitializePoolIfNecessary",
+        "outputs": [{"name": "pool", "type": "address"}],
+        "stateMutability": "payable",
+        "type": "function"
+    },
     # Events для парсинга результатов
     {
         "anonymous": False,

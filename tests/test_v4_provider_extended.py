@@ -1196,35 +1196,50 @@ class TestCreateLadderExtended:
 
         assert result.pool_created is True
 
-    def test_create_ladder_pool_not_exists_auto_create_fails(self, provider, config):
-        """Pool creation fails → return error result."""
+    def test_create_ladder_pool_not_exists_auto_create_price_error(self, provider, config):
+        """sqrtPriceX96 computation fails → return error result."""
         positions, mock_pool_key, mock_batch = self._setup_create_ladder(
             provider, config, pool_exists=False
         )
         config.pool_id = None
 
-        provider.create_pool = Mock(return_value=("0xpool_tx", False))
+        provider._compute_sqrt_price_x96 = Mock(
+            side_effect=ValueError("Invalid price")
+        )
 
         with patch('src.v4_liquidity_provider.BatchRPC', return_value=mock_batch):
             result = provider.create_ladder(config, auto_create_pool=True, skip_approvals=False)
 
         assert result.success is False
-        assert "Failed to create pool" in result.error
+        assert "Pool price computation failed" in result.error
 
-    def test_create_ladder_pool_create_exception(self, provider, config):
-        """Pool creation exception → return error result."""
+    def test_create_ladder_pool_not_exists_auto_create_batches(self, provider, config):
+        """Pool doesn't exist + auto_create → batched init+mint via execute_init_and_modify."""
         positions, mock_pool_key, mock_batch = self._setup_create_ladder(
             provider, config, pool_exists=False
         )
         config.pool_id = None
 
-        provider.create_pool = Mock(side_effect=Exception("Pool creation error"))
+        provider._compute_sqrt_price_x96 = Mock(return_value=79228162514264337593543950336)
+
+        provider.position_manager.execute_init_and_modify = Mock(
+            return_value=("0xbatched_tx_hash", [])
+        )
+        mock_receipt = {
+            'status': 1,
+            'gasUsed': 500000
+        }
+        provider.w3.eth.get_transaction_receipt = Mock(return_value=mock_receipt)
+        provider.position_manager.contract.events.Transfer.return_value.process_receipt = Mock(
+            return_value=[]
+        )
 
         with patch('src.v4_liquidity_provider.BatchRPC', return_value=mock_batch):
-            result = provider.create_ladder(config, auto_create_pool=True, skip_approvals=False)
+            result = provider.create_ladder(config, auto_create_pool=True, skip_approvals=True)
 
-        assert result.success is False
-        assert "Pool creation failed" in result.error
+        assert result.success is True
+        assert result.pool_created is True
+        provider.position_manager.execute_init_and_modify.assert_called_once()
 
     def test_create_ladder_skip_approvals_checks_state(self, provider, config):
         """skip_approvals=True checks approval state and fails if not approved."""
