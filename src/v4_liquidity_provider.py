@@ -638,10 +638,18 @@ class V4LiquidityProvider:
             abi=ERC20_ABI
         )
 
-        current_allowance = token.functions.allowance(
-            self.account.address,
-            Web3.to_checksum_address(spender)
-        ).call()
+        # Retry allowance read — BASE RPC nodes can return stale (zero) data
+        current_allowance = 0
+        for _attempt in range(3):
+            current_allowance = token.functions.allowance(
+                self.account.address,
+                Web3.to_checksum_address(spender)
+            ).call()
+            if current_allowance >= amount:
+                break
+            if _attempt < 2 and current_allowance == 0:
+                logger.warning(f"ERC20 allowance returned 0 (attempt {_attempt+1}/3), RPC may lag. Retrying in 2s...")
+                time.sleep(2)
 
         logger.info(f"ERC20 allowance check: token={token_address[:10]}..., spender={spender[:10]}..., current={current_allowance}, needed={amount}")
 
@@ -721,19 +729,26 @@ class V4LiquidityProvider:
 
         # Check existing Permit2 allowance before sending TX
         current_time = int(time.time())
-
-        allowance_data = permit2.functions.allowance(
-            self.account.address,
-            Web3.to_checksum_address(token_address),
-            Web3.to_checksum_address(spender)
-        ).call()
-
-        current_amount = allowance_data[0]
-        current_expiration = allowance_data[1]
-
         max_uint160 = 2**160 - 1
         # Cap comparison at uint160 max — Permit2 stores allowances as uint160
         capped_amount = min(amount, max_uint160)
+
+        # Retry allowance read — BASE RPC nodes can return stale (zero) data
+        current_amount = 0
+        current_expiration = 0
+        for _attempt in range(3):
+            allowance_data = permit2.functions.allowance(
+                self.account.address,
+                Web3.to_checksum_address(token_address),
+                Web3.to_checksum_address(spender)
+            ).call()
+            current_amount = allowance_data[0]
+            current_expiration = allowance_data[1]
+            if current_amount >= capped_amount and current_expiration > current_time + 3600:
+                break
+            if _attempt < 2 and current_amount == 0:
+                logger.warning(f"Permit2 allowance returned 0 (attempt {_attempt+1}/3), RPC may lag. Retrying in 2s...")
+                time.sleep(2)
 
         # Skip if allowance sufficient and not expiring within 1 hour
         if current_amount >= capped_amount and current_expiration > current_time + 3600:

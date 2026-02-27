@@ -932,10 +932,13 @@ class TestV4LiquidityProvider:
         mock_approve_fn = Mock()
         mock_approve_fn.build_transaction = Mock(return_value={})
         mock_contract.functions.approve = Mock(return_value=mock_approve_fn)
-        # Мок allowance: первый вызов — проверка (недостаточно), второй — верификация после approve
+        # Мок allowance: first 3 calls — pre-check retries (all insufficient),
+        # then post-approve verification returns sufficient
         mock_contract.functions.allowance = Mock(
             return_value=Mock(call=Mock(side_effect=[
-                (0, 0, 0),  # pre-check: insufficient → proceed with approve
+                (0, 0, 0),  # pre-check attempt 1: insufficient
+                (0, 0, 0),  # pre-check attempt 2: insufficient (RPC lag)
+                (0, 0, 0),  # pre-check attempt 3: insufficient (RPC lag)
                 (10**160, 9999999999, 0),  # post-approve verification
             ]))
         )
