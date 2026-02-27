@@ -1652,6 +1652,13 @@ class CreateTab(QWidget):
 
     def _on_fee_changed(self, fee_value: float):
         """Handle fee value change - auto-update tick spacing if auto is checked."""
+        # Clear pre-loaded pool ID: user changed fee, so the loaded pool
+        # (with its original fee) is no longer relevant. Without this,
+        # create_ladder would silently auto-correct back to the loaded pool's fee.
+        if self.loaded_v4_pool_id is not None:
+            self.loaded_v4_pool_id = None
+            self._log("Pool ID cleared (fee changed by user)")
+
         if self.tick_spacing_auto_cb.isChecked():
             suggested = self._suggest_tick_spacing(fee_value)
             self.tick_spacing_spin.setValue(suggested)

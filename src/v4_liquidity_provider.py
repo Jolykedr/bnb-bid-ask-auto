@@ -1332,90 +1332,113 @@ class V4LiquidityProvider:
             # CRITICAL: Compare pool IDs
             if config.pool_id != computed_pool_id:
                 logger.warning("=" * 50)
-                logger.warning("POOL ID MISMATCH - attempting auto-correction...")
+                logger.warning("POOL ID MISMATCH detected")
                 logger.warning(f"  Loaded:   0x{config.pool_id.hex()}")
                 logger.warning(f"  Computed: 0x{computed_pool_id.hex()}")
                 logger.warning(f"  Your fee: {pool_key.fee} ({config.fee_percent}%)")
                 logger.warning(f"  Your tick_spacing: {pool_key.tick_spacing}")
 
-                # Try to get the actual pool's fee from getSlot0
-                try:
-                    loaded_pool_state = self.pool_manager.get_pool_state_by_id(config.pool_id)
-                    if loaded_pool_state.initialized:
-                        actual_fee = loaded_pool_state.lp_fee
-                        logger.info(f"  Pool's actual fee: {actual_fee} ({actual_fee/10000:.4f}%)")
+                if auto_create_pool:
+                    # User wants to create a new pool with their chosen fee.
+                    # Don't auto-correct to the loaded pool's fee — discard
+                    # the stale pre-loaded pool_id and proceed with the user's
+                    # computed pool_key. The pool-creation path below will handle it.
+                    logger.info("auto_create_pool=True → ignoring loaded pool ID, using user's fee/tick_spacing")
+                    config.pool_id = None
+                    # Fall through — pool_exists will be checked by computed pool_key below
+                else:
+                    # Try to auto-correct to the loaded pool's parameters
+                    logger.warning("Attempting auto-correction to loaded pool...")
+                    try:
+                        loaded_pool_state = self.pool_manager.get_pool_state_by_id(config.pool_id)
+                        if loaded_pool_state.initialized:
+                            actual_fee = loaded_pool_state.lp_fee
+                            logger.info(f"  Pool's actual fee: {actual_fee} ({actual_fee/10000:.4f}%)")
 
-                        # Check if fee mismatch is the issue
-                        if actual_fee != pool_key.fee:
-                            logger.info("Fee mismatch detected! Trying with pool's actual fee...")
+                            # Check if fee mismatch is the issue
+                            if actual_fee != pool_key.fee:
+                                logger.info("Fee mismatch detected! Trying with pool's actual fee...")
 
-                            # Build comprehensive list of tick_spacings to try
-                            tick_spacings_to_try = set([
-                                pool_key.tick_spacing,  # Current value first
-                                1, 10, 50, 60, 100, 200, 500, 780, 800, 1000, 2000, 2500, 4000,
-                                2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
-                            ])
-                            # Add multiples of 10 and 100
-                            tick_spacings_to_try.update(range(10, 1010, 10))
-                            tick_spacings_to_try.update(range(100, 10100, 100))
+                                # Build comprehensive list of tick_spacings to try
+                                tick_spacings_to_try = set([
+                                    pool_key.tick_spacing,  # Current value first
+                                    1, 10, 50, 60, 100, 200, 500, 780, 800, 1000, 2000, 2500, 4000,
+                                    2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
+                                ])
+                                # Add multiples of 10 and 100
+                                tick_spacings_to_try.update(range(10, 1010, 10))
+                                tick_spacings_to_try.update(range(100, 10100, 100))
 
-                            for try_tick_spacing in sorted(tick_spacings_to_try):
-                                test_pool_key = PoolKey.from_tokens(
-                                    token0=config.token0,
-                                    token1=config.token1,
-                                    fee=actual_fee,
-                                    tick_spacing=try_tick_spacing,
-                                    hooks=config.hooks
-                                )
-                                test_pool_id = self.pool_manager._compute_pool_id(test_pool_key)
-                                if test_pool_id == config.pool_id:
-                                    logger.info(f"  MATCH FOUND! fee={actual_fee}, tick_spacing={try_tick_spacing}")
-                                    # Update pool_key with correct values
-                                    pool_key = test_pool_key
-                                    computed_pool_id = test_pool_id
-                                    config.fee_percent = actual_fee / 10000
-                                    config.tick_spacing = try_tick_spacing
-                                    break
-                            else:
-                                # No match found even with correct fee - probably token address issue
-                                logger.error("Could not find matching parameters!")
-                                logger.error(f"  Tried fee={actual_fee} with {len(tick_spacings_to_try)} tick_spacings")
-                                logger.error("  Check token addresses!")
-                except Exception as e:
-                    logger.error(f"Could not query loaded pool: {e}")
+                                for try_tick_spacing in sorted(tick_spacings_to_try):
+                                    test_pool_key = PoolKey.from_tokens(
+                                        token0=config.token0,
+                                        token1=config.token1,
+                                        fee=actual_fee,
+                                        tick_spacing=try_tick_spacing,
+                                        hooks=config.hooks
+                                    )
+                                    test_pool_id = self.pool_manager._compute_pool_id(test_pool_key)
+                                    if test_pool_id == config.pool_id:
+                                        logger.info(f"  MATCH FOUND! fee={actual_fee}, tick_spacing={try_tick_spacing}")
+                                        # Update pool_key with correct values
+                                        pool_key = test_pool_key
+                                        computed_pool_id = test_pool_id
+                                        config.fee_percent = actual_fee / 10000
+                                        config.tick_spacing = try_tick_spacing
+                                        break
+                                else:
+                                    # No match found even with correct fee - probably token address issue
+                                    logger.error("Could not find matching parameters!")
+                                    logger.error(f"  Tried fee={actual_fee} with {len(tick_spacings_to_try)} tick_spacings")
+                                    logger.error("  Check token addresses!")
+                    except Exception as e:
+                        logger.error(f"Could not query loaded pool: {e}")
 
-                # Final check after auto-correction attempt
-                if config.pool_id != computed_pool_id:
-                    logger.error("=" * 50)
-                    logger.error("POOL ID STILL MISMATCHED after auto-correction!")
-                    logger.error("=" * 50)
+                    # Final check after auto-correction attempt
+                    if config.pool_id != computed_pool_id:
+                        logger.error("=" * 50)
+                        logger.error("POOL ID STILL MISMATCHED after auto-correction!")
+                        logger.error("=" * 50)
 
-                    return V4LadderResult(
-                        positions=positions,
-                        tx_hash=None,
-                        gas_used=None,
-                        token_ids=[],
-                        pool_created=False,
-                        success=False,
-                        error=(
-                            f"Pool ID mismatch! Could not auto-correct. "
-                            f"Expected: 0x{config.pool_id.hex()[:16]}... "
-                            f"Got: 0x{computed_pool_id.hex()[:16]}... "
-                            f"Check token addresses carefully!"
+                        return V4LadderResult(
+                            positions=positions,
+                            tx_hash=None,
+                            gas_used=None,
+                            token_ids=[],
+                            pool_created=False,
+                            success=False,
+                            error=(
+                                f"Pool ID mismatch! Could not auto-correct. "
+                                f"Expected: 0x{config.pool_id.hex()[:16]}... "
+                                f"Got: 0x{computed_pool_id.hex()[:16]}... "
+                                f"Check token addresses carefully!"
+                            )
                         )
-                    )
 
-                logger.info("Pool ID auto-corrected successfully!")
+                    logger.info("Pool ID auto-corrected successfully!")
 
-            logger.info("Pool ID verification PASSED")
-            state = self.pool_manager.get_pool_state_by_id(config.pool_id)
-            pool_exists = state.initialized
-            if pool_exists:
-                logger.info(f"Pool state: tick={state.tick}, liquidity={state.liquidity}, fee={state.lp_fee}")
-            else:
-                logger.warning("Pool ID found but pool is NOT initialized!")
-        else:
-            # Check using computed pool_key
+                    # CRITICAL: Re-compute positions with corrected fee/tick_spacing.
+                    # The initial preview_ladder used the user's original parameters;
+                    # after auto-correction tick_spacing may differ, which changes tick
+                    # alignment and therefore the liquidity each position needs.
+                    logger.info("Re-computing positions with corrected parameters...")
+                    positions = self.preview_ladder(config)
+                    pool_key = self.get_pool_key(config)
+                    computed_pool_id = self.pool_manager._compute_pool_id(pool_key)
+                    logger.info(f"Re-computed {len(positions)} positions with tick_spacing={pool_key.tick_spacing}")
+
+            if config.pool_id:
+                logger.info("Pool ID verification PASSED")
+                state = self.pool_manager.get_pool_state_by_id(config.pool_id)
+                pool_exists = state.initialized
+                if pool_exists:
+                    logger.info(f"Pool state: tick={state.tick}, liquidity={state.liquidity}, fee={state.lp_fee}")
+                else:
+                    logger.warning("Pool ID found but pool is NOT initialized!")
+
+        if not config.pool_id:
+            # No pre-loaded pool ID (either never loaded, or cleared due to fee change
+            # with auto_create_pool). Check using computed pool_key.
             logger.info("No pre-loaded pool ID, checking by computed pool_key...")
             pool_exists = self.pool_manager.is_pool_initialized(pool_key)
 
@@ -1647,6 +1670,51 @@ class V4LiquidityProvider:
                     error=f"Token approval failed: {approval_result.get('error', 'Unknown error')}"
                 )
 
+            # Verify approvals propagated on-chain (BASE RPC nodes can lag)
+            max_retries = 5
+            retry_delay = 3  # seconds
+            for attempt in range(1, max_retries + 1):
+                approval_state = self.check_approvals(config)
+                all_ok = (
+                    approval_state['erc20_to_permit2']['approved']
+                    and approval_state['permit2_to_position_manager']['approved']
+                    and approval_state['base_erc20_to_permit2']['approved']
+                    and approval_state['base_permit2_to_position_manager']['approved']
+                )
+                if all_ok:
+                    logger.info(f"Approval verification passed (attempt {attempt}/{max_retries})")
+                    break
+                logger.warning(
+                    f"Approval verification failed (attempt {attempt}/{max_retries}), "
+                    f"RPC may be lagging. Retrying in {retry_delay}s..."
+                )
+                if attempt < max_retries:
+                    time.sleep(retry_delay)
+            else:
+                # All retries exhausted
+                details = []
+                if not approval_state['erc20_to_permit2']['approved']:
+                    details.append(f"quote ERC20→Permit2 (have {approval_state['erc20_to_permit2']['allowance']})")
+                if not approval_state['permit2_to_position_manager']['approved']:
+                    details.append("quote Permit2→PM")
+                if not approval_state['base_erc20_to_permit2']['approved']:
+                    details.append(f"base ERC20→Permit2 (have {approval_state['base_erc20_to_permit2']['allowance']})")
+                if not approval_state['base_permit2_to_position_manager']['approved']:
+                    details.append("base Permit2→PM")
+                return V4LadderResult(
+                    positions=positions,
+                    tx_hash=None,
+                    gas_used=None,
+                    token_ids=[],
+                    pool_created=pool_created,
+                    success=False,
+                    error=(
+                        f"Approvals sent but not yet visible on-chain after {max_retries * retry_delay}s. "
+                        f"RPC node lag suspected. Missing: {', '.join(details)}. "
+                        f"Please try again in a minute."
+                    )
+                )
+
         # Build mint actions for all positions
         deadline = int(time.time()) + 3600
 
@@ -1693,8 +1761,8 @@ class V4LiquidityProvider:
             # Determine amounts based on PROTOCOL position relative to current tick
             slippage_multiplier = 1 + (config.slippage_percent / 100)
 
-            # Calculate both token amounts with 2x safety margin
-            safety_margin = 2.0
+            # Calculate both token amounts with safety margin
+            safety_margin = 1.2
             base_token_amount = int(pos.usd_amount / user_price * (10 ** base_decimals) * safety_margin)
             safe_stablecoin = int(stablecoin_amount * safety_margin)
 

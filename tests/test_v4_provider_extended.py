@@ -1141,6 +1141,13 @@ class TestCreateLadderExtended:
         provider.preview_ladder = Mock(return_value=positions)
         provider.validate_balances = Mock(return_value=(True, None))
         provider.approve_tokens_for_ladder = Mock(return_value={'success': True})
+        # Mock check_approvals for post-approval verification (all approved)
+        provider.check_approvals = Mock(return_value={
+            'erc20_to_permit2': {'approved': True, 'allowance': 10**30},
+            'permit2_to_position_manager': {'approved': True, 'amount': 10**30, 'expiration': int(time.time()) + 86400, 'expired': False},
+            'base_erc20_to_permit2': {'approved': True, 'allowance': 10**30},
+            'base_permit2_to_position_manager': {'approved': True, 'amount': 10**30, 'expiration': int(time.time()) + 86400, 'expired': False},
+        })
 
         # Mock ERC20 contract for base decimals check
         mock_erc20 = Mock()
@@ -1451,7 +1458,7 @@ class TestCreateLadderExtended:
         assert result.success is True
 
     def test_create_ladder_with_pool_id_mismatch_uncorrectable(self, provider, config):
-        """Pre-loaded pool_id doesn't match and can't auto-correct → error."""
+        """Pre-loaded pool_id doesn't match and can't auto-correct → error (auto_create_pool=False)."""
         positions, mock_pool_key, mock_batch = self._setup_create_ladder(provider, config)
         config.pool_id = b'\xff' * 32  # Different from computed (b'\x01' * 32)
 
@@ -1463,15 +1470,41 @@ class TestCreateLadderExtended:
         # _compute_pool_id never returns the target pool_id
         provider.pool_manager._compute_pool_id = Mock(return_value=b'\x01' * 32)
 
+        # auto_create_pool=False: should try auto-correction and fail
         with patch('src.v4_liquidity_provider.BatchRPC', return_value=mock_batch), \
              patch('src.v4_liquidity_provider.compute_decimal_tick_offset', return_value=0), \
              patch('src.v4_liquidity_provider.price_to_tick', return_value=-150), \
              patch('src.v4_liquidity_provider.tick_to_price', return_value=0.005), \
              patch.object(PoolKey, 'from_tokens', return_value=mock_pool_key):
-            result = provider.create_ladder(config, skip_approvals=False)
+            result = provider.create_ladder(config, auto_create_pool=False, skip_approvals=False)
 
         assert result.success is False
         assert "Pool ID mismatch" in result.error
+
+    def test_create_ladder_pool_id_mismatch_auto_create_clears_pool_id(self, provider, config):
+        """Pre-loaded pool_id mismatch + auto_create_pool=True → clears pool_id, uses computed key."""
+        positions, mock_pool_key, mock_batch = self._setup_create_ladder(provider, config, pool_exists=False)
+        config.pool_id = b'\xff' * 32  # Different from computed (b'\x01' * 32)
+
+        provider.create_pool = Mock(return_value=("0xpool_tx", True))
+        provider.pool_manager.is_pool_initialized.return_value = False
+
+        provider.w3.eth.get_transaction_receipt = Mock(return_value={
+            'status': 1, 'gasUsed': 500_000, 'logs': [],
+        })
+        provider.position_manager.contract.events.Transfer = Mock(
+            return_value=Mock(process_receipt=Mock(return_value=[]))
+        )
+
+        with patch('src.v4_liquidity_provider.BatchRPC', return_value=mock_batch), \
+             patch('src.v4_liquidity_provider.compute_decimal_tick_offset', return_value=0), \
+             patch('src.v4_liquidity_provider.price_to_tick', return_value=-150), \
+             patch('src.v4_liquidity_provider.tick_to_price', return_value=0.005):
+            result = provider.create_ladder(config, auto_create_pool=True, skip_approvals=False)
+
+        # pool_id should have been cleared, pool created with user's fee
+        assert result.pool_created is True
+        assert config.pool_id is None
 
     def test_create_ladder_tick_alignment(self, provider, config):
         """Ticks not aligned to tick_spacing get re-aligned."""
