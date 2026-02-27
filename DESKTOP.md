@@ -602,9 +602,16 @@ except:
 ### UI
 - [x] QMutex защищает provider sync
 - [x] Worker cleanup в closeEvent
-- [x] BaseException handlers в workers
+- [x] BaseException handlers в workers (emit signals, not swallow)
 - [x] threading.excepthook для uncaught
 - [x] Live settings reload
+- [x] _load_pool_worker safe cleanup перед перезаписью
+- [x] _on_finished deferred deleteLater (через finished signal)
+- [x] advanced_tab wait() перед deleteLater
+- [x] _cleanup_workers покрывает все worker типы
+- [x] _row_index очищается в _clear_list/_remove_selected
+- [x] SwapPreviewDialog останавливает QuoteWorker при Cancel
+- [x] Session close() для KyberSwap/OKX/DexSwap
 
 ### Тесты
 - [x] 1312 тестов, все passing
@@ -612,6 +619,15 @@ except:
 - [x] Contract coverage 100% (V3 PM, pool factory)
 - [ ] UI layer coverage 4-16% — **НИЗКОЕ**
 - [ ] okx_dex.py coverage 0% — **НЕ ТЕСТИРОВАНО**
+
+### Известные нефиксированные баги
+- [ ] **H1: PCS V3 swap ABI mismatch** — `dex_swap.py` использует Uniswap ABI (7-field struct + multicall с deadline), PCS SmartRouter ожидает 8-field struct + multicall без deadline. V3 свапы на BSC ревертятся. Замаскировано auto-режимом (V3 = последний fallback). Исправлено в web версии (v22 #4), НЕ портировано в десктоп.
+- [ ] **M8: _secure_zero на immutable bytes** — `crypto.py` вызывает ctypes.memset на `bytes` (CPython хак, может сломаться в 3.12+)
+- [ ] **M10: GraphQL injection** — `subgraph.py` интерполирует pool_id в запрос без валидации
+- [ ] **L1: calculate_liquidity returns None** — `liquidity0 or liquidity1` = None когда liquidity0=0
+- [ ] **L2: negative tick_spacing OverflowError** — `to_pancake_tuple()` использует `1<<256` вместо `1<<24`
+- [ ] **L5: OKX sell_tokens без NonceManager** — nonce collision при multi-token sell
+- [ ] **L6: KyberSwap slippage floor 3%** — десктоп 3%, веб 0.5%
 
 ---
 
