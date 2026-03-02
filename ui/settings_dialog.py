@@ -321,6 +321,34 @@ class SettingsDialog(QDialog):
         okx_layout.addStretch()
         tabs.addTab(okx_tab, "OKX DEX")
 
+        # Codex API Tab (pool search by token address)
+        codex_tab = QWidget()
+        codex_layout = QVBoxLayout(codex_tab)
+
+        codex_group = QGroupBox("Codex API (Pool Search)")
+        codex_group_layout = QVBoxLayout(codex_group)
+
+        codex_key_row = QHBoxLayout()
+        codex_key_row.addWidget(QLabel("API Key:"))
+        self.codex_api_key_input = QLineEdit()
+        self.codex_api_key_input.setPlaceholderText("Enter your Codex API key")
+        self.codex_api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        codex_key_row.addWidget(self.codex_api_key_input)
+        codex_group_layout.addLayout(codex_key_row)
+
+        codex_info = QLabel(
+            "Get a free API key at: dashboard.codex.io\n"
+            "Free tier: 10,000 requests/month.\n\n"
+            "Used for searching pools by token contract address\n"
+            "on the Create tab (top 5 USDT/USDC pools by liquidity)."
+        )
+        codex_info.setStyleSheet("color: #888; font-size: 11px;")
+        codex_group_layout.addWidget(codex_info)
+
+        codex_layout.addWidget(codex_group)
+        codex_layout.addStretch()
+        tabs.addTab(codex_tab, "Codex API")
+
         layout.addWidget(tabs)
 
         # Buttons
@@ -429,6 +457,10 @@ class SettingsDialog(QDialog):
         self.okx_slippage_spin.setValue(
             self.settings.value("okx/slippage", 1.0, type=float)
         )
+        # Codex API
+        self.codex_api_key_input.setText(
+            self.settings.value("codex/api_key", "")
+        )
 
     def save_settings(self):
         """Save settings to QSettings."""
@@ -456,6 +488,8 @@ class SettingsDialog(QDialog):
         self.settings.setValue("okx/passphrase", self.okx_passphrase_input.text())
         self.settings.setValue("okx/project_id", self.okx_project_input.text())
         self.settings.setValue("okx/slippage", self.okx_slippage_spin.value())
+        # Codex API
+        self.settings.setValue("codex/api_key", self.codex_api_key_input.text())
 
         self.accept()
 

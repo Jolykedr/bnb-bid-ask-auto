@@ -280,6 +280,21 @@ def calculate_bid_ask_distribution(
         # Using invert=True would give 1/raw_price, causing wrong liquidity for
         # pairs where stablecoin has the lower address (invert_price=True).
         # Human-readable prices (lines 262-267) are only for display.
+        #
+        # CRITICAL: Raw prices follow POOL order (currency0/currency1), but
+        # calculate_liquidity_from_usd expects DESKTOP order (token0=volatile, token1=stable).
+        # When invert_price=True, pool order is REVERSED from desktop order:
+        #   pool currency0 = stablecoin, currency1 = volatile
+        # So we must swap decimals and token1_is_stable to match pool convention.
+        if invert_price:
+            liq_t0_dec = token1_decimals   # pool currency0 = desktop token1 (stablecoin)
+            liq_t1_dec = token0_decimals   # pool currency1 = desktop token0 (volatile)
+            liq_t1_stable = False          # pool's "token1" = volatile, not stable
+        else:
+            liq_t0_dec = token0_decimals
+            liq_t1_dec = token1_decimals
+            liq_t1_stable = token1_is_stable
+
         if decimal_tick_offset != 0:
             # Pool-space raw prices for correct liquidity computation
             pool_price_lower = tick_to_price(pool_tick_lower, invert=False)
@@ -293,9 +308,9 @@ def calculate_bid_ask_distribution(
                 price_lower=pool_price_lower,
                 price_upper=pool_price_upper,
                 current_price=pool_current_price,
-                token0_decimals=token0_decimals,
-                token1_decimals=token1_decimals,
-                token1_is_stable=token1_is_stable
+                token0_decimals=liq_t0_dec,
+                token1_decimals=liq_t1_dec,
+                token1_is_stable=liq_t1_stable
             )
         else:
             # Same decimals (e.g. BNB chain 18/18) — still use raw prices from ticks
@@ -308,9 +323,9 @@ def calculate_bid_ask_distribution(
                 price_lower=raw_price_lower,
                 price_upper=raw_price_upper,
                 current_price=raw_current_price,
-                token0_decimals=token0_decimals,
-                token1_decimals=token1_decimals,
-                token1_is_stable=token1_is_stable
+                token0_decimals=liq_t0_dec,
+                token1_decimals=liq_t1_dec,
+                token1_is_stable=liq_t1_stable
             )
 
         positions.append(BidAskPosition(

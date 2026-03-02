@@ -8,7 +8,8 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QLabel, QLineEdit, QComboBox, QPushButton,
     QTextEdit, QProgressBar, QMessageBox, QDoubleSpinBox,
-    QSpinBox, QCheckBox, QSplitter, QFrame, QScrollArea
+    QSpinBox, QCheckBox, QSplitter, QFrame, QScrollArea,
+    QListWidget, QListWidgetItem
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
 from PyQt6.QtGui import QFont
@@ -71,6 +72,32 @@ def _parse_price_text(text: str) -> float:
             # Build normal decimal: "0." + "0" * zeros_count + significant
             return float("0." + "0" * zeros_count + after)
     return float(text)
+
+
+class SearchPoolWorker(QThread):
+    """Worker thread for searching pools by token CA via Codex API."""
+
+    results = pyqtSignal(list)   # list of pool dicts
+    error = pyqtSignal(str)
+
+    def __init__(self, token_address, chain_id, dex_key, api_key, proxy=None):
+        super().__init__()
+        self.token_address = token_address
+        self.chain_id = chain_id
+        self.dex_key = dex_key
+        self.api_key = api_key
+        self.proxy = proxy
+
+    def run(self):
+        try:
+            from src.codex_api import search_pools_by_token
+            pools = search_pools_by_token(
+                self.token_address, self.chain_id, self.dex_key,
+                self.api_key, self.proxy
+            )
+            self.results.emit(pools)
+        except BaseException as e:
+            self.error.emit(str(e))
 
 
 class LoadPoolWorker(QThread):
@@ -945,6 +972,7 @@ class CreateTab(QWidget):
         self.worker = None
         self._balance_worker = None
         self._pool_create_worker = None
+        self._search_pool_worker = None
         self.custom_tokens = {}  # symbol -> address mapping
         self.loaded_v4_pool_id = None  # Store loaded V4 pool ID for verification
         self._detected_v3_dex = None  # Store detected V3 DEX config (Uniswap/PancakeSwap)
@@ -1137,6 +1165,23 @@ class CreateTab(QWidget):
         self.pool_info_label.setObjectName("subtitleLabel")
         self.pool_info_label.setWordWrap(True)
         token_layout.addWidget(self.pool_info_label)
+
+        # Search pool by token CA (Codex API)
+        search_row = QHBoxLayout()
+        self.token_search_input = QLineEdit()
+        self.token_search_input.setPlaceholderText("Search by token CA (0x...) — top 5 USDT/USDC pools")
+        search_row.addWidget(self.token_search_input, 1)
+        self.search_pool_btn = QPushButton("Search")
+        self.search_pool_btn.setMaximumWidth(70)
+        self.search_pool_btn.clicked.connect(self._on_search_pool)
+        search_row.addWidget(self.search_pool_btn)
+        token_layout.addLayout(search_row)
+
+        self.pool_search_results = QListWidget()
+        self.pool_search_results.setMaximumHeight(120)
+        self.pool_search_results.setVisible(False)
+        self.pool_search_results.itemClicked.connect(self._on_pool_search_item_clicked)
+        token_layout.addWidget(self.pool_search_results)
 
         # Separator
         separator = QLabel("— OR enter tokens manually —")
@@ -2599,6 +2644,119 @@ class CreateTab(QWidget):
         self.settings.remove("network_index")
         self.settings.setValue("remember", False)
         self.save_wallet_cb.setChecked(False)
+
+    # ── Pool search by token CA (Codex API) ──────────────────────
+
+    def _on_search_pool(self):
+        """Start searching pools by token contract address."""
+        from src.codex_api import is_contract_address
+
+        token_ca = self.token_search_input.text().strip()
+        if not is_contract_address(token_ca):
+            QMessageBox.warning(self, "Invalid Address",
+                                "Enter a valid token contract address (0x + 40 hex chars).")
+            return
+
+        # Determine chain_id and dex_key from current selections
+        network = self._get_current_network()
+        protocol_text = self.protocol_combo.currentText().lower()
+        if "pancakeswap" in protocol_text:
+            dex_key = "pancakeswap"
+        else:
+            dex_key = "uniswap"
+
+        # Get Codex API key from settings
+        s = QSettings("BNBLiquidityLadder", "Settings")
+        api_key = s.value("codex/api_key", "")
+        if not api_key:
+            QMessageBox.warning(self, "API Key Missing",
+                                "Set Codex API key in Settings → Codex API tab.")
+            return
+
+        # Proxy
+        proxy_config = self._get_proxy_config()
+        proxy_url = proxy_config.get("https") if proxy_config else None
+
+        # Clean up previous worker
+        if self._search_pool_worker is not None:
+            old = self._search_pool_worker
+            self._search_pool_worker = None
+            try:
+                if old.isRunning():
+                    old.quit()
+                    old.wait(3000)
+                old.deleteLater()
+            except RuntimeError:
+                pass
+
+        self.search_pool_btn.setEnabled(False)
+        self.search_pool_btn.setText("...")
+        self.pool_search_results.clear()
+        self.pool_search_results.setVisible(False)
+
+        w = SearchPoolWorker(token_ca, network.chain_id, dex_key, api_key, proxy_url)
+        self._search_pool_worker = w
+        w.results.connect(self._on_search_pool_results)
+        w.error.connect(self._on_search_pool_error)
+        w.finished.connect(lambda: self.search_pool_btn.setEnabled(True))
+        w.finished.connect(lambda: self.search_pool_btn.setText("Search"))
+        w.finished.connect(lambda dead=w: self._on_search_pool_worker_done(dead))
+        w.start()
+
+    def _on_search_pool_worker_done(self, worker):
+        if self._search_pool_worker is worker:
+            self._search_pool_worker = None
+        try:
+            worker.deleteLater()
+        except RuntimeError:
+            pass
+
+    def _on_search_pool_results(self, pools: list):
+        """Display pool search results in the list widget."""
+        self.pool_search_results.clear()
+        if not pools:
+            self.pool_search_results.setVisible(True)
+            item = QListWidgetItem("No USDT/USDC pools found for this token")
+            item.setData(Qt.ItemDataRole.UserRole, None)
+            self.pool_search_results.addItem(item)
+            return
+
+        self.pool_search_results.setVisible(True)
+        for p in pools:
+            liq = p.get("liquidity_usd", 0)
+            if liq >= 1_000_000:
+                liq_str = f"${liq / 1_000_000:.1f}M"
+            elif liq >= 1_000:
+                liq_str = f"${liq / 1_000:.0f}k"
+            else:
+                liq_str = f"${liq:.0f}"
+
+            fee_pct = p.get("fee", 0) / 10_000
+            label = (f"{p['token0_symbol']}/{p['token1_symbol']}  "
+                     f"fee={fee_pct:.2f}%  liq={liq_str}  "
+                     f"[{p['pool_address'][:8]}…]")
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, p)
+            self.pool_search_results.addItem(item)
+
+    def _on_search_pool_error(self, error_msg: str):
+        """Handle pool search error."""
+        self.pool_search_results.clear()
+        self.pool_search_results.setVisible(True)
+        item = QListWidgetItem(f"Error: {error_msg[:100]}")
+        item.setData(Qt.ItemDataRole.UserRole, None)
+        self.pool_search_results.addItem(item)
+
+    def _on_pool_search_item_clicked(self, item: QListWidgetItem):
+        """Fill pool_input with selected pool and trigger load."""
+        pool_data = item.data(Qt.ItemDataRole.UserRole)
+        if pool_data is None:
+            return
+
+        pool_addr = pool_data["pool_address"]
+        self.pool_input.setText(pool_addr)
+        self.pool_search_results.setVisible(False)
+        self._load_pool_info()
 
     def _load_pool_info(self):
         """Load pool info via worker thread (non-blocking)."""
