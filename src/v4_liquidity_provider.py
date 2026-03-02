@@ -642,10 +642,15 @@ class V4LiquidityProvider:
         token_address: str,
         amount: int,
         spender: str = None,
-        timeout: int = 120
+        timeout: int = 120,
+        unlimited: bool = False
     ) -> Optional[str]:
         """
         Check and approve token if needed.
+
+        Args:
+            amount: Required amount (for allowance check).
+            unlimited: If True, approve max_uint256 instead of exact amount.
 
         Returns tx_hash if approval was sent, None if already approved.
         """
@@ -676,12 +681,12 @@ class V4LiquidityProvider:
             logger.info("ERC20 allowance sufficient, skipping approve")
             return None
 
-        max_uint256 = 2**256 - 1
-        logger.info(f"Sending ERC20 approve: token={token_address[:10]}... -> spender={spender[:10]}...")
+        approve_amount = 2**256 - 1 if unlimited else amount
+        logger.info(f"Sending ERC20 approve: token={token_address[:10]}... -> spender={spender[:10]}..., amount={approve_amount}")
 
         approve_fn = token.functions.approve(
             Web3.to_checksum_address(spender),
-            max_uint256
+            approve_amount
         )
 
         # Use gas estimation with fallback
@@ -1091,8 +1096,8 @@ class V4LiquidityProvider:
             base_token = pool_key.currency0
             base_decimals = config.token0_decimals if pool_key.currency0.lower() == config.token0.lower() else config.token1_decimals
 
-        # Use 3x multiplier for safety (slippage + liquidity calculation variations)
-        safety_multiplier = 3
+        # Use 1.3x multiplier (user's total_usd + 30% buffer for slippage/rounding)
+        safety_multiplier = 1.3
         total_quote = int(config.total_usd * (10 ** quote_decimals) * safety_multiplier)
 
         # Calculate base token amount using current price
@@ -1157,13 +1162,14 @@ class V4LiquidityProvider:
             # === BASE TOKEN (Volatile) ===
             logger.info("=== Base Token (Volatile) ===")
 
-            # Step 1b: ERC20 approve base to Permit2
+            # Step 1b: ERC20 approve base to Permit2 (unlimited — volatile price can change)
             logger.info("Step 1b: ERC20 approve base to Permit2...")
             base_erc20_tx = self.check_and_approve_token(
                 base_token,
                 total_base,
                 spender=permit2_addr,
-                timeout=timeout
+                timeout=timeout,
+                unlimited=True
             )
             result['base_erc20_approve_tx'] = base_erc20_tx
             if base_erc20_tx:

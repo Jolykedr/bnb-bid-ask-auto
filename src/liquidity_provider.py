@@ -451,12 +451,11 @@ class LiquidityProvider:
             logger.info(f"Token {token_address[:10]}... already approved")
             return None
 
-        logger.info(f"Approving token {token_address[:10]}...")
+        logger.info(f"Approving token {token_address[:10]}..., amount={amount}")
 
-        max_uint256 = 2**256 - 1
         approve_fn = token.functions.approve(
             Web3.to_checksum_address(spender),
-            max_uint256
+            amount
         )
 
         # Use gas estimation with fallback
@@ -719,9 +718,10 @@ class LiquidityProvider:
             )
             logger.info(f"After filtering: {len(positions)} positions, total stablecoin: {total_stablecoin_amount}")
 
-        # Approve стейблкоин (оригинальный config.token1)
-        logger.info(f"Approving stablecoin {stablecoin[:15]}... amount={total_stablecoin_amount} to PM={self.position_manager_address[:15]}...")
-        self.check_and_approve_tokens(stablecoin, total_stablecoin_amount, timeout=timeout)
+        # Approve стейблкоин (оригинальный config.token1) с 1.3x буфером
+        approve_amount = int(total_stablecoin_amount * 1.3)
+        logger.info(f"Approving stablecoin {stablecoin[:15]}... amount={approve_amount} (base={total_stablecoin_amount} x1.3) to PM={self.position_manager_address[:15]}...")
+        self.check_and_approve_tokens(stablecoin, approve_amount, timeout=timeout)
 
         # Verify approval
         from .contracts.abis import ERC20_ABI
