@@ -1096,8 +1096,8 @@ class V4LiquidityProvider:
             base_token = pool_key.currency0
             base_decimals = config.token0_decimals if pool_key.currency0.lower() == config.token0.lower() else config.token1_decimals
 
-        # Use 1.3x multiplier (user's total_usd + 30% buffer for slippage/rounding)
-        safety_multiplier = 1.3
+        # Use 3x multiplier (V4 uses 2x safety_margin on amounts + slippage/rounding)
+        safety_multiplier = 3
         total_quote = int(config.total_usd * (10 ** quote_decimals) * safety_multiplier)
 
         # Calculate base token amount using current price

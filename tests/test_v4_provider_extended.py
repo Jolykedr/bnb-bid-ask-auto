@@ -1007,7 +1007,7 @@ class TestApproveTokensForLadder:
         assert "Approval failed" in result['error']
 
     def test_approve_uses_safety_multiplier(self, provider, config):
-        """Approval amounts use 1.3x safety multiplier."""
+        """Approval amounts use 3x safety multiplier."""
         provider._get_quote_token = Mock(return_value=(TOKEN_STABLE, 18))
 
         mock_pool_key = Mock()
@@ -1020,8 +1020,8 @@ class TestApproveTokensForLadder:
 
         result = provider.approve_tokens_for_ladder(config)
 
-        # check_and_approve_token called with amount = total_usd * 10^18 * 1.3
-        expected_quote_amount = int(100.0 * (10 ** 18) * 1.3)
+        # check_and_approve_token called with amount = total_usd * 10^18 * 3
+        expected_quote_amount = int(100.0 * (10 ** 18) * 3)
         first_call_amount = provider.check_and_approve_token.call_args_list[0][0][1]
         assert first_call_amount == expected_quote_amount
 
