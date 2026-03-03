@@ -30,6 +30,7 @@ from src.contracts.v4 import V4PositionManager, V4Protocol
 from src.contracts.v4.constants import get_v4_addresses, UNISWAP_V4_ADDRESSES, PANCAKESWAP_V4_ADDRESSES
 from src.contracts.v4.pool_manager import V4PoolManager
 from src.liquidity_provider import LiquidityProvider
+from src.multicall.batcher import Multicall3Batcher
 from src.dex_swap import DexSwap
 from ui.swap_preview_dialog import SwapPreviewDialog
 
@@ -835,6 +836,153 @@ class BatchCloseWorker(QThread):
 
 
 
+class BatchCollectWorker(QThread):
+    """Worker thread for batch collecting fees from positions (V3 + V4)."""
+
+    progress = pyqtSignal(str)
+    collect_result = pyqtSignal(bool, str, dict)  # success, message, data
+
+    def __init__(self, provider, positions_data: dict, token_ids: list, chain_id: int = 56):
+        super().__init__()
+        self.provider = provider
+        self.positions_data = positions_data
+        self.token_ids = token_ids
+        self.chain_id = chain_id
+
+    def run(self):
+        try:
+            w3 = self.provider.w3
+            wallet = self.provider.account.address
+
+            # Group by protocol
+            v3_pancake_ids = []
+            v3_uniswap_ids = []
+            v4_by_protocol = {}  # protocol_str -> list of position dicts
+
+            for tid in self.token_ids:
+                pos = self.positions_data.get(tid, {})
+                protocol = pos.get('protocol', '') if pos else ''
+                if protocol.startswith('v4'):
+                    v4_by_protocol.setdefault(protocol, []).append(pos)
+                elif protocol == 'v3_uniswap':
+                    v3_uniswap_ids.append(tid)
+                else:
+                    v3_pancake_ids.append(tid)
+
+            results = []
+
+            # V3 PancakeSwap: batcher with collect calls
+            if v3_pancake_ids:
+                self.progress.emit(f"Collecting fees from {len(v3_pancake_ids)} PancakeSwap V3 positions...")
+                try:
+                    pm_addr = self.provider.position_manager_address
+                    batcher = Multicall3Batcher(w3, account=self.provider.account)
+                    for tid in v3_pancake_ids:
+                        batcher.add_collect_call(pm_addr, tid, wallet)
+                    tx_hash, _, receipt, _ = batcher.execute(
+                        position_manager_address=pm_addr,
+                        timeout=300
+                    )
+                    success = receipt.get('status', 0) == 1
+                    results.append(('PCS V3', tx_hash, success))
+                    self.progress.emit(f"PCS V3 collect {'OK' if success else 'FAILED'}: {tx_hash}")
+                except Exception as e:
+                    self.progress.emit(f"PCS V3 collect failed: {e}")
+                    results.append(('PCS V3', None, False))
+
+            # V3 Uniswap: batcher with uniswap PM
+            if v3_uniswap_ids:
+                self.progress.emit(f"Collecting fees from {len(v3_uniswap_ids)} Uniswap V3 positions...")
+                try:
+                    if self.chain_id in V3_DEXES and "uniswap" in V3_DEXES[self.chain_id]:
+                        uniswap_config = V3_DEXES[self.chain_id]["uniswap"]
+                        pm_addr = uniswap_config.position_manager
+                        batcher = Multicall3Batcher(w3, account=self.provider.account)
+                        for tid in v3_uniswap_ids:
+                            batcher.add_collect_call(pm_addr, tid, wallet)
+                        tx_hash, _, receipt, _ = batcher.execute(
+                            position_manager_address=pm_addr,
+                            timeout=300
+                        )
+                        success = receipt.get('status', 0) == 1
+                        results.append(('Uni V3', tx_hash, success))
+                        self.progress.emit(f"Uni V3 collect {'OK' if success else 'FAILED'}: {tx_hash}")
+                    else:
+                        self.progress.emit("Uniswap V3 not configured for this chain")
+                        results.append(('Uni V3', None, False))
+                except Exception as e:
+                    self.progress.emit(f"Uni V3 collect failed: {e}")
+                    results.append(('Uni V3', None, False))
+
+            # V4: group by protocol, build batch collect payload
+            for proto_str, positions in v4_by_protocol.items():
+                self.progress.emit(f"Collecting fees from {len(positions)} {proto_str} positions...")
+                try:
+                    v4_pm = _create_v4_position_manager(w3, self.provider.account, proto_str, self.chain_id,
+                                                        proxy=getattr(self.provider, 'proxy', None))
+
+                    # Normalize position data
+                    normalized = []
+                    null_addr = "0x0000000000000000000000000000000000000000"
+                    for pos in positions:
+                        c0 = pos.get('currency0') or pos.get('token0', '')
+                        c1 = pos.get('currency1') or pos.get('token1', '')
+                        if not c0 or not c1 or c0 == null_addr or c1 == null_addr:
+                            self.progress.emit(f"Skipping {pos.get('token_id')}: missing token addresses")
+                            continue
+                        normalized.append({
+                            'token_id': pos['token_id'],
+                            'currency0': c0,
+                            'currency1': c1,
+                        })
+
+                    if not normalized:
+                        continue
+
+                    unlock_data = v4_pm.build_batch_collect_payload(normalized, wallet)
+                    deadline = int(time.time()) + 3600
+                    gas_limit = max(300000, len(normalized) * 150000)
+
+                    tx_hash, _, receipt = v4_pm.execute_modify_liquidities(
+                        unlock_data=unlock_data,
+                        deadline=deadline,
+                        gas_limit=gas_limit,
+                        timeout=300
+                    )
+                    success = receipt.get('status', 0) == 1
+                    results.append((proto_str, tx_hash, success))
+                    self.progress.emit(f"{proto_str} collect {'OK' if success else 'FAILED'}: {tx_hash}")
+
+                except Exception as e:
+                    self.progress.emit(f"{proto_str} collect failed: {e}")
+                    results.append((proto_str, None, False))
+
+            # Build result
+            all_success = all(r[2] for r in results) if results else False
+            tx_hashes = [r[1] for r in results if r[1]]
+            result_data = {
+                'tx_hashes': tx_hashes,
+                'token_ids': self.token_ids,
+            }
+
+            if all_success:
+                self.collect_result.emit(True, f"Collected fees from {len(self.token_ids)} positions", result_data)
+            elif any(r[2] for r in results):
+                self.collect_result.emit(True, "Some fee collections succeeded, some failed", result_data)
+            else:
+                self.collect_result.emit(False, "Fee collection failed", result_data)
+
+        except Exception as e:
+            self.progress.emit(f"Batch collect failed: {e}")
+            self.collect_result.emit(False, str(e), {})
+        except BaseException as e:
+            logger.critical(f"BaseException in BatchCollectWorker: {e}", exc_info=True)
+            try:
+                self.collect_result.emit(False, f"Fatal: {e}", {})
+            except Exception:
+                pass
+
+
 class SwapWorker(QThread):
     """Worker thread for executing swaps after position close (via KyberSwap/DEX)."""
 
@@ -951,6 +1099,7 @@ class ManageTab(QWidget):
         self.positions_data = {}  # token_id -> position data
         self._positions_mutex = QMutex()  # Protects positions_data access
         self.worker = None
+        self._collect_worker = None
         self.load_workers = []  # Legacy compat — now means _active_workers
         self.scan_worker = None
         self._worker_queue = []  # [(token_id, protocol)] pending work
@@ -1193,6 +1342,13 @@ class ManageTab(QWidget):
         self.batch_close_btn.clicked.connect(self._batch_close_all)
         self.batch_close_btn.setEnabled(False)
         action_layout.addWidget(self.batch_close_btn)
+
+        self.collect_fees_btn = QPushButton("💰 Collect Fees")
+        self.collect_fees_btn.setToolTip("Collect fees from selected positions (or all with fees if none selected)")
+        self.collect_fees_btn.setStyleSheet("QPushButton { background-color: #28a745; color: white; } QPushButton:hover { background-color: #218838; } QPushButton:disabled { background-color: #6c757d; }")
+        self.collect_fees_btn.clicked.connect(self._batch_collect_fees)
+        self.collect_fees_btn.setEnabled(False)
+        action_layout.addWidget(self.collect_fees_btn)
 
         self.remove_selected_btn = QPushButton("Remove from List")
         self.remove_selected_btn.clicked.connect(self._remove_selected)
@@ -2300,6 +2456,15 @@ class ManageTab(QWidget):
         if v4_active_count > 0:
             self.batch_close_btn.setText(f"🚀 Close All V4 (1 TX) [{v4_active_count}]")
 
+        # Enable collect fees when any positions are loaded
+        # (V4 tokens_owed may be 0 in UI but fees exist on-chain)
+        pos_count = len(self.positions_data)
+        self.collect_fees_btn.setEnabled(pos_count > 0)
+        if pos_count > 0:
+            self.collect_fees_btn.setText(f"💰 Collect Fees [{pos_count}]")
+        else:
+            self.collect_fees_btn.setText("💰 Collect Fees")
+
     def _get_selected_token_ids(self) -> list:
         """Get token IDs of selected rows."""
         selected_rows = set(item.row() for item in self.positions_table.selectedItems())
@@ -2468,6 +2633,7 @@ class ManageTab(QWidget):
         self.close_selected_btn.setEnabled(False)
         self.close_all_btn.setEnabled(False)
         self.batch_close_btn.setEnabled(False)
+        self.collect_fees_btn.setEnabled(False)
 
         self._log(f"Starting batch close of {len(v4_positions)} V4 positions...")
 
@@ -2489,6 +2655,7 @@ class ManageTab(QWidget):
             self.close_selected_btn.setEnabled(True)
             self.close_all_btn.setEnabled(True)
             self.batch_close_btn.setEnabled(True)
+            self.collect_fees_btn.setEnabled(True)
 
             if success:
                 self._log(f"SUCCESS: {message}")
@@ -2512,6 +2679,83 @@ class ManageTab(QWidget):
         except Exception as e:
             logger.exception(f"Error in _on_batch_close_finished: {e}")
             self._log(f"Error in batch close handler: {e}")
+
+    def _batch_collect_fees(self):
+        """Collect fees from selected positions (or all with fees if none selected)."""
+        if not self.provider:
+            QMessageBox.warning(self, "Error", "Provider not connected.")
+            return
+
+        # Get selected or all positions
+        selected_ids = self._get_selected_token_ids()
+        if selected_ids:
+            collect_ids = [
+                tid for tid in selected_ids
+                if tid in self.positions_data and self.positions_data[tid]
+            ]
+        else:
+            # No selection — collect from all loaded positions
+            collect_ids = [tid for tid, p in self.positions_data.items() if p]
+
+        if not collect_ids:
+            QMessageBox.warning(self, "No Positions", "No positions to collect fees from.")
+            return
+
+        # Confirmation
+        reply = QMessageBox.question(
+            self, "Confirm Collect Fees",
+            f"Collect fees from {len(collect_ids)} position(s)?\n\n"
+            f"Token IDs: {collect_ids}\n\n"
+            "This will collect accrued fees WITHOUT removing liquidity.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        chain_id = getattr(self.provider, 'chain_id', 56)
+
+        # Disable buttons, show progress
+        self.progress_bar.show()
+        self.close_selected_btn.setEnabled(False)
+        self.close_all_btn.setEnabled(False)
+        self.batch_close_btn.setEnabled(False)
+        self.collect_fees_btn.setEnabled(False)
+
+        self._collect_worker = BatchCollectWorker(
+            self.provider, self.positions_data, collect_ids, chain_id
+        )
+        self._collect_worker.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
+        self._collect_worker.collect_result.connect(self._on_batch_collect_finished, Qt.ConnectionType.QueuedConnection)
+        self._collect_worker.start()
+
+    def _on_batch_collect_finished(self, success: bool, message: str, data: dict):
+        """Handle batch collect fees completion."""
+        try:
+            if hasattr(self, '_collect_worker') and self._collect_worker is not None:
+                self._safe_cleanup_worker(self._collect_worker)
+                self._collect_worker = None
+            self.progress_bar.hide()
+            self.close_selected_btn.setEnabled(True)
+            self.close_all_btn.setEnabled(True)
+            self.batch_close_btn.setEnabled(True)
+            self.collect_fees_btn.setEnabled(True)
+
+            if success:
+                tx_hashes = data.get('tx_hashes', [])
+                self._log(f"SUCCESS: {message}")
+                for tx_hash in tx_hashes:
+                    self._log(f"TX Hash: {tx_hash}")
+                QMessageBox.information(
+                    self, "Collect Fees Success",
+                    f"{message}\n\nTX: {', '.join(tx_hashes) if tx_hashes else 'N/A'}"
+                )
+                self._refresh_all_positions()
+            else:
+                self._log(f"FAILED: {message}")
+                QMessageBox.critical(self, "Collect Fees Failed", f"Failed:\n{message}")
+        except Exception as e:
+            logger.exception(f"Error in _on_batch_collect_finished: {e}")
+            self._log(f"Error in collect fees handler: {e}")
 
     def _close_positions(self, token_ids: list):
         """Close specified positions."""
@@ -2578,6 +2822,7 @@ class ManageTab(QWidget):
         self.close_selected_btn.setEnabled(False)
         self.close_all_btn.setEnabled(False)
         self.batch_close_btn.setEnabled(False)
+        self.collect_fees_btn.setEnabled(False)
 
         # Get initial investment for PnL calculation
         initial_investment = self.initial_investment_spin.value()
@@ -2605,6 +2850,7 @@ class ManageTab(QWidget):
             self.close_selected_btn.setEnabled(True)
             self.close_all_btn.setEnabled(True)
             self.batch_close_btn.setEnabled(True)
+            self.collect_fees_btn.setEnabled(True)
 
             if success:
                 self._log(f"SUCCESS: {message}")
