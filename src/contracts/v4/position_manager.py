@@ -708,6 +708,51 @@ class V4PositionManager:
 
         return self._encode_actions(all_actions)
 
+    def build_batch_collect_payload(
+        self,
+        positions: List[dict],
+        recipient: str,
+    ) -> bytes:
+        """
+        Build payload for collecting fees from MULTIPLE positions in ONE transaction.
+
+        Uses DECREASE_LIQUIDITY with liquidity=0 to settle accrued fees,
+        then TAKE_PAIR to withdraw them. Liquidity is NOT removed.
+
+        Args:
+            positions: List of dicts with {token_id, currency0, currency1}
+            recipient: Address to receive collected fees
+
+        Returns:
+            Encoded payload for modifyLiquidities
+        """
+        all_actions = []
+        token_pairs = set()
+
+        for pos in positions:
+            # DECREASE_LIQUIDITY with liquidity=0 settles accrued fees
+            all_actions.append(self.encode_decrease_liquidity(
+                token_id=pos['token_id'],
+                liquidity=0,
+                amount0_min=0,
+                amount1_min=0,
+            ))
+
+            # Track unique token pairs
+            c0 = Web3.to_checksum_address(pos['currency0'])
+            c1 = Web3.to_checksum_address(pos['currency1'])
+            if c0.lower() > c1.lower():
+                c0, c1 = c1, c0
+            token_pairs.add((c0, c1))
+
+        # ONE TAKE_PAIR per unique token pair to withdraw settled fees
+        for c0, c1 in token_pairs:
+            all_actions.append(self.encode_take_pair(c0, c1, recipient))
+
+        logger.info(f"[V4] Batch collect fees: {len(positions)} positions, {len(token_pairs)} unique pairs, {len(all_actions)} total actions")
+
+        return self._encode_actions(all_actions)
+
     def _encode_actions(self, actions: List[bytes]) -> bytes:
         """
         Encode list of actions into unlockData payload.
