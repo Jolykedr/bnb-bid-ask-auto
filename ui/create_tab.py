@@ -100,6 +100,89 @@ class SearchPoolWorker(QThread):
             self.error.emit(str(e))
 
 
+class ReferencePriceWorker(QThread):
+    """Worker thread for fetching reference (market) price from top-liquidity Codex pool."""
+
+    result = pyqtSignal(dict)   # { reference_price, source_pool, liquidity_usd }
+    error = pyqtSignal(str)
+
+    def __init__(self, volatile_token, chain_id, dex_key, api_key,
+                 rpc_url, proxy=None, exclude_pool=""):
+        super().__init__()
+        self.volatile_token = volatile_token
+        self.chain_id = chain_id
+        self.dex_key = dex_key
+        self.api_key = api_key
+        self.rpc_url = rpc_url
+        self.proxy = proxy
+        self.exclude_pool = exclude_pool
+
+    def run(self):
+        try:
+            from src.codex_api import search_pools_by_token
+            pools = search_pools_by_token(
+                self.volatile_token, self.chain_id, self.dex_key,
+                self.api_key, self.proxy,
+            )
+            if not pools:
+                self.result.emit({"reference_price": None})
+                return
+
+            # Skip the pool we're checking
+            candidates = pools
+            if self.exclude_pool:
+                excl = self.exclude_pool.lower()
+                candidates = [p for p in pools if p["pool_address"].lower() != excl]
+                if not candidates:
+                    candidates = pools
+
+            top = candidates[0]
+            pool_addr = top["pool_address"]
+            # V4 pools (66-char) — can't read slot0
+            if len(pool_addr) != 42:
+                self.result.emit({"reference_price": None})
+                return
+
+            from web3 import Web3
+            if self.proxy:
+                w3 = Web3(Web3.HTTPProvider(endpoint_uri=self.rpc_url, request_kwargs={"proxies": {"https": self.proxy, "http": self.proxy}}))
+            else:
+                w3 = Web3(Web3.HTTPProvider(self.rpc_url))
+            raw = w3.eth.call({
+                'to': Web3.to_checksum_address(pool_addr),
+                'data': bytes.fromhex('3850c7bd'),  # slot0()
+            })
+            if len(raw) < 64:
+                self.result.emit({"reference_price": None})
+                return
+
+            sqrt_price_x96 = int.from_bytes(raw[0:32], 'big')
+            if sqrt_price_x96 == 0:
+                self.result.emit({"reference_price": None})
+                return
+
+            tick_raw = int.from_bytes(raw[32:64], 'big')
+            tick = tick_raw - 2**256 if tick_raw >= 2**255 else tick_raw
+
+            t0_dec = top["token0_decimals"]
+            t1_dec = top["token1_decimals"]
+
+            # Compute price
+            raw_price = 1.0001 ** tick
+            decimal_adj = 10 ** (t0_dec - t1_dec)
+            adjusted = raw_price * decimal_adj
+            invert = is_stablecoin(top["token0_address"])
+            price = (1.0 / adjusted) if invert and adjusted != 0 else adjusted
+
+            self.result.emit({
+                "reference_price": price,
+                "source_pool": pool_addr,
+                "liquidity_usd": top.get("liquidity_usd", 0),
+            })
+        except BaseException as e:
+            self.error.emit(str(e))
+
+
 class LoadPoolWorker(QThread):
     """Worker thread for loading pool info without blocking UI."""
 
@@ -973,6 +1056,7 @@ class CreateTab(QWidget):
         self._balance_worker = None
         self._pool_create_worker = None
         self._search_pool_worker = None
+        self._ref_price_worker = None
         self.custom_tokens = {}  # symbol -> address mapping
         self.loaded_v4_pool_id = None  # Store loaded V4 pool ID for verification
         self._detected_v3_dex = None  # Store detected V3 DEX config (Uniswap/PancakeSwap)
@@ -1001,6 +1085,9 @@ class CreateTab(QWidget):
         if hasattr(self, 'pool_info_label'):
             self.pool_info_label.setText("")
             self.pool_info_label.setStyleSheet("")
+        if hasattr(self, 'price_warning_label'):
+            self.price_warning_label.setVisible(False)
+            self.price_warning_label.setText("")
         self._log("Pool state reset")
 
     def _on_reset_pool(self):
@@ -1258,6 +1345,12 @@ class CreateTab(QWidget):
         self.price_input.textChanged.connect(self._normalize_price_input)
         price_row.addWidget(self.price_input)
         settings_layout.addLayout(price_row)
+
+        # Price deviation warning label (hidden by default)
+        self.price_warning_label = QLabel("")
+        self.price_warning_label.setWordWrap(True)
+        self.price_warning_label.setVisible(False)
+        settings_layout.addWidget(self.price_warning_label)
 
         # Range - supports both positive and negative percentages
         range_row = QHBoxLayout()
@@ -2711,6 +2804,116 @@ class CreateTab(QWidget):
         except RuntimeError:
             pass
 
+    def _fetch_reference_price(self, volatile_token: str, exclude_pool: str = ""):
+        """Start background fetch of reference market price for the volatile token."""
+        # Hide previous warning
+        self.price_warning_label.setVisible(False)
+        self.price_warning_label.setText("")
+
+        if not volatile_token:
+            return
+
+        # Get Codex API key
+        s = QSettings("BNBLiquidityLadder", "Settings")
+        api_key = s.value("codex/api_key", "")
+        if not api_key:
+            return
+
+        network = self._get_current_network()
+        protocol_text = self.protocol_combo.currentText().lower()
+        dex_key = "pancakeswap" if "pancakeswap" in protocol_text else "uniswap"
+        rpc_url = self.rpc_input.text().strip() or network.rpc_url
+        proxy_config = self._get_proxy_config()
+        proxy_url = proxy_config.get("https") if proxy_config else None
+
+        # Cleanup previous worker
+        if self._ref_price_worker is not None:
+            old = self._ref_price_worker
+            self._ref_price_worker = None
+            try:
+                if old.isRunning():
+                    old.quit()
+                    old.wait(3000)
+                old.deleteLater()
+            except RuntimeError:
+                pass
+
+        w = ReferencePriceWorker(
+            volatile_token, network.chain_id, dex_key, api_key,
+            rpc_url, proxy_url, exclude_pool,
+        )
+        self._ref_price_worker = w
+        w.result.connect(self._on_reference_price_result)
+        w.error.connect(lambda e: logger.debug("Reference price error: %s", e))
+        w.finished.connect(lambda dead=w: self._on_ref_price_worker_done(dead))
+        w.start()
+
+    def _on_ref_price_worker_done(self, worker):
+        if self._ref_price_worker is worker:
+            self._ref_price_worker = None
+        try:
+            worker.deleteLater()
+        except RuntimeError:
+            pass
+
+    def _on_reference_price_result(self, data: dict):
+        """Show price deviation warning if pool price differs from market."""
+        ref_price = data.get("reference_price")
+        if ref_price is None or ref_price <= 0:
+            return
+
+        # Get current pool price
+        try:
+            current_price = _parse_price_text(self.price_input.text())
+        except (ValueError, TypeError):
+            return
+        if current_price <= 0:
+            return
+
+        deviation = abs(current_price - ref_price) / ref_price
+
+        if deviation <= 0.15:
+            self.price_warning_label.setVisible(False)
+            return
+
+        liq_usd = data.get("liquidity_usd", 0)
+        liq_str = ""
+        if liq_usd and liq_usd > 0:
+            if liq_usd >= 1_000_000:
+                liq_str = f"  |  Reference pool liquidity: ${liq_usd / 1_000_000:.1f}M"
+            elif liq_usd >= 1_000:
+                liq_str = f"  |  Reference pool liquidity: ${liq_usd / 1_000:.0f}k"
+            else:
+                liq_str = f"  |  Reference pool liquidity: ${liq_usd:.0f}"
+
+        pct = deviation * 100
+        pool_str = _format_price(current_price)
+        ref_str = _format_price(ref_price)
+
+        if deviation > 0.40:
+            # Red warning
+            self.price_warning_label.setStyleSheet(
+                "color: #ff4444; background-color: rgba(255,68,68,0.08); "
+                "border: 1px solid rgba(255,68,68,0.3); border-radius: 6px; padding: 8px;"
+            )
+            self.price_warning_label.setText(
+                f"\u26a0 ABNORMAL PRICE — deviation {pct:.1f}%!\n"
+                f"Pool: {pool_str}  |  Market: {ref_str}{liq_str}\n"
+                f"Entering this pool may result in immediate loss of funds!"
+            )
+        else:
+            # Yellow warning
+            self.price_warning_label.setStyleSheet(
+                "color: #fdcb6e; background-color: rgba(253,203,110,0.08); "
+                "border: 1px solid rgba(253,203,110,0.3); border-radius: 6px; padding: 8px;"
+            )
+            self.price_warning_label.setText(
+                f"\u26a0 Price deviation {pct:.1f}% from market\n"
+                f"Pool: {pool_str}  |  Market: {ref_str}{liq_str}\n"
+                f"Please verify the price before proceeding."
+            )
+        self.price_warning_label.setVisible(True)
+
     def _on_search_pool_results(self, pools: list):
         """Display pool search results in the list widget."""
         self.pool_search_results.clear()
@@ -2893,6 +3096,15 @@ class CreateTab(QWidget):
                 else:
                     self.pool_info_label.setText(f"✅ V4 Pool found on {protocol_name}!\nFee: {fee_percent}%")
                 self.pool_info_label.setStyleSheet("color: #00b894;")
+
+                # Fetch reference price for V4 pool
+                if subgraph:
+                    volatile_token = subgraph.token0_address if not is_stablecoin(subgraph.token0_address) else subgraph.token1_address
+                elif data.get('ui_token0'):
+                    volatile_token = data['ui_token0']
+                else:
+                    volatile_token = self.token0_input.text().strip()
+                self._fetch_reference_price(volatile_token)
             else:
                 # Not found
                 self.pool_info_label.setText("V4 pool ID not found on-chain or in subgraph.\nEnter token addresses manually.")
@@ -2950,5 +3162,9 @@ class CreateTab(QWidget):
                 info_text += f" | Price: {_format_price(display_price)}"
             self.pool_info_label.setText(info_text)
             self.pool_info_label.setStyleSheet("color: #00b894;")
+
+            # Fetch reference price — volatile token is the non-stablecoin side
+            volatile_token = data.get('ui_token0', '')  # ui_token0 = volatile after reorder
+            self._fetch_reference_price(volatile_token, pool_address or '')
 
             self._log(f"Loaded pool: {display_pair}, fee={fee/10000}%")
