@@ -310,61 +310,41 @@ class TestV3ClosePositionsReceiptCheck:
 # ============================================================
 
 class TestSkipApprovalsChecksBaseToken:
-    """skip_approvals должен проверять оба токена: quote И base.
+    """skip_approvals должен проверять quote token.
 
-    Тестируем логику напрямую, читая код create_ladder (skip_approvals блок),
-    вместо мока всего create_ladder (слишком много зависимостей).
+    Base (volatile) token approve теперь условный — только если позиции
+    требуют volatile токен (in-range или на стороне volatile).
     """
 
-    def test_skip_approvals_code_checks_base_erc20(self):
-        """Проверяем что код create_ladder содержит проверку base_erc20_to_permit2."""
+    def test_skip_approvals_code_checks_quote(self):
+        """Проверяем что код create_ladder содержит проверку quote token."""
         import inspect
         from src.v4_liquidity_provider import V4LiquidityProvider
         source = inspect.getsource(V4LiquidityProvider.create_ladder)
 
-        # Новая проверка base token должна быть в коде
-        assert "base_erc20_to_permit2" in source, \
-            "create_ladder должен проверять base_erc20_to_permit2 при skip_approvals"
-        assert "base_permit2_to_position_manager" in source, \
-            "create_ladder должен проверять base_permit2_to_position_manager при skip_approvals"
-        assert "Base ERC20 not approved" in source, \
-            "create_ladder должен выдавать ошибку при отсутствии base ERC20 approval"
-        assert "Base Permit2 allowance EXPIRED" in source, \
-            "create_ladder должен выдавать ошибку при истёкшем base Permit2"
+        assert "erc20_to_permit2" in source, \
+            "create_ladder должен проверять erc20_to_permit2 при skip_approvals"
+        assert "permit2_to_position_manager" in source, \
+            "create_ladder должен проверять permit2_to_position_manager при skip_approvals"
 
-    def test_skip_approvals_checks_4_conditions(self):
-        """skip_approvals проверяет 4 условия: quote ERC20, quote Permit2, base ERC20, base Permit2."""
+    def test_approve_tokens_has_volatile_flag(self):
+        """approve_tokens_for_ladder принимает approve_volatile параметр."""
+        import inspect
+        from src.v4_liquidity_provider import V4LiquidityProvider
+        sig = inspect.signature(V4LiquidityProvider.approve_tokens_for_ladder)
+        assert "approve_volatile" in sig.parameters, \
+            "approve_tokens_for_ladder должен принимать approve_volatile параметр"
+
+    def test_needs_volatile_detection_in_create_ladder(self):
+        """create_ladder определяет needs_volatile перед approve."""
         import inspect
         from src.v4_liquidity_provider import V4LiquidityProvider
         source = inspect.getsource(V4LiquidityProvider.create_ladder)
 
-        # Считаем количество V4LadderResult с success=False в блоке skip_approvals
-        # Должно быть минимум 6 (quote erc20, quote permit2 expired, quote permit2, base erc20, base permit2 expired, base permit2)
-        # Ищем все return с "not approved" или "EXPIRED"
-        approval_error_count = source.count("Base ERC20 not approved") + \
-                              source.count("Base Permit2 allowance EXPIRED") + \
-                              source.count("Base Permit2 not approved") + \
-                              source.count("Quote ERC20 not approved") + \
-                              source.count("Quote Permit2 allowance EXPIRED") + \
-                              source.count("Quote Permit2 not approved")
-        assert approval_error_count >= 6, \
-            f"Ожидается минимум 6 проверок approvals, найдено {approval_error_count}"
-
-    def test_v4_ladder_result_has_base_approval_errors(self):
-        """V4LadderResult может содержать ошибки про base token approvals."""
-        from src.v4_liquidity_provider import V4LadderResult
-
-        result = V4LadderResult(
-            positions=[],
-            tx_hash=None,
-            gas_used=None,
-            token_ids=[],
-            pool_created=False,
-            success=False,
-            error="Base ERC20 not approved to Permit2."
-        )
-        assert result.success is False
-        assert "Base ERC20" in result.error
+        assert "needs_volatile" in source, \
+            "create_ladder должен определять needs_volatile"
+        assert "approve_volatile=needs_volatile" in source, \
+            "create_ladder должен передавать needs_volatile в approve_tokens_for_ladder"
 
 
 # ============================================================
