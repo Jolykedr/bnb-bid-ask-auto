@@ -1137,7 +1137,8 @@ class V4LiquidityProvider:
                 quote_token,
                 total_quote,
                 spender=permit2_addr,
-                timeout=timeout
+                timeout=timeout,
+                unlimited=True
             )
             result['erc20_approve_tx'] = erc20_tx
             if erc20_tx:
@@ -1513,19 +1514,6 @@ class V4LiquidityProvider:
                     error=f"Pool price computation failed: {e}"
                 )
 
-        # Validate balances
-        is_valid, error = self.validate_balances(config)
-        if not is_valid:
-            return V4LadderResult(
-                positions=positions,
-                tx_hash=None,
-                gas_used=None,
-                token_ids=[],
-                pool_created=pool_created,
-                success=False,
-                error=error
-            )
-
         # Determine quote token (stablecoin) for bid positions
         quote_token, quote_decimals = self._get_quote_token(config)
         quote_is_token0 = quote_token.lower() == pool_key.currency0.lower()
@@ -1706,51 +1694,6 @@ class V4LiquidityProvider:
                     error=f"Token approval failed: {approval_result.get('error', 'Unknown error')}"
                 )
 
-            # Verify approvals propagated on-chain (BASE RPC nodes can lag)
-            max_retries = 5
-            retry_delay = 3  # seconds
-            for attempt in range(1, max_retries + 1):
-                approval_state = self.check_approvals(config)
-                all_ok = (
-                    approval_state['erc20_to_permit2']['approved']
-                    and approval_state['permit2_to_position_manager']['approved']
-                    and approval_state['base_erc20_to_permit2']['approved']
-                    and approval_state['base_permit2_to_position_manager']['approved']
-                )
-                if all_ok:
-                    logger.info(f"Approval verification passed (attempt {attempt}/{max_retries})")
-                    break
-                logger.warning(
-                    f"Approval verification failed (attempt {attempt}/{max_retries}), "
-                    f"RPC may be lagging. Retrying in {retry_delay}s..."
-                )
-                if attempt < max_retries:
-                    time.sleep(retry_delay)
-            else:
-                # All retries exhausted
-                details = []
-                if not approval_state['erc20_to_permit2']['approved']:
-                    details.append(f"quote ERC20→Permit2 (have {approval_state['erc20_to_permit2']['allowance']})")
-                if not approval_state['permit2_to_position_manager']['approved']:
-                    details.append("quote Permit2→PM")
-                if not approval_state['base_erc20_to_permit2']['approved']:
-                    details.append(f"base ERC20→Permit2 (have {approval_state['base_erc20_to_permit2']['allowance']})")
-                if not approval_state['base_permit2_to_position_manager']['approved']:
-                    details.append("base Permit2→PM")
-                return V4LadderResult(
-                    positions=positions,
-                    tx_hash=None,
-                    gas_used=None,
-                    token_ids=[],
-                    pool_created=pool_created,
-                    success=False,
-                    error=(
-                        f"Approvals sent but not yet visible on-chain after {max_retries * retry_delay}s. "
-                        f"RPC node lag suspected. Missing: {', '.join(details)}. "
-                        f"Please try again in a minute."
-                    )
-                )
-
         # Build mint actions for all positions
         deadline = int(time.time()) + 3600
 
@@ -1883,47 +1826,6 @@ class V4LiquidityProvider:
 
         logger.info(f"Actions: {len(positions)} MINT_POSITION + 1 SETTLE_PAIR = {len(all_actions)} total")
         logger.info("=" * 50)
-
-        # Final verification of balances and approvals before sending (using batch RPC)
-        logger.info("Final pre-flight checks (batch RPC)...")
-        permit2_addr = get_permit2_address(config.protocol)
-        pos_manager_addr = self.position_manager.position_manager_address
-
-        try:
-            # Use batch RPC for efficient pre-flight checks
-            batch = BatchRPC(self.w3)
-            tokens = [pool_key.currency0, pool_key.currency1]
-
-            for token_addr in tokens:
-                batch.add_balance_of(token_addr, self.account.address)
-                batch.add_allowance(token_addr, self.account.address, permit2_addr)
-
-            results = batch.execute()
-
-            # Parse results: [balance0, allowance0, balance1, allowance1]
-            for i, (token_addr, token_name) in enumerate([(pool_key.currency0, "currency0"), (pool_key.currency1, "currency1")]):
-                balance = results[i * 2] if i * 2 < len(results) else 0
-                erc20_allowance = results[i * 2 + 1] if i * 2 + 1 < len(results) else 0
-
-                # Permit2 allowance requires separate call (complex return type)
-                try:
-                    permit2_contract = self.w3.eth.contract(
-                        address=Web3.to_checksum_address(permit2_addr),
-                        abi=PERMIT2_ABI
-                    )
-                    permit2_allowance = permit2_contract.functions.allowance(
-                        self.account.address,
-                        Web3.to_checksum_address(token_addr),
-                        Web3.to_checksum_address(pos_manager_addr)
-                    ).call()
-                    permit2_info = f"({permit2_allowance[0]}, exp={permit2_allowance[1]})"
-                except Exception:
-                    permit2_info = "(error)"
-
-                logger.info(f"  {token_name} ({token_addr[:10]}...): balance={balance}, ERC20->Permit2={erc20_allowance}, Permit2->PosMan={permit2_info}")
-
-        except Exception as e:
-            logger.warning(f"Pre-flight batch check failed: {e}, continuing anyway...")
 
         logger.info(f"Creating {len(positions)} positions...")
         logger.debug(f"Quote is token0: {quote_is_token0}")
