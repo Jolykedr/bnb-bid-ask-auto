@@ -1732,7 +1732,7 @@ class V4LiquidityProvider:
             slippage_multiplier = 1 + (config.slippage_percent / 100)
 
             # Calculate both token amounts with safety margin
-            safety_margin = 1.2
+            safety_margin = 1.3
             base_token_amount = int(pos.usd_amount / user_price * (10 ** base_decimals) * safety_margin)
             safe_stablecoin = int(stablecoin_amount * safety_margin)
 
