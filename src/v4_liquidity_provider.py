@@ -1808,14 +1808,20 @@ class V4LiquidityProvider:
             )
             all_actions.append(mint_action)
 
-        # Add ONE SETTLE_PAIR at the end for all positions
-        settle_action = self.position_manager.encode_settle_pair(
-            pool_key.currency0,
-            pool_key.currency1
-        )
-        all_actions.append(settle_action)
+        # Settle only tokens that are actually needed
+        if needs_volatile:
+            # Both tokens needed — use SETTLE_PAIR
+            all_actions.append(self.position_manager.encode_settle_pair(
+                pool_key.currency0, pool_key.currency1
+            ))
+            settle_desc = "SETTLE_PAIR"
+        else:
+            # Only stablecoin needed — use single SETTLE to avoid Permit2 check on volatile
+            stablecoin_currency = pool_key.currency0 if quote_is_token0 else pool_key.currency1
+            all_actions.append(self.position_manager.encode_settle(stablecoin_currency))
+            settle_desc = "SETTLE(quote only)"
 
-        logger.info(f"Actions: {len(positions)} MINT_POSITION + 1 SETTLE_PAIR = {len(all_actions)} total")
+        logger.info(f"Actions: {len(positions)} MINT_POSITION + 1 {settle_desc} = {len(all_actions)} total")
         logger.info("=" * 50)
 
         logger.info(f"Creating {len(positions)} positions...")
