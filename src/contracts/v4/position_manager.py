@@ -470,6 +470,16 @@ class V4PositionManager:
         # Return action + params
         return bytes([action]) + params
 
+    def encode_settle(self, currency: str, max_amount: int = 0, payer_is_user: bool = True) -> bytes:
+        """Encode settle action for a single currency."""
+        action = self.actions.SETTLE
+        logger.debug(f"[V4 SETTLE] currency={currency}, max_amount={max_amount}")
+        params = encode(
+            ['address', 'uint256', 'bool'],
+            [Web3.to_checksum_address(currency), max_amount, payer_is_user]
+        )
+        return bytes([action]) + params
+
     def encode_settle_pair(self, currency0: str, currency1: str) -> bytes:
         """Encode settle pair action."""
         action = self.actions.SETTLE_PAIR
