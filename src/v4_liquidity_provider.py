@@ -1059,7 +1059,8 @@ class V4LiquidityProvider:
     def approve_tokens_for_ladder(
         self,
         config: V4LadderConfig,
-        timeout: int = 120
+        timeout: int = 120,
+        approve_volatile: bool = True
     ) -> dict:
         """
         Approve tokens for ladder creation - SEPARATE from position creation.
@@ -1160,39 +1161,40 @@ class V4LiquidityProvider:
             result['permit2_approve_tx'] = permit2_tx
             logger.info(f"Quote Permit2 approve tx: {permit2_tx}")
 
-            # === BASE TOKEN (Volatile) ===
-            logger.info("=== Base Token (Volatile) ===")
+            # === BASE TOKEN (Volatile) — only if needed ===
+            if approve_volatile:
+                logger.info("=== Base Token (Volatile) ===")
 
-            # Step 1b: ERC20 approve base to Permit2 (unlimited — volatile price can change)
-            logger.info("Step 1b: ERC20 approve base to Permit2...")
-            base_erc20_tx = self.check_and_approve_token(
-                base_token,
-                total_base,
-                spender=permit2_addr,
-                timeout=timeout,
-                unlimited=True
-            )
-            result['base_erc20_approve_tx'] = base_erc20_tx
-            if base_erc20_tx:
-                logger.info(f"Base ERC20 approve tx: {base_erc20_tx}")
+                logger.info("Step 1b: ERC20 approve base to Permit2...")
+                base_erc20_tx = self.check_and_approve_token(
+                    base_token,
+                    total_base,
+                    spender=permit2_addr,
+                    timeout=timeout,
+                    unlimited=True
+                )
+                result['base_erc20_approve_tx'] = base_erc20_tx
+                if base_erc20_tx:
+                    logger.info(f"Base ERC20 approve tx: {base_erc20_tx}")
+                else:
+                    logger.info("Base ERC20 already approved to Permit2")
+
+                logger.info("Step 2b: Permit2 approve base to PositionManager...")
+                base_permit2_tx = self.approve_on_permit2(
+                    base_token,
+                    pos_manager_addr,
+                    total_base,
+                    permit2_addr,
+                    timeout=timeout
+                )
+                result['base_permit2_approve_tx'] = base_permit2_tx
+                logger.info(f"Base Permit2 approve tx: {base_permit2_tx}")
             else:
-                logger.info("Base ERC20 already approved to Permit2")
-
-            # Step 2b: Permit2 approve base to PositionManager
-            logger.info("Step 2b: Permit2 approve base to PositionManager...")
-            base_permit2_tx = self.approve_on_permit2(
-                base_token,
-                pos_manager_addr,
-                total_base,
-                permit2_addr,
-                timeout=timeout
-            )
-            result['base_permit2_approve_tx'] = base_permit2_tx
-            logger.info(f"Base Permit2 approve tx: {base_permit2_tx}")
+                logger.info("Skipping volatile token approve (not needed for current positions)")
 
             result['success'] = True
             logger.info("=" * 50)
-            logger.info("APPROVALS COMPLETE (Both Tokens)")
+            logger.info(f"APPROVALS COMPLETE ({'Both Tokens' if approve_volatile else 'Quote Only'})")
             logger.info("=" * 50)
 
             return result
@@ -1606,6 +1608,28 @@ class V4LiquidityProvider:
         current_tick = expected_current_tick
         logger.info(f"Using current_tick: {current_tick} (from user's input price)")
 
+        # Check if any position needs volatile token (in-range or on volatile side)
+        needs_volatile = False
+        for pos in positions:
+            if pos.tick_lower <= current_tick <= pos.tick_upper:
+                needs_volatile = True
+                break
+            # Check if position is on volatile token's side
+            if quote_is_token0:
+                # quote=token0, volatile=token1 → volatile needed for below_tick (token1 side)
+                if current_tick > pos.tick_upper:
+                    needs_volatile = True
+                    break
+            else:
+                # quote=token1, volatile=token0 → volatile needed for above_tick (token0 side)
+                if current_tick < pos.tick_lower:
+                    needs_volatile = True
+                    break
+        if needs_volatile:
+            logger.info("Some positions need volatile token — will approve both tokens")
+        else:
+            logger.info("All positions are stablecoin-only — skipping volatile token approve")
+
         # Check and handle approvals
         if skip_approvals:
             logger.info("skip_approvals=True, verifying existing approvals...")
@@ -1644,44 +1668,11 @@ class V4LiquidityProvider:
                     error=f"Quote Permit2 not approved to PositionManager. Run approve_tokens_for_ladder() first."
                 )
 
-            # Проверка base token (volatile)
-            if not approval_state['base_erc20_to_permit2']['approved']:
-                return V4LadderResult(
-                    positions=positions,
-                    tx_hash=None,
-                    gas_used=None,
-                    token_ids=[],
-                    pool_created=pool_created,
-                    success=False,
-                    error=f"Base ERC20 not approved to Permit2. Run approve_tokens_for_ladder() first. Current allowance: {approval_state['base_erc20_to_permit2']['allowance']}"
-                )
-
-            if not approval_state['base_permit2_to_position_manager']['approved']:
-                if approval_state['base_permit2_to_position_manager']['expired']:
-                    return V4LadderResult(
-                        positions=positions,
-                        tx_hash=None,
-                        gas_used=None,
-                        token_ids=[],
-                        pool_created=pool_created,
-                        success=False,
-                        error=f"Base Permit2 allowance EXPIRED! Expiration: {approval_state['base_permit2_to_position_manager']['expiration']}. Run approve_tokens_for_ladder() first."
-                    )
-                return V4LadderResult(
-                    positions=positions,
-                    tx_hash=None,
-                    gas_used=None,
-                    token_ids=[],
-                    pool_created=pool_created,
-                    success=False,
-                    error=f"Base Permit2 not approved to PositionManager. Run approve_tokens_for_ladder() first."
-                )
-
-            logger.info("Approvals verified OK (both quote and base tokens)")
+            logger.info("Approvals verified OK (quote token)")
         else:
             # Do approvals inline
             logger.info("Performing token approvals...")
-            approval_result = self.approve_tokens_for_ladder(config, timeout=120)
+            approval_result = self.approve_tokens_for_ladder(config, timeout=120, approve_volatile=needs_volatile)
 
             if not approval_result['success']:
                 return V4LadderResult(

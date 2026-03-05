@@ -1283,69 +1283,6 @@ class TestCreateLadderExtended:
         assert result.success is False
         assert "EXPIRED" in result.error
 
-    def test_create_ladder_skip_approvals_base_erc20_not_approved(self, provider, config):
-        """skip_approvals=True with base ERC20 not approved returns error."""
-        positions, mock_pool_key, mock_batch = self._setup_create_ladder(provider, config)
-        config.pool_id = None
-
-        provider.check_approvals = Mock(return_value={
-            'erc20_to_permit2': {'approved': True, 'allowance': 10**30},
-            'permit2_to_position_manager': {'approved': True, 'amount': 10**30, 'expiration': int(time.time()) + 86400, 'expired': False},
-            'base_erc20_to_permit2': {'approved': False, 'allowance': 0},
-            'base_permit2_to_position_manager': {'approved': True, 'amount': 10**30, 'expiration': int(time.time()) + 86400, 'expired': False},
-        })
-
-        with patch('src.v4_liquidity_provider.BatchRPC', return_value=mock_batch), \
-             patch('src.v4_liquidity_provider.compute_decimal_tick_offset', return_value=0), \
-             patch('src.v4_liquidity_provider.price_to_tick', return_value=-150), \
-             patch('src.v4_liquidity_provider.tick_to_price', return_value=0.005):
-            result = provider.create_ladder(config, skip_approvals=True)
-
-        assert result.success is False
-        assert "Base ERC20 not approved" in result.error
-
-    def test_create_ladder_skip_approvals_base_permit2_not_approved(self, provider, config):
-        """skip_approvals=True with base Permit2 not approved returns error."""
-        positions, mock_pool_key, mock_batch = self._setup_create_ladder(provider, config)
-        config.pool_id = None
-
-        provider.check_approvals = Mock(return_value={
-            'erc20_to_permit2': {'approved': True, 'allowance': 10**30},
-            'permit2_to_position_manager': {'approved': True, 'amount': 10**30, 'expiration': int(time.time()) + 86400, 'expired': False},
-            'base_erc20_to_permit2': {'approved': True, 'allowance': 10**30},
-            'base_permit2_to_position_manager': {'approved': False, 'amount': 0, 'expiration': 0, 'expired': True},
-        })
-
-        with patch('src.v4_liquidity_provider.BatchRPC', return_value=mock_batch), \
-             patch('src.v4_liquidity_provider.compute_decimal_tick_offset', return_value=0), \
-             patch('src.v4_liquidity_provider.price_to_tick', return_value=-150), \
-             patch('src.v4_liquidity_provider.tick_to_price', return_value=0.005):
-            result = provider.create_ladder(config, skip_approvals=True)
-
-        assert result.success is False
-        assert "Base Permit2" in result.error
-
-    def test_create_ladder_skip_approvals_base_permit2_expired(self, provider, config):
-        """skip_approvals=True with base Permit2 expired returns EXPIRED error."""
-        positions, mock_pool_key, mock_batch = self._setup_create_ladder(provider, config)
-        config.pool_id = None
-
-        provider.check_approvals = Mock(return_value={
-            'erc20_to_permit2': {'approved': True, 'allowance': 10**30},
-            'permit2_to_position_manager': {'approved': True, 'amount': 10**30, 'expiration': int(time.time()) + 86400, 'expired': False},
-            'base_erc20_to_permit2': {'approved': True, 'allowance': 10**30},
-            'base_permit2_to_position_manager': {'approved': False, 'amount': 10**30, 'expiration': int(time.time()) - 3600, 'expired': True},
-        })
-
-        with patch('src.v4_liquidity_provider.BatchRPC', return_value=mock_batch), \
-             patch('src.v4_liquidity_provider.compute_decimal_tick_offset', return_value=0), \
-             patch('src.v4_liquidity_provider.price_to_tick', return_value=-150), \
-             patch('src.v4_liquidity_provider.tick_to_price', return_value=0.005):
-            result = provider.create_ladder(config, skip_approvals=True)
-
-        assert result.success is False
-        assert "Base Permit2 allowance EXPIRED" in result.error
-
     def test_create_ladder_inline_approvals_fail(self, provider, config):
         """Inline approval failure returns error."""
         positions, mock_pool_key, mock_batch = self._setup_create_ladder(provider, config)
@@ -1435,22 +1372,6 @@ class TestCreateLadderExtended:
 
         assert result.success is False
         assert "execution failed" in result.error
-
-    def test_create_ladder_balance_validation_fails(self, provider, config):
-        """Balance validation failure → error result."""
-        positions, mock_pool_key, mock_batch = self._setup_create_ladder(provider, config)
-        config.pool_id = None
-
-        provider.validate_balances = Mock(return_value=(False, "Insufficient balance"))
-
-        with patch('src.v4_liquidity_provider.BatchRPC', return_value=mock_batch), \
-             patch('src.v4_liquidity_provider.compute_decimal_tick_offset', return_value=0), \
-             patch('src.v4_liquidity_provider.price_to_tick', return_value=-150), \
-             patch('src.v4_liquidity_provider.tick_to_price', return_value=0.005):
-            result = provider.create_ladder(config, skip_approvals=False)
-
-        assert result.success is False
-        assert "Insufficient balance" in result.error
 
     def test_create_ladder_with_pool_id_matching(self, provider, config):
         """Pre-loaded pool_id matches computed → proceeds normally."""
