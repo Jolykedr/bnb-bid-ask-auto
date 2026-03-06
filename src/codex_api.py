@@ -13,6 +13,15 @@ CODEX_API_URL = "https://graph.codex.io/graphql"
 
 _STABLECOIN_SYMBOLS = {"usdt", "usdc"}
 
+
+def _safe_decimals(val, default=18):
+    """Validate token decimals from external API (must be int in 0..24)."""
+    try:
+        d = int(val) if val is not None else default
+        return d if 0 <= d <= 24 else default
+    except (ValueError, TypeError):
+        return default
+
 _GRAPHQL_QUERY = """
 query ListPairs($tokenAddress: String!, $networkId: Int!, $limit: Int) {
   listPairsWithMetadataForToken(
@@ -155,10 +164,10 @@ def search_pools_by_token(
                 "pool_address": pool_address,
                 "token0_symbol": t0.get("symbol", "???"),
                 "token0_address": t0.get("address", ""),
-                "token0_decimals": t0.get("decimals", 18),
+                "token0_decimals": _safe_decimals(t0.get("decimals")),
                 "token1_symbol": t1.get("symbol", "???"),
                 "token1_address": t1.get("address", ""),
-                "token1_decimals": t1.get("decimals", 18),
+                "token1_decimals": _safe_decimals(t1.get("decimals")),
                 "fee": int(fee_raw) if fee_raw is not None else 0,
                 "dex": dex_key,
                 "liquidity_usd": round(liq_usd, 2),
