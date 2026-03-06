@@ -282,13 +282,20 @@ def calculate_bid_ask_distribution(
         # Human-readable prices (lines 262-267) are only for display.
         #
         # CRITICAL: Raw prices follow POOL order (currency0/currency1), but
-        # calculate_liquidity_from_usd expects DESKTOP order (token0=volatile, token1=stable).
-        # When invert_price=True, pool order is REVERSED from desktop order:
-        #   pool currency0 = stablecoin, currency1 = volatile
-        # So we must swap decimals and token1_is_stable to match pool convention.
+        # calculate_liquidity_from_usd expects decimals in pool order.
+        # When invert_price=True, pool currency0 = stablecoin, currency1 = volatile.
+        # We must map config decimals to pool order using token1_is_stable
+        # (NOT blindly swap — config token0/token1 order is user-chosen, not fixed).
         if invert_price:
-            liq_t0_dec = token1_decimals   # pool currency0 = desktop token1 (stablecoin)
-            liq_t1_dec = token0_decimals   # pool currency1 = desktop token0 (volatile)
+            # Pool currency0 = stablecoin. Find which config token is the stablecoin.
+            if token1_is_stable:
+                # config.token1 = stablecoin = pool currency0
+                liq_t0_dec = token1_decimals
+                liq_t1_dec = token0_decimals
+            else:
+                # config.token0 = stablecoin (or neither) = pool currency0
+                liq_t0_dec = token0_decimals
+                liq_t1_dec = token1_decimals
             liq_t1_stable = False          # pool's "token1" = volatile, not stable
         else:
             liq_t0_dec = token0_decimals
