@@ -50,6 +50,35 @@ V4_STATE_VIEW_ABI = [
         "stateMutability": "view",
         "type": "function"
     },
+    # Get fee growth globals for a pool
+    {
+        "inputs": [
+            {"name": "poolId", "type": "bytes32"}
+        ],
+        "name": "getFeeGrowthGlobals",
+        "outputs": [
+            {"name": "feeGrowthGlobal0", "type": "uint256"},
+            {"name": "feeGrowthGlobal1", "type": "uint256"}
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    # Get position info (fee growth inside last) by positionId
+    # positionId = keccak256(abi.encode(owner, tickLower, tickUpper, salt))
+    {
+        "inputs": [
+            {"name": "poolId", "type": "bytes32"},
+            {"name": "positionId", "type": "bytes32"}
+        ],
+        "name": "getPositionInfo",
+        "outputs": [
+            {"name": "liquidity", "type": "uint128"},
+            {"name": "feeGrowthInside0LastX128", "type": "uint256"},
+            {"name": "feeGrowthInside1LastX128", "type": "uint256"}
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
 ]
 
 # V4 PoolManager ABI (key functions)
@@ -140,6 +169,51 @@ V4_POOL_MANAGER_ABI = [
         "name": "unlock",
         "outputs": [{"name": "", "type": "bytes"}],
         "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    # Get fee growth globals (PancakeSwap V4 CLPoolManager)
+    {
+        "inputs": [
+            {"name": "id", "type": "bytes32"}
+        ],
+        "name": "getFeeGrowthGlobals",
+        "outputs": [
+            {"name": "feeGrowthGlobal0", "type": "uint256"},
+            {"name": "feeGrowthGlobal1", "type": "uint256"}
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    # Get tick info with fee growth outside (PancakeSwap V4)
+    {
+        "inputs": [
+            {"name": "id", "type": "bytes32"},
+            {"name": "tick", "type": "int24"}
+        ],
+        "name": "getPoolTickInfo",
+        "outputs": [
+            {"name": "liquidityGross", "type": "uint128"},
+            {"name": "liquidityNet", "type": "int128"},
+            {"name": "feeGrowthOutside0X128", "type": "uint256"},
+            {"name": "feeGrowthOutside1X128", "type": "uint256"}
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    # Get position info from pool (PancakeSwap V4)
+    # positionId = keccak256(abi.encode(owner, tickLower, tickUpper, salt))
+    {
+        "inputs": [
+            {"name": "id", "type": "bytes32"},
+            {"name": "positionId", "type": "bytes32"}
+        ],
+        "name": "getPositionInfo",
+        "outputs": [
+            {"name": "liquidity", "type": "uint128"},
+            {"name": "feeGrowthInside0LastX128", "type": "uint256"},
+            {"name": "feeGrowthInside1LastX128", "type": "uint256"}
+        ],
+        "stateMutability": "view",
         "type": "function"
     },
 ]

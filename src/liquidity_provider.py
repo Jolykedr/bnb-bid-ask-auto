@@ -508,7 +508,6 @@ class LiquidityProvider:
         use_multicall: bool = True,
         simulate_first: bool = True,
         timeout: int = 600,
-        check_balance: bool = True,
         validated_pool_address: str = None,
         auto_create_pool: bool = False
     ) -> LadderResult:
@@ -521,7 +520,6 @@ class LiquidityProvider:
             simulate_first: Симулировать перед отправкой
             timeout: Таймаут ожидания подтверждения транзакции в секундах
             validated_pool_address: Адрес пула, уже проверенного вызывающим кодом (пропускает проверку)
-            check_balance: Проверять баланс перед созданием
 
         Returns:
             LadderResult с результатами
@@ -566,20 +564,6 @@ class LiquidityProvider:
             stablecoin_decimals = config.token1_decimals
 
         total_stablecoin_amount = int(config.total_usd * (10 ** stablecoin_decimals))
-
-        # Проверка баланса перед созданием
-        if check_balance:
-            is_valid, error_msg = self.validate_balances_for_ladder(config)
-            if not is_valid:
-                return LadderResult(
-                    positions=positions,
-                    tx_hash=None,
-                    gas_used=None,
-                    token_ids=[],
-                    success=False,
-                    error=error_msg
-                )
-            logger.info("Balance check passed")
 
         # Проверка существования пула
         # Пропускаем если пул уже проверен вызывающим кодом
@@ -718,19 +702,10 @@ class LiquidityProvider:
             )
             logger.info(f"After filtering: {len(positions)} positions, total stablecoin: {total_stablecoin_amount}")
 
-        # Approve стейблкоин (оригинальный config.token1) с 1.3x буфером
-        approve_amount = int(total_stablecoin_amount * 3)
-        logger.info(f"Approving stablecoin {stablecoin[:15]}... amount={approve_amount} (base={total_stablecoin_amount} x1.3) to PM={self.position_manager_address[:15]}...")
-        self.check_and_approve_tokens(stablecoin, approve_amount, timeout=timeout)
-
-        # Verify approval
-        from .contracts.abis import ERC20_ABI
-        token_contract = self.w3.eth.contract(address=Web3.to_checksum_address(stablecoin), abi=ERC20_ABI)
-        current_allowance = token_contract.functions.allowance(
-            self.account.address,
-            self.position_manager_address
-        ).call()
-        logger.info(f"Current allowance: {current_allowance}")
+        # Approve стейблкоин unlimited (standard DeFi practice for NonfungiblePositionManager)
+        unlimited = 2**256 - 1
+        logger.info(f"Approving stablecoin {stablecoin[:15]}... unlimited to PM={self.position_manager_address[:15]}...")
+        self.check_and_approve_tokens(stablecoin, unlimited, timeout=timeout)
 
         # Очищаем батчер
         self.batcher.clear()

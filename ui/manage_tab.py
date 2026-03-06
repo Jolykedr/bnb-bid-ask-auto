@@ -58,13 +58,14 @@ def _create_v4_position_manager(w3, account, protocol_str: str, chain_id: int = 
 
 def _load_v4_position_to_dict(
     w3, account, token_id: int, protocol_str: str, chain_id: int = 56,
-    v4_pm: V4PositionManager = None
+    v4_pm: V4PositionManager = None, pool_cache=None
 ) -> dict:
     """
     Load a V4 position and return a dict with all fields.
 
     Creates V4PositionManager if not provided.
     Gets pool state, token decimals, current price.
+    Uses pool_cache to avoid duplicate RPC calls for same pool.
     """
     target_protocol = _resolve_v4_protocol(protocol_str)
 
@@ -87,7 +88,48 @@ def _load_v4_position_to_dict(
         'protocol': protocol_str,
     }
 
-    # Get pool state and token info
+    # V4 pool cache key includes tick_spacing
+    v4_pool_key = (
+        v4_pos.pool_key.currency0.lower(),
+        v4_pos.pool_key.currency1.lower(),
+        v4_pos.pool_key.fee,
+        v4_pos.pool_key.tick_spacing,
+    )
+
+    cached = pool_cache.get(v4_pool_key) if pool_cache else None
+    if cached:
+        position['token0_decimals'] = cached.token0_decimals
+        position['token1_decimals'] = cached.token1_decimals
+        position['token0_symbol'] = cached.token0_symbol
+        position['token1_symbol'] = cached.token1_symbol
+        if cached.current_price is not None:
+            position['current_price'] = cached.current_price
+            position['current_tick'] = cached.current_tick
+        return position
+
+    # Check if another worker is already fetching this pool
+    claimed = False
+    should_fetch = pool_cache.wait_or_claim(v4_pool_key) if pool_cache else True
+    claimed = should_fetch
+
+    if not should_fetch:
+        cached = pool_cache.get(v4_pool_key) if pool_cache else None
+        if cached:
+            position['token0_decimals'] = cached.token0_decimals
+            position['token1_decimals'] = cached.token1_decimals
+            position['token0_symbol'] = cached.token0_symbol
+            position['token1_symbol'] = cached.token1_symbol
+            if cached.current_price is not None:
+                position['current_price'] = cached.current_price
+                position['current_tick'] = cached.current_tick
+            return position
+        # Other worker's fetch failed — re-claim and fetch ourselves
+        should_fetch = True
+        if pool_cache:
+            pool_cache.wait_or_claim(v4_pool_key)
+            claimed = True
+
+    # Get pool state and token info (RPC calls)
     try:
         pool_mgr = V4PoolManager(w3, protocol=target_protocol, chain_id=chain_id)
         pool_state = pool_mgr.get_pool_state(v4_pos.pool_key)
@@ -118,11 +160,30 @@ def _load_v4_position_to_dict(
 
             dec0 = position.get('token0_decimals', 18)
             dec1 = position.get('token1_decimals', 18)
-            position['current_price'] = pool_mgr.sqrt_price_x96_to_price(
+            current_price = pool_mgr.sqrt_price_x96_to_price(
                 pool_state.sqrt_price_x96, dec0, dec1
             )
+            position['current_price'] = current_price
+
+            # Populate cache for other workers
+            if pool_cache:
+                from src.utils import PoolInfoCache
+                pool_cache.put(v4_pool_key, PoolInfoCache.PoolData(
+                    pool_address=None,
+                    token0_decimals=dec0,
+                    token1_decimals=position.get('token1_decimals', 18),
+                    token0_symbol=position.get('token0_symbol', '???'),
+                    token1_symbol=position.get('token1_symbol', '???'),
+                    current_tick=pool_state.tick,
+                    sqrt_price_x96=pool_state.sqrt_price_x96,
+                    current_price=current_price,
+                    timestamp=time.time(),
+                ))
     except Exception as e:
         logger.debug(f"Could not get V4 pool state for token {token_id}: {e}")
+    finally:
+        if pool_cache and claimed:
+            pool_cache.release(v4_pool_key)
 
     return position
 
@@ -339,13 +400,14 @@ class LoadPositionWorker(QThread):
     error = pyqtSignal(int, str)  # token_id, error message
     not_owned = pyqtSignal(int, str)  # token_id, actual owner (position exists but not owned by wallet)
 
-    def __init__(self, provider, token_id, pool_factory=None, check_ownership=True, protocol="v3"):
+    def __init__(self, provider, token_id, pool_factory=None, check_ownership=True, protocol="v3", pool_cache=None):
         super().__init__()
         self.provider = provider
         self.token_id = token_id
         self.pool_factory = pool_factory
         self.check_ownership = check_ownership
         self.protocol = protocol  # "v3" or "v4"
+        self.pool_cache = pool_cache  # PoolInfoCache for cross-worker dedup
 
     def run(self):
         try:
@@ -394,43 +456,99 @@ class LoadPositionWorker(QThread):
                 self.error.emit(self.token_id, "Failed to decode position data")
                 return
 
-            # Phase 2: pool + token data in one multicall (5-6 calls → 1 RPC)
+            # Phase 2: pool + token data + slot0 (with cross-worker cache)
             if self.pool_factory and position['liquidity'] > 0:
-                try:
-                    factory_address = self.pool_factory.factory_address
-                    batch2 = BatchRPC(self.provider.w3)
-                    batch2.add_pool_address(factory_address, position['token0'], position['token1'], position['fee'])
-                    batch2.add_decimals(position['token0'])
-                    batch2.add_decimals(position['token1'])
-                    batch2.add_erc20_symbol(position['token0'])
-                    batch2.add_erc20_symbol(position['token1'])
-                    results2 = batch2.execute()
+                pool_key = (position['token0'].lower(), position['token1'].lower(), position['fee'])
+                cached = self.pool_cache.get(pool_key) if self.pool_cache else None
 
-                    pool_addr = results2[0]
-                    dec0 = results2[1] if results2[1] is not None else 18
-                    dec1 = results2[2] if results2[2] is not None else 18
-                    sym0 = results2[3] or '???'
-                    sym1 = results2[4] or '???'
+                if cached:
+                    # Cache hit — 0 RPCs
+                    position['token0_decimals'] = cached.token0_decimals
+                    position['token1_decimals'] = cached.token1_decimals
+                    position['token0_symbol'] = cached.token0_symbol
+                    position['token1_symbol'] = cached.token1_symbol
+                    if cached.current_price is not None:
+                        position['current_price'] = cached.current_price
+                        position['current_tick'] = cached.current_tick
+                else:
+                    # Check if another worker is already fetching this pool
+                    should_fetch = self.pool_cache.wait_or_claim(pool_key) if self.pool_cache else True
 
-                    position['token0_decimals'] = dec0
-                    position['token1_decimals'] = dec1
-                    position['token0_symbol'] = sym0
-                    position['token1_symbol'] = sym1
+                    if not should_fetch:
+                        cached = self.pool_cache.get(pool_key) if self.pool_cache else None
+                        if cached:
+                            position['token0_decimals'] = cached.token0_decimals
+                            position['token1_decimals'] = cached.token1_decimals
+                            position['token0_symbol'] = cached.token0_symbol
+                            position['token1_symbol'] = cached.token1_symbol
+                            if cached.current_price is not None:
+                                position['current_price'] = cached.current_price
+                                position['current_tick'] = cached.current_tick
+                        else:
+                            # Other worker's fetch failed — we need to fetch ourselves
+                            should_fetch = True
+                            if self.pool_cache:
+                                self.pool_cache.wait_or_claim(pool_key)
 
-                    # Get pool price via separate slot0 call (needs pool_addr from phase 2)
-                    if pool_addr:
-                        batch3 = BatchRPC(self.provider.w3)
-                        batch3.add_pool_slot0(pool_addr)
-                        results3 = batch3.execute()
-                        slot0 = results3[0]
-                        if slot0 and slot0['sqrtPriceX96'] > 0:
-                            current_price = self.pool_factory.sqrt_price_x96_to_price(
-                                slot0['sqrtPriceX96'], dec0, dec1
-                            )
-                            position['current_price'] = current_price
-                            position['current_tick'] = slot0['tick']
-                except Exception as e:
-                    logger.warning(f"Error fetching pool info via multicall: {e}")
+                    if should_fetch:
+                        try:
+                            factory_address = self.pool_factory.factory_address
+                            batch2 = BatchRPC(self.provider.w3)
+                            batch2.add_pool_address(factory_address, position['token0'], position['token1'], position['fee'])
+                            batch2.add_decimals(position['token0'])
+                            batch2.add_decimals(position['token1'])
+                            batch2.add_erc20_symbol(position['token0'])
+                            batch2.add_erc20_symbol(position['token1'])
+                            results2 = batch2.execute()
+
+                            pool_addr = results2[0]
+                            dec0 = results2[1] if results2[1] is not None else 18
+                            dec1 = results2[2] if results2[2] is not None else 18
+                            sym0 = results2[3] or '???'
+                            sym1 = results2[4] or '???'
+
+                            position['token0_decimals'] = dec0
+                            position['token1_decimals'] = dec1
+                            position['token0_symbol'] = sym0
+                            position['token1_symbol'] = sym1
+
+                            current_price = None
+                            current_tick = None
+                            sqrt_price = None
+
+                            if pool_addr:
+                                batch3 = BatchRPC(self.provider.w3)
+                                batch3.add_pool_slot0(pool_addr)
+                                results3 = batch3.execute()
+                                slot0 = results3[0]
+                                if slot0 and slot0['sqrtPriceX96'] > 0:
+                                    current_price = self.pool_factory.sqrt_price_x96_to_price(
+                                        slot0['sqrtPriceX96'], dec0, dec1
+                                    )
+                                    current_tick = slot0['tick']
+                                    sqrt_price = slot0['sqrtPriceX96']
+                                    position['current_price'] = current_price
+                                    position['current_tick'] = current_tick
+
+                            # Populate cache for other workers
+                            if self.pool_cache:
+                                from src.utils import PoolInfoCache
+                                self.pool_cache.put(pool_key, PoolInfoCache.PoolData(
+                                    pool_address=pool_addr,
+                                    token0_decimals=dec0,
+                                    token1_decimals=dec1,
+                                    token0_symbol=sym0,
+                                    token1_symbol=sym1,
+                                    current_tick=current_tick,
+                                    sqrt_price_x96=sqrt_price,
+                                    current_price=current_price,
+                                    timestamp=time.time(),
+                                ))
+                        except Exception as e:
+                            logger.warning(f"Error fetching pool info via multicall: {e}")
+                        finally:
+                            if self.pool_cache:
+                                self.pool_cache.release(pool_key)
 
             self.position_loaded.emit(self.token_id, position)
 
@@ -478,10 +596,11 @@ class LoadPositionWorker(QThread):
                     self.not_owned.emit(self.token_id, owner)
                     return
 
-            # Load position data using helper
+            # Load position data using helper (with pool cache)
             position = _load_v4_position_to_dict(
                 self.provider.w3, self.provider.account,
-                self.token_id, self.protocol, chain_id, v4_pm
+                self.token_id, self.protocol, chain_id, v4_pm,
+                pool_cache=self.pool_cache
             )
 
             self.position_loaded.emit(self.token_id, position)
@@ -492,10 +611,14 @@ class LoadPositionWorker(QThread):
 
 
 class ScanWalletWorker(QThread):
-    """Worker thread for scanning wallet for all positions."""
+    """Worker thread for scanning wallet — discovers token IDs only.
+
+    Position data is loaded in parallel by ManageTab._load_positions_by_ids()
+    after scan_result is emitted, using the existing worker pool.
+    """
 
     progress = pyqtSignal(str)  # progress message
-    position_found = pyqtSignal(int, dict)  # token_id, position_data
+    position_found = pyqtSignal(int, dict)  # token_id, position_data (kept for compat, unused)
     scan_result = pyqtSignal(int, list, str)  # total found, list of token_ids, protocol
 
     def __init__(self, provider, pool_factory=None, protocol="v3"):
@@ -506,7 +629,6 @@ class ScanWalletWorker(QThread):
 
     def run(self):
         try:
-            # Determine protocol type
             is_v4 = self.protocol in ("v4", "v4_pancake")
 
             if self.protocol == "v4_pancake":
@@ -532,22 +654,25 @@ class ScanWalletWorker(QThread):
                 token_ids = v4_pm.get_position_token_ids(address)
                 self.progress.emit(f"Found {len(token_ids)} V4 positions")
 
-                for i, token_id in enumerate(token_ids):
-                    self.progress.emit(f"Loading V4 position {i+1}/{len(token_ids)} (ID: {token_id})...")
+                # Pre-filter: remove liquidity=0 positions via Multicall3 (1 RPC per 200)
+                if token_ids:
                     try:
-                        position = _load_v4_position_to_dict(
-                            self.provider.w3, self.provider.account,
-                            token_id, self.protocol, chain_id, v4_pm
+                        from src.utils import batch_filter_v4_active
+                        original_count = len(token_ids)
+                        token_ids = batch_filter_v4_active(
+                            self.provider.w3, pm_addr, token_ids
                         )
-                        self.position_found.emit(token_id, position)
+                        filtered = original_count - len(token_ids)
+                        if filtered > 0:
+                            self.progress.emit(f"Pre-filtered {filtered} empty V4 positions")
                     except Exception as e:
-                        self.progress.emit(f"Error loading V4 position {token_id}: {e}")
+                        self.progress.emit(f"V4 pre-filter failed: {e}, keeping all")
 
+                # Emit IDs only — ManageTab will load positions in parallel
                 self.scan_result.emit(len(token_ids), token_ids, self.protocol)
 
             else:
-                # Use V3 position manager
-                # Check if we need a different position manager for Uniswap V3
+                # V3: discover token IDs only
                 if self.protocol == "v3_uniswap":
                     try:
                         chain_id = getattr(self.provider, 'chain_id', 56)
@@ -573,43 +698,7 @@ class ScanWalletWorker(QThread):
                 token_ids = position_manager.get_position_token_ids(address)
                 self.progress.emit(f"Found {len(token_ids)} {protocol_name} positions")
 
-                for i, token_id in enumerate(token_ids):
-                    self.progress.emit(f"Loading {protocol_name} position {i+1}/{len(token_ids)} (ID: {token_id})...")
-                    try:
-                        position = position_manager.get_position(token_id)
-                        position['protocol'] = self.protocol  # v3 or v3_uniswap
-
-                        # Get pool info if available
-                        if self.pool_factory and position['liquidity'] > 0:
-                            try:
-                                pool_addr = self.pool_factory.get_pool_address(
-                                    position['token0'],
-                                    position['token1'],
-                                    position['fee']
-                                )
-                                if pool_addr:
-                                    pool_info = self.pool_factory.get_pool_info(pool_addr)
-                                    token0_info = self.pool_factory.get_token_info(position['token0'])
-                                    token1_info = self.pool_factory.get_token_info(position['token1'])
-
-                                    position['current_price'] = self.pool_factory.sqrt_price_x96_to_price(
-                                        pool_info.sqrt_price_x96,
-                                        token0_info.decimals,
-                                        token1_info.decimals
-                                    )
-                                    position['current_tick'] = pool_info.tick
-                                    position['token0_symbol'] = token0_info.symbol
-                                    position['token1_symbol'] = token1_info.symbol
-                                    position['token0_decimals'] = token0_info.decimals
-                                    position['token1_decimals'] = token1_info.decimals
-                            except Exception as e:
-                                logger.warning(f"Error fetching pool info for {token_id}: {e}")
-
-                        self.position_found.emit(token_id, position)
-
-                    except Exception as e:
-                        self.progress.emit(f"Error loading position {token_id}: {e}")
-
+                # Emit IDs only — ManageTab will load positions in parallel
                 self.scan_result.emit(len(token_ids), token_ids, self.protocol)
 
         except Exception as e:
@@ -1105,7 +1194,10 @@ class ManageTab(QWidget):
         self._worker_queue = []  # [(token_id, protocol)] pending work
         self._active_workers = []  # Currently running workers
         self._dying_workers = []  # Cancelled workers still running — prevent GC segfault
-        self.MAX_CONCURRENT_WORKERS = 8
+        self.MAX_CONCURRENT_WORKERS = 16
+        # Pool info cache — shared across workers to avoid duplicate RPC calls
+        from src.utils import PoolInfoCache
+        self._pool_cache = PoolInfoCache(ttl=60.0)
         # Batch table update state
         self._pending_updates = {}  # {token_id: position} — accumulated for batch flush
         self._row_index = {}  # {token_id: row_number} — O(1) row lookup
@@ -1574,6 +1666,8 @@ class ManageTab(QWidget):
         """Cancel all running load workers and clear queue."""
         # Clear pending queue first
         self._worker_queue.clear()
+        # Clear pool cache so fresh data is fetched on next load
+        self._pool_cache.clear()
 
         # Disconnect signals and move to _dying_workers to prevent GC while running.
         # CRITICAL: If Python GC collects a QThread while it's running,
@@ -1660,7 +1754,8 @@ class ManageTab(QWidget):
             try:
                 worker = LoadPositionWorker(
                     self.provider, token_id, self.pool_factory,
-                    check_ownership=True, protocol=protocol
+                    check_ownership=True, protocol=protocol,
+                    pool_cache=self._pool_cache
                 )
                 worker.position_loaded.connect(self._on_position_loaded, Qt.ConnectionType.QueuedConnection)
                 worker.error.connect(self._on_position_error, Qt.ConnectionType.QueuedConnection)
@@ -1781,8 +1876,12 @@ class ManageTab(QWidget):
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
+        # Cancel any running load workers first
+        self._cancel_load_workers()
+
         # Clear existing data
         self.positions_table.setRowCount(0)
+        self._row_index.clear()
         self.positions_data = {}
         self.token_ids_input.clear()
 
@@ -1878,32 +1977,17 @@ class ManageTab(QWidget):
         self._update_buttons()
 
     def _on_scan_finished(self, total_found: int, token_ids: list, protocol: str = "v3"):
-        """Handle scan completion."""
+        """Handle scan completion — load discovered positions in parallel."""
         if self.scan_worker is not None:
-            # scan_result is emitted from run() — thread may still be finishing.
             self._safe_cleanup_worker(self.scan_worker)
             self.scan_worker = None
-        self.progress_bar.hide()
+
         self.scan_btn.setEnabled(True)
         self.load_btn.setEnabled(True)
         self.refresh_btn.setEnabled(True)
 
         # Update input field with found token IDs
         self.token_ids_input.setText(", ".join(str(tid) for tid in token_ids))
-
-        # Count active vs empty positions
-        active_count = sum(
-            1 for p in self.positions_data.values()
-            if p and p.get('liquidity', 0) > 0
-        )
-        empty_count = total_found - active_count
-
-        # Save positions
-        self._save_positions()
-
-        # Rebuild table with filter
-        self._rebuild_table()
-        self._update_pnl_summary()
 
         if protocol == "v4_pancake":
             protocol_name = "PancakeSwap V4"
@@ -1915,18 +1999,17 @@ class ManageTab(QWidget):
             protocol_name = "PancakeSwap V3"
 
         if total_found > 0:
-            self._log(f"✅ Scan complete! Found {total_found} {protocol_name} positions: {active_count} active, {empty_count} empty")
-            QMessageBox.information(
-                self, "Scan Complete",
-                f"Found {total_found} {protocol_name} position(s) owned by your wallet.\n\n"
-                f"• Active (with liquidity): {active_count}\n"
-                f"• Empty (liquidity = 0): {empty_count}\n\n"
-                f"Token IDs: {token_ids}\n\n"
-                f"{'Empty positions are hidden. Uncheck filter to see them.' if empty_count > 0 and self.hide_empty_cb.isChecked() else ''}"
-            )
+            self._log(f"✅ Scan found {total_found} {protocol_name} positions, loading in parallel...")
+            # Pre-register IDs with protocol placeholder so they appear in table
+            for tid in token_ids:
+                self.positions_data[tid] = {'protocol': protocol}
+
+            # Load positions in parallel using existing worker pipeline
+            # _on_worker_finished will call _save_positions when all workers complete
+            self._load_positions_by_ids(token_ids, protocol=protocol, cancel_existing=False)
         else:
+            self.progress_bar.hide()
             self._log(f"Scan complete - no {protocol_name} positions found")
-            # Suggest other protocols
             if protocol.startswith("v4"):
                 other_protocol = "PancakeSwap V3 or other V4 protocol"
             else:
@@ -2458,12 +2541,7 @@ class ManageTab(QWidget):
 
         # Enable collect fees when any positions are loaded
         # (V4 tokens_owed may be 0 in UI but fees exist on-chain)
-        pos_count = len(self.positions_data)
-        self.collect_fees_btn.setEnabled(pos_count > 0)
-        if pos_count > 0:
-            self.collect_fees_btn.setText(f"💰 Collect Fees [{pos_count}]")
-        else:
-            self.collect_fees_btn.setText("💰 Collect Fees")
+        self.collect_fees_btn.setEnabled(len(self.positions_data) > 0)
 
     def _get_selected_token_ids(self) -> list:
         """Get token IDs of selected rows."""

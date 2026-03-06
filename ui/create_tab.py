@@ -1057,6 +1057,9 @@ class CreateTab(QWidget):
         self._pool_create_worker = None
         self._search_pool_worker = None
         self._ref_price_worker = None
+        self._price_deviation = None  # Current pool price deviation from market
+        self._reference_price = None  # Reference market price
+        self._ref_liq_usd = None      # Reference pool liquidity USD
         self.custom_tokens = {}  # symbol -> address mapping
         self.loaded_v4_pool_id = None  # Store loaded V4 pool ID for verification
         self._detected_v3_dex = None  # Store detected V3 DEX config (Uniswap/PancakeSwap)
@@ -1983,6 +1986,51 @@ class CreateTab(QWidget):
 
     def _preview_positions(self):
         """Preview positions without creating."""
+        # Check price deviation — require user confirmation if >15%
+        if self._price_deviation is not None and self._price_deviation > 0.15 and self._reference_price:
+            try:
+                cur_price = _parse_price_text(self.price_input.text())
+            except (ValueError, TypeError):
+                cur_price = 0
+            pct = self._price_deviation * 100
+            pool_str = _format_price(cur_price) if cur_price > 0 else "?"
+            ref_str = _format_price(self._reference_price)
+            liq_str = ""
+            if self._ref_liq_usd and self._ref_liq_usd > 0:
+                if self._ref_liq_usd >= 1_000_000:
+                    liq_str = f"\nReference pool liquidity: ${self._ref_liq_usd / 1_000_000:.1f}M"
+                elif self._ref_liq_usd >= 1_000:
+                    liq_str = f"\nReference pool liquidity: ${self._ref_liq_usd / 1_000:.0f}k"
+
+            if self._price_deviation > 0.40:
+                title = "⚠ ABNORMAL POOL PRICE"
+                msg = (
+                    f"The price in this pool differs significantly from the market price!\n\n"
+                    f"Pool price: {pool_str}\n"
+                    f"Market price: {ref_str}\n"
+                    f"Deviation: {pct:.1f}%{liq_str}\n\n"
+                    f"Entering this pool may result in immediate loss of funds!\n\n"
+                    f"Are you sure you want to continue?"
+                )
+            else:
+                title = "⚠ Price Deviation Detected"
+                msg = (
+                    f"The price in this pool differs from the market price.\n\n"
+                    f"Pool price: {pool_str}\n"
+                    f"Market price: {ref_str}\n"
+                    f"Deviation: {pct:.1f}%{liq_str}\n\n"
+                    f"Please verify the price before proceeding.\n\n"
+                    f"Continue anyway?"
+                )
+
+            reply = QMessageBox.warning(
+                self, title, msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
         try:
             current_price = _parse_price_text(self.price_input.text())
             percent_from = self.range_from_spin.value()
@@ -2806,9 +2854,12 @@ class CreateTab(QWidget):
 
     def _fetch_reference_price(self, volatile_token: str, exclude_pool: str = ""):
         """Start background fetch of reference market price for the volatile token."""
-        # Hide previous warning
+        # Hide previous warning and reset deviation
         self.price_warning_label.setVisible(False)
         self.price_warning_label.setText("")
+        self._price_deviation = None
+        self._reference_price = None
+        self._ref_liq_usd = None
 
         if not volatile_token:
             return
@@ -2871,12 +2922,15 @@ class CreateTab(QWidget):
             return
 
         deviation = abs(current_price - ref_price) / ref_price
+        self._price_deviation = deviation
+        self._reference_price = ref_price
 
         if deviation <= 0.15:
             self.price_warning_label.setVisible(False)
             return
 
         liq_usd = data.get("liquidity_usd", 0)
+        self._ref_liq_usd = liq_usd
         liq_str = ""
         if liq_usd and liq_usd > 0:
             if liq_usd >= 1_000_000:
