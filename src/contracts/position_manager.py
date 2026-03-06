@@ -495,14 +495,44 @@ class UniswapV3PositionManager:
             if balance == 0:
                 return []
 
-            # Пробуем ERC721Enumerable
+            # Пробуем batch tokenOfOwnerByIndex через Multicall3
+            try:
+                from ..utils import BatchRPC
+                batch = BatchRPC(self.w3)
+                # tokenOfOwnerByIndex(address,uint256) selector = 0x2f745c59
+                selector = bytes.fromhex('2f745c59')
+                addr_bytes = bytes.fromhex(address_checksum[2:].lower()).rjust(32, b'\x00')
+
+                def _decode_uint256(data: bytes) -> Optional[int]:
+                    if len(data) >= 32:
+                        return int.from_bytes(data[:32], 'big')
+                    return None
+
+                for i in range(balance):
+                    call_data = selector + addr_bytes + i.to_bytes(32, 'big')
+                    batch.add_call(self.position_manager_address, call_data, _decode_uint256)
+
+                results = batch.execute()
+                token_ids = [r for r in results if r is not None]
+
+                if len(token_ids) == balance:
+                    logger.info(f"[V3] Found {len(token_ids)} positions via Multicall3 batch")
+                    return token_ids
+                else:
+                    logger.warning(f"[V3] Multicall3 returned {len(token_ids)}/{balance}, falling back to sequential")
+                    token_ids = []
+            except Exception as batch_err:
+                logger.warning(f"[V3] Multicall3 tokenOfOwnerByIndex failed: {batch_err}")
+                token_ids = []
+
+            # Фоллбэк на последовательный ERC721Enumerable
             try:
                 for i in range(balance):
                     token_id = erc721_contract.functions.tokenOfOwnerByIndex(
                         address_checksum, i
                     ).call()
                     token_ids.append(token_id)
-                logger.info(f"[V3] Found {len(token_ids)} positions via ERC721Enumerable")
+                logger.info(f"[V3] Found {len(token_ids)} positions via ERC721Enumerable (sequential)")
                 return token_ids
             except Exception as enum_error:
                 logger.warning(f"[V3] tokenOfOwnerByIndex not supported: {enum_error}")

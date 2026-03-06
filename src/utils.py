@@ -48,6 +48,32 @@ MULTICALL3_ABI = [
         ],
         "stateMutability": "payable",
         "type": "function"
+    },
+    {
+        "inputs": [
+            {"name": "requireSuccess", "type": "bool"},
+            {
+                "components": [
+                    {"name": "target", "type": "address"},
+                    {"name": "callData", "type": "bytes"}
+                ],
+                "name": "calls",
+                "type": "tuple[]"
+            }
+        ],
+        "name": "tryAggregate",
+        "outputs": [
+            {
+                "components": [
+                    {"name": "success", "type": "bool"},
+                    {"name": "returnData", "type": "bytes"}
+                ],
+                "name": "returnData",
+                "type": "tuple[]"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
     }
 ]
 
@@ -785,3 +811,137 @@ def get_token_info_batch(
             output[token]['decimals'] = cache.get_decimals(token)
 
     return output
+
+
+# ── Pool Info Cache ─────────────────────────────────────────────────────
+
+class PoolInfoCache:
+    """
+    Thread-safe cache for pool information (slot0, decimals, symbols, pool address).
+
+    When multiple LoadPositionWorkers load positions from the same pool,
+    only the first worker makes the RPC calls; others wait and get cached data.
+
+    Key: (token0_lower, token1_lower, fee) for V3
+         (currency0_lower, currency1_lower, fee, tick_spacing) for V4
+    TTL: 60s default (pool tick changes often, but within a batch load it's fine).
+    """
+
+    @dataclass
+    class PoolData:
+        pool_address: Optional[str]  # V3 pool address (None for V4)
+        token0_decimals: int
+        token1_decimals: int
+        token0_symbol: str
+        token1_symbol: str
+        current_tick: Optional[int]
+        sqrt_price_x96: Optional[int]
+        current_price: Optional[float]
+        timestamp: float
+
+    def __init__(self, ttl: float = 60.0):
+        self._cache: Dict[tuple, 'PoolInfoCache.PoolData'] = {}
+        self._lock = threading.Lock()
+        self._ttl = ttl
+        self._in_flight: Dict[tuple, threading.Event] = {}
+        self._in_flight_lock = threading.Lock()
+
+    def get(self, key: tuple) -> Optional['PoolInfoCache.PoolData']:
+        """Get cached pool data. Returns None if not cached or expired."""
+        with self._lock:
+            data = self._cache.get(key)
+            if data and (time.time() - data.timestamp) < self._ttl:
+                return data
+            return None
+
+    def put(self, key: tuple, data: 'PoolInfoCache.PoolData'):
+        """Store pool data in cache."""
+        with self._lock:
+            self._cache[key] = data
+
+    def wait_or_claim(self, key: tuple) -> bool:
+        """
+        Coordinate concurrent fetches for the same pool.
+
+        Returns True if caller should fetch (claimed the slot).
+        Returns False if another thread already fetched it (data now in cache).
+        """
+        with self._in_flight_lock:
+            if key in self._in_flight:
+                event = self._in_flight[key]
+            else:
+                self._in_flight[key] = threading.Event()
+                return True  # Caller should fetch
+
+        # Another thread is fetching — wait up to 15s
+        event.wait(timeout=15.0)
+        return self.get(key) is None  # True if still no data (fetch failed)
+
+    def release(self, key: tuple):
+        """Signal that fetching is complete (success or failure)."""
+        with self._in_flight_lock:
+            event = self._in_flight.pop(key, None)
+            if event:
+                event.set()
+
+    def clear(self):
+        """Clear all cached data and in-flight trackers."""
+        with self._lock:
+            self._cache.clear()
+        with self._in_flight_lock:
+            # Wake up any waiting threads
+            for event in self._in_flight.values():
+                event.set()
+            self._in_flight.clear()
+
+
+# ── V4 Multicall3 Pre-filter ────────────────────────────────────────────
+
+# getPositionLiquidity(uint256) selector
+_GET_POS_LIQ_SELECTOR = bytes.fromhex('1efeed33')
+
+
+def batch_filter_v4_active(w3: Web3, position_manager_address: str, token_ids: List[int]) -> List[int]:
+    """
+    Filter V4 token_ids to only those with liquidity > 0 using Multicall3.
+
+    1 RPC per 200 positions instead of N individual calls.
+    Falls back to returning all IDs if multicall fails.
+    """
+    if not token_ids:
+        return []
+
+    total = len(token_ids)
+    try:
+        multicall = w3.eth.contract(
+            address=Web3.to_checksum_address(MULTICALL3_ADDRESS),
+            abi=MULTICALL3_ABI
+        )
+        target = Web3.to_checksum_address(position_manager_address)
+
+        calls = []
+        for tid in token_ids:
+            calldata = _GET_POS_LIQ_SELECTOR + tid.to_bytes(32, 'big')
+            calls.append((target, calldata))
+
+        CHUNK = 200
+        active_ids = []
+        for i in range(0, total, CHUNK):
+            chunk_ids = token_ids[i:i + CHUNK]
+            chunk_calls = calls[i:i + CHUNK]
+            results = multicall.functions.tryAggregate(False, chunk_calls).call()
+            for tid, (success, data) in zip(chunk_ids, results):
+                if success and len(data) >= 32:
+                    liq = int.from_bytes(data[-32:], 'big')
+                    if liq > 0:
+                        active_ids.append(tid)
+                elif not success:
+                    active_ids.append(tid)  # include on failure (safe fallback)
+
+        skipped = total - len(active_ids)
+        if skipped:
+            logger.info(f"[V4] Multicall pre-filter: {skipped}/{total} positions have 0 liquidity, loading {len(active_ids)} active")
+        return active_ids
+    except Exception as e:
+        logger.warning(f"[V4] Multicall pre-filter failed ({e}), returning all IDs")
+        return list(token_ids)

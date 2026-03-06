@@ -659,37 +659,12 @@ class TestLiquidityProvider:
 
     @patch('config.STABLECOINS', create=True, new={USDT_BSC.lower(): 18})
     @patch('src.liquidity_provider.compute_decimal_tick_offset', return_value=0)
-    @patch('src.liquidity_provider.calculate_bid_ask_distribution', return_value=[])
-    @patch.object(Web3, 'to_checksum_address', side_effect=lambda addr: addr)
-    def test_create_ladder_insufficient_balance(
-        self, mock_checksum, mock_calc, mock_offset, provider
-    ):
-        """Недостаточный баланс -> LadderResult(success=False)."""
-        provider.get_token_balance = Mock(return_value=10 * 10**18)  # только 10
-
-        config = LiquidityLadderConfig(
-            current_price=600.0,
-            lower_price=400.0,
-            total_usd=1000,
-            n_positions=5,
-            token0=WBNB,
-            token1=USDT_BSC,
-            fee_tier=2500,
-        )
-
-        result = provider.create_ladder(config, check_balance=True)
-
-        assert result.success is False
-        assert "Insufficient" in result.error
-
-    @patch('config.STABLECOINS', create=True, new={USDT_BSC.lower(): 18})
-    @patch('src.liquidity_provider.compute_decimal_tick_offset', return_value=0)
     @patch('src.liquidity_provider.calculate_bid_ask_distribution')
     @patch.object(Web3, 'to_checksum_address', side_effect=lambda addr: addr)
-    def test_create_ladder_skip_balance_check(
+    def test_create_ladder_no_balance_check(
         self, mock_checksum, mock_calc, mock_offset, provider
     ):
-        """check_balance=False пропускает проверку баланса."""
+        """create_ladder does not check balance (UI does it beforehand)."""
         positions = [
             BidAskPosition(
                 index=0, tick_lower=-51000, tick_upper=-50950,
@@ -715,15 +690,6 @@ class TestLiquidityProvider:
         # Approve
         provider.check_and_approve_tokens = Mock(return_value=None)
 
-        # Mock contract for allowance check inside create_ladder
-        mock_allowance = Mock()
-        mock_allowance.call = Mock(return_value=2**256 - 1)
-        mock_functions = Mock()
-        mock_functions.allowance = Mock(return_value=mock_allowance)
-        mock_contract = Mock()
-        mock_contract.functions = mock_functions
-        provider.w3.eth.contract = Mock(return_value=mock_contract)
-
         config = LiquidityLadderConfig(
             current_price=600.0,
             lower_price=400.0,
@@ -736,12 +702,8 @@ class TestLiquidityProvider:
 
         result = provider.create_ladder(
             config,
-            check_balance=False,
             validated_pool_address="0xPoolAddr",
         )
-
-        # validate_balances_for_ladder не должен вызываться
-        # Если бы вызвался - get_token_balance не определён и упал бы
         assert result.success is True
         assert result.token_ids == [5001]
 
