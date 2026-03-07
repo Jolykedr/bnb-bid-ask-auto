@@ -1,11 +1,13 @@
 """
 Licensing module for BNB Liquidity Ladder.
 
-Для разработчика (тебя):
-    from licensing.license_generator import generate_license, init_keys
+Server-based license validation with HWID binding.
 
-Для софта (клиентам):
-    from licensing.license_checker import require_license, LicenseChecker
+Usage:
+    from licensing import LicenseChecker, LicenseError
+
+    checker = LicenseChecker()
+    result = checker.validate()
 """
 
 from .license_checker import (
@@ -15,7 +17,6 @@ from .license_checker import (
     LicenseInvalidError,
     LicenseNotFoundError,
     require_license,
-    require_feature,
     find_license_file,
 )
 
@@ -26,6 +27,5 @@ __all__ = [
     "LicenseInvalidError",
     "LicenseNotFoundError",
     "require_license",
-    "require_feature",
     "find_license_file",
 ]

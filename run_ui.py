@@ -57,67 +57,101 @@ def _thread_exception_handler(args):
 
 
 # === ПРОВЕРКА ЛИЦЕНЗИИ ===
-from licensing import LicenseChecker, find_license_file, LicenseError
+from licensing import LicenseChecker, LicenseError
+from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QLineEdit, QPushButton, QHBoxLayout
+
+
+class LicenseKeyDialog(QDialog):
+    """Dialog for entering a license key."""
+
+    def __init__(self, error_msg: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("License Activation")
+        self.setFixedWidth(450)
+        self.key_value = ""
+
+        layout = QVBoxLayout(self)
+
+        if error_msg:
+            err_label = QLabel(error_msg)
+            err_label.setStyleSheet("color: red; font-weight: bold;")
+            err_label.setWordWrap(True)
+            layout.addWidget(err_label)
+
+        layout.addWidget(QLabel("Enter your license key:"))
+
+        self.key_input = QLineEdit()
+        self.key_input.setPlaceholderText("LL-XXXX-XXXX-XXXX-XXXX-XXXX")
+        self.key_input.setFont(QFont("Consolas", 12))
+        layout.addWidget(self.key_input)
+
+        btn_layout = QHBoxLayout()
+        activate_btn = QPushButton("Activate")
+        activate_btn.clicked.connect(self._on_activate)
+        cancel_btn = QPushButton("Exit")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(activate_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+
+        self.key_input.returnPressed.connect(self._on_activate)
+
+    def _on_activate(self):
+        key = self.key_input.text().strip()
+        if key:
+            self.key_value = key
+            self.accept()
 
 
 def check_license_gui(app: QApplication) -> bool:
     """
-    Проверка лицензии с GUI диалогом при ошибке.
+    Server-based license check with GUI dialogs.
+    If no key found or validation fails, shows activation dialog.
 
     Returns:
-        True если лицензия валидна, False если нет
+        True if license is valid, False if user cancelled
     """
-    license_path = find_license_file([
-        "license.lic",
-        os.path.join(os.path.dirname(__file__), "license.lic"),
-    ])
+    checker = LicenseChecker()
+    error_msg = ""
 
-    if not license_path:
-        QMessageBox.critical(
-            None,
-            "Лицензия не найдена",
-            "Файл лицензии не найден!\n\n"
-            "Поместите файл license.lic в папку с программой.\n\n"
-            "Для получения лицензии свяжитесь с разработчиком."
-        )
-        return False
+    # Try existing key first
+    if checker.get_license_key():
+        result = checker.validate()
+        if result["valid"]:
+            days = result.get("days_remaining", 0)
+            offline = " (offline)" if result.get("offline_mode") else ""
+            if days is not None and days <= 7:
+                QMessageBox.warning(
+                    None,
+                    "License expiring",
+                    f"Your license expires in {days} days.\n\n"
+                    f"Contact support for renewal."
+                )
+            print(f"License: OK | {days} days remaining{offline}")
+            return True
+        error_msg = result.get("error", "Unknown error")
 
-    try:
-        checker = LicenseChecker()
-        result = checker.check_license(license_path)
+    # No key or validation failed — show activation dialog
+    while True:
+        dialog = LicenseKeyDialog(error_msg=error_msg)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return False  # User cancelled
 
-        if not result["valid"]:
-            QMessageBox.critical(
+        key = dialog.key_value
+        result = checker.activate(key)
+
+        if result["valid"]:
+            days = result.get("days_remaining", "?")
+            QMessageBox.information(
                 None,
-                "Ошибка лицензии",
-                f"Лицензия недействительна!\n\n"
-                f"Причина: {result['error']}\n\n"
-                f"Для продления лицензии свяжитесь с разработчиком."
+                "License activated",
+                f"License activated successfully!\n\n"
+                f"Valid for {days} days."
             )
-            return False
+            print(f"License: activated | {days} days remaining")
+            return True
 
-        # Показать предупреждение если осталось мало дней
-        days = result["days_remaining"]
-        if days <= 7:
-            QMessageBox.warning(
-                None,
-                "Лицензия истекает",
-                f"Внимание! Лицензия истекает через {days} дней.\n\n"
-                f"Свяжитесь с разработчиком для продления."
-            )
-
-        print(f"Лицензия: {result['user_id']} | "
-              f"Осталось {days} дней | "
-              f"До: {result['expires_at'].strftime('%Y-%m-%d')}")
-        return True
-
-    except LicenseError as e:
-        QMessageBox.critical(
-            None,
-            "Ошибка лицензии",
-            f"Ошибка проверки лицензии:\n\n{e}"
-        )
-        return False
+        error_msg = result.get("error", "Activation failed")
 
 
 def main():

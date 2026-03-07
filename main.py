@@ -12,29 +12,32 @@ import sys
 from dotenv import load_dotenv
 
 # === ПРОВЕРКА ЛИЦЕНЗИИ ===
-from licensing import LicenseChecker, find_license_file, LicenseError
+from licensing import LicenseChecker, LicenseError
 
 def check_license_on_startup():
-    """Проверка лицензии при запуске."""
-    license_path = find_license_file([
-        "license.lic",
-        os.path.join(os.path.dirname(__file__), "license.lic"),
-    ])
+    """Server-based license check at startup."""
+    checker = LicenseChecker()
 
-    if not license_path:
+    if not checker.get_license_key():
         print("=" * 60)
-        print("ФАЙЛ ЛИЦЕНЗИИ НЕ НАЙДЕН")
+        print("LICENSE KEY NOT FOUND")
         print("=" * 60)
-        print("Поместите файл license.lic в папку с программой.")
-        print("Для получения лицензии свяжитесь с разработчиком.")
-        print("=" * 60)
-        sys.exit(1)
+        key = input("Enter your license key (LL-XXXX-...): ").strip()
+        if not key:
+            print("No key entered. Exiting.")
+            sys.exit(1)
+
+        result = checker.activate(key)
+        if not result["valid"]:
+            print(f"Activation failed: {result['error']}")
+            sys.exit(1)
+        print(f"Activated! {result.get('days_remaining', '?')} days remaining.")
+        return
 
     try:
-        checker = LicenseChecker()
-        checker.verify_or_exit(license_path, show_info=True)
+        checker.verify_or_exit(show_info=True)
     except LicenseError as e:
-        print(f"Ошибка лицензии: {e}")
+        print(f"License error: {e}")
         sys.exit(1)
 
 from src.math.distribution import (
