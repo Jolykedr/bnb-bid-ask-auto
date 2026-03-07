@@ -135,6 +135,28 @@ All distributions place **more capital at lower prices** — the further price d
 
 ---
 
+## Security & Trust
+
+This software handles wallet private keys. Here's why you can trust it:
+
+**Open source** — the entire codebase is public. You can read every line of code before using it. There are no hidden binaries, no obfuscated modules, no backdoors.
+
+**Private keys never leave your machine.** They are:
+- Encrypted locally with AES-256-GCM using your password
+- Decrypted only in RAM when you enter your password
+- Never sent to any server, API, or third party
+
+**The license server only receives:**
+- Your license key
+- A hardware fingerprint (hash of your machine ID)
+- That's it. No wallet data. No transaction data. No personal information.
+
+You can verify all of this yourself — check `licensing/license_checker.py` to see exactly what is sent, and `src/crypto.py` to see how wallet encryption works.
+
+**You can run from source** — clone the repo, read the code, run `python run_ui.py`. You don't have to trust a binary.
+
+---
+
 ## License
 
 This software requires a valid license key. Keys are bound to a single device (HWID).
