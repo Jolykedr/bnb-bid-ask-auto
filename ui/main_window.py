@@ -13,10 +13,10 @@ from PyQt6.QtGui import QAction, QIcon
 
 import os
 
+from .dashboard_tab import DashboardTab
 from .calculator_tab import CalculatorTab
 from .create_tab import CreateTab
 from .manage_tab import ManageTab
-from .advanced_tab import AdvancedTab
 from .settings_dialog import SettingsDialog
 
 
@@ -26,7 +26,7 @@ class MainWindow(QMainWindow):
 
     Contains:
     - Menu bar with File, Settings, Help
-    - Tab widget with Calculator, Create, Manage tabs
+    - Tab widget with Dashboard, Calculator, Create, Manage tabs
     - Status bar with connection info
     """
 
@@ -50,27 +50,33 @@ class MainWindow(QMainWindow):
         # Central widget - Tab widget
         self.tabs = QTabWidget()
 
-        # Calculator tab
-        self.calculator_tab = CalculatorTab()
-        self.tabs.addTab(self.calculator_tab, "Calculator")
+        # Dashboard tab (index 0)
+        self.dashboard_tab = DashboardTab()
+        self.tabs.addTab(self.dashboard_tab, "Dashboard")
 
-        # Create tab
+        # Create tab (index 1)
         self.create_tab = CreateTab()
         self.tabs.addTab(self.create_tab, "Create Position")
 
-        # Manage tab
+        # Manage tab (index 2)
         self.manage_tab = ManageTab()
         self.tabs.addTab(self.manage_tab, "Manage Positions")
 
-        # Advanced tab (custom tokens, pools, pool creation)
-        self.advanced_tab = AdvancedTab()
-        self.tabs.addTab(self.advanced_tab, "Advanced")
-
-        # Connect advanced tab signals
-        self.advanced_tab.tokens_updated.connect(self._on_tokens_updated)
+        # Calculator tab (index 3)
+        self.calculator_tab = CalculatorTab()
+        self.tabs.addTab(self.calculator_tab, "Calculator")
 
         # Connect create tab to manage tab for new positions
         self.create_tab.positions_created.connect(self._on_positions_created)
+
+        # Connect manage tab trade_recorded signal to refresh dashboard
+        self.manage_tab.trade_recorded.connect(self._on_trade_recorded)
+
+        # Connect manage tab positions_updated to sync dashboard
+        self.manage_tab.positions_updated.connect(self._sync_dashboard_positions)
+
+        # Connect dashboard pair click to navigate to manage tab
+        self.dashboard_tab.pair_clicked.connect(self._on_dashboard_pair_clicked)
 
         self.setCentralWidget(self.tabs)
 
@@ -79,6 +85,9 @@ class MainWindow(QMainWindow):
 
         # Connect tabs
         self.tabs.currentChanged.connect(self._on_tab_changed)
+
+        # Initial dashboard load
+        self.dashboard_tab.refresh()
 
     def setup_menu(self):
         """Setup the menu bar."""
@@ -110,10 +119,10 @@ class MainWindow(QMainWindow):
         # View menu
         view_menu = menubar.addMenu("View")
 
-        calculator_action = QAction("Calculator", self)
-        calculator_action.setShortcut("Ctrl+1")
-        calculator_action.triggered.connect(lambda: self.tabs.setCurrentIndex(0))
-        view_menu.addAction(calculator_action)
+        dashboard_action = QAction("Dashboard", self)
+        dashboard_action.setShortcut("Ctrl+1")
+        dashboard_action.triggered.connect(lambda: self.tabs.setCurrentIndex(0))
+        view_menu.addAction(dashboard_action)
 
         create_action = QAction("Create Position", self)
         create_action.setShortcut("Ctrl+2")
@@ -125,10 +134,10 @@ class MainWindow(QMainWindow):
         manage_action.triggered.connect(lambda: self.tabs.setCurrentIndex(2))
         view_menu.addAction(manage_action)
 
-        advanced_action = QAction("Advanced", self)
-        advanced_action.setShortcut("Ctrl+4")
-        advanced_action.triggered.connect(lambda: self.tabs.setCurrentIndex(3))
-        view_menu.addAction(advanced_action)
+        calculator_action = QAction("Calculator", self)
+        calculator_action.setShortcut("Ctrl+4")
+        calculator_action.triggered.connect(lambda: self.tabs.setCurrentIndex(3))
+        view_menu.addAction(calculator_action)
 
         # Help menu
         help_menu = menubar.addMenu("Help")
@@ -246,30 +255,25 @@ class MainWindow(QMainWindow):
                     w.deleteLater()
                     setattr(self.create_tab, attr, None)
 
-        # Advanced tab worker
-        if hasattr(self, 'advanced_tab') and hasattr(self.advanced_tab, 'worker'):
-            if self.advanced_tab.worker is not None:
-                if self.advanced_tab.worker.isRunning():
-                    self.advanced_tab.worker.quit()
-                    self.advanced_tab.worker.wait(3000)
-                self.advanced_tab.worker.deleteLater()
-                self.advanced_tab.worker = None
-
     def _on_tab_changed(self, index):
         """Handle tab change."""
         # Sync provider between tabs (mutex protects against worker race condition)
         locker = QMutexLocker(self._provider_mutex)
-        if index == 2:  # Manage tab
+        if index == 0:  # Dashboard tab
+            self._sync_dashboard_positions()
+            self.dashboard_tab.refresh()
+        elif index == 2:  # Manage tab
             if self.create_tab.provider and self.create_tab.worker is None:
                 self.manage_tab.set_provider(self.create_tab.provider)
-        elif index == 3:  # Advanced tab
-            if self.create_tab.provider and self.create_tab.worker is None:
-                self.advanced_tab.set_provider(self.create_tab.provider)
 
-    def _on_tokens_updated(self, tokens: list):
-        """Handle custom tokens update from Advanced tab."""
-        # Update Create tab with new custom tokens
-        self.create_tab.update_custom_tokens(tokens)
+    def _on_trade_recorded(self):
+        """Handle new trade recorded — refresh dashboard stats."""
+        self.dashboard_tab.refresh()
+
+    def _sync_dashboard_positions(self):
+        """Push current manage_tab positions to dashboard."""
+        if hasattr(self.manage_tab, 'positions_data'):
+            self.dashboard_tab.update_positions_data(self.manage_tab.positions_data)
 
     def _on_positions_created(self, token_ids: list):
         """Handle new positions created in Create tab."""
@@ -289,9 +293,48 @@ class MainWindow(QMainWindow):
                 5000
             )
 
+    # chain_id → network_combo index mapping
+    _CHAIN_TO_NETWORK_IDX = {56: 0, 1: 1, 8453: 2}
+
+    def _on_dashboard_pair_clicked(self, token_ids: list, protocol: str, chain_id: int = 56):
+        """Handle pair click from dashboard — switch to Manage tab and load positions."""
+        # Auto-switch network if needed
+        current_chain = getattr(self.create_tab.provider, 'chain_id', None) if self.create_tab.provider else None
+        if current_chain is not None and current_chain != chain_id:
+            target_idx = self._CHAIN_TO_NETWORK_IDX.get(chain_id)
+            if target_idx is not None and self.create_tab.key_input.text().strip():
+                self.create_tab.network_combo.setCurrentIndex(target_idx)
+                # Reconnect wallet on new network
+                self.create_tab._connect_wallet()
+                chain_names = {56: "BNB", 1: "ETH", 8453: "Base"}
+                self.status_bar.showMessage(
+                    f"Switched to {chain_names.get(chain_id, chain_id)} network", 3000
+                )
+
+        # Sync provider before switching (scoped lock, released before setCurrentIndex)
+        with QMutexLocker(self._provider_mutex):
+            if self.create_tab.provider and self.create_tab.worker is None:
+                self.manage_tab.set_provider(self.create_tab.provider)
+
+        # Set token IDs in manage tab input
+        ids_str = ", ".join(str(tid) for tid in token_ids)
+        self.manage_tab.token_ids_input.setText(ids_str)
+
+        # Set protocol combo to match dashboard data (like web version sets version/dexKey)
+        idx = self.manage_tab.scan_protocol_combo.findData(protocol)
+        if idx >= 0:
+            self.manage_tab.scan_protocol_combo.setCurrentIndex(idx)
+
+        # Switch to Manage tab (triggers _on_tab_changed, which needs the mutex)
+        self.tabs.setCurrentIndex(2)
+
+        # Load the positions with correct protocol
+        if self.manage_tab.provider:
+            self.manage_tab._load_positions_by_ids(token_ids, protocol=protocol)
+
     def _on_new_calculator(self):
         """Reset calculator to defaults."""
-        self.tabs.setCurrentIndex(0)
+        self.tabs.setCurrentIndex(3)
         self.calculator_tab.position_table.clear()
         self.calculator_tab.price_chart.clear()
 
@@ -302,7 +345,7 @@ class MainWindow(QMainWindow):
             # Settings changed - apply live without restart
             self.load_stylesheet()
             # Notify all tabs to reload settings
-            for tab in [self.create_tab, self.manage_tab, self.advanced_tab, self.calculator_tab]:
+            for tab in [self.create_tab, self.manage_tab, self.calculator_tab]:
                 if hasattr(tab, 'reload_settings'):
                     tab.reload_settings()
 
@@ -317,6 +360,7 @@ class MainWindow(QMainWindow):
             "on PancakeSwap/Uniswap V3.</p>"
             "<p>Features:</p>"
             "<ul>"
+            "<li>Portfolio dashboard with PnL tracking</li>"
             "<li>Interactive position calculator</li>"
             "<li>Multiple distribution types</li>"
             "<li>Batch position creation via Multicall3</li>"
@@ -333,6 +377,8 @@ class MainWindow(QMainWindow):
             "Documentation",
             "<h3>Quick Start</h3>"
             "<ol>"
+            "<li><b>Dashboard:</b> Overview of your portfolio, PnL, "
+            "and active positions</li>"
             "<li><b>Calculator Tab:</b> Set price, range, and distribution "
             "to preview positions</li>"
             "<li><b>Create Tab:</b> Connect wallet, configure tokens, "
