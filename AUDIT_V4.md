@@ -1,7 +1,9 @@
-# Desktop Audit v4 — 2026-02-28
+# Desktop Audit v4 — 2026-02-28 (обновлено 2026-03-13)
 
 Полный аудит всех Python-файлов в `src/`, `ui/`, `config.py`.
 Найдено **36 новых багов** (не пересекаются с ранее известными C1, H1-H2, M1-M11, L1-L9).
+
+> **Обновление 2026-03-13:** L24, L25, L28 исправлены (QMutex). Добавлен BalanceFetchWorker (async balance). NonceManager gap re-sync. V4 PM возвращает receipt.
 
 ---
 
@@ -416,17 +418,17 @@ params_int.to_bytes(32, 'big')  # OverflowError — 272 bits
 
 ### L24: `_on_scan_position_found` пишет `positions_data` без QMutex
 **Файл:** `ui/manage_tab.py:1674`
-**Статус:** unfixed
+**Статус:** ✅ FIXED (2026-03-13)
 
-`self.positions_data[token_id] = position` без `QMutexLocker(self._positions_mutex)`. Нарушение паттерна — другие места (`_on_position_loaded:1523`) используют mutex. Сейчас безопасно (main thread only), но хрупко.
+`self.positions_data[token_id] = position` теперь обёрнут в `QMutexLocker`. Также добавлен mutex в `_save_positions`, `_persist_open_positions`, `_update_token_ids_input`, `_scan_wallet`, `_update_summary_bar`, `_update_buttons`, `_batch_close_all`, `_clear_all_positions`, `add_positions`, и передаётся `dict(self.positions_data)` snapshot в workers.
 
 ---
 
 ### L25: `_remove_selected` модифицирует `positions_data` без QMutex
 **Файл:** `ui/manage_tab.py:2331-2333`
-**Статус:** unfixed
+**Статус:** ✅ FIXED (2026-03-13)
 
-Удаление из `positions_data` без mutex. Тот же паттерн что L24.
+Удаление из `positions_data` теперь обёрнуто в mutex. Snapshot передаётся для rebuild таблицы.
 
 ---
 
@@ -455,21 +457,21 @@ if not self._update_timer.isActive():
 
 ### L28: `_batch_close_all` читает `positions_data` без QMutex
 **Файл:** `ui/manage_tab.py:2390-2393`
-**Статус:** unfixed
+**Статус:** ✅ FIXED (2026-03-13)
 
-Итерация `self.positions_data.values()` без mutex. Тот же паттерн что L24-L25.
+Теперь используется `QMutexLocker` + snapshot. Также `_batch_collect_fees` и `ClosePositionsWorker` получают `dict(self.positions_data)` вместо ссылки.
 
 ---
 
 ## Сводная таблица
 
-| Severity | Новых (v4) | Ранее известных | Всего |
-|----------|-----------|----------------|-------|
-| **Critical** | 1 (C2) | 1 (C1) | **2** |
-| **High** | 5 (H3-H7) | 2 (H1-H2) | **7** |
-| **Medium** | 11 (M12-M22) | 11 (M1-M11) | **22** |
-| **Low** | 19 (L10-L28) | 9 (L1-L9) | **28** |
-| **Итого** | **36** | **23** | **59** |
+| Severity | Новых (v4) | Ранее известных | Всего | Исправлено |
+|----------|-----------|----------------|-------|-----------|
+| **Critical** | 1 (C2) | 1 (C1) | **2** | 0 |
+| **High** | 5 (H3-H7) | 2 (H1-H2) | **7** | 0 |
+| **Medium** | 11 (M12-M22) | 11 (M1-M11) | **22** | 0 |
+| **Low** | 19 (L10-L28) | 9 (L1-L9) | **28** | 3 (L24,L25,L28) |
+| **Итого** | **36** | **23** | **59** | **3** |
 
 ## Приоритеты для фикса
 

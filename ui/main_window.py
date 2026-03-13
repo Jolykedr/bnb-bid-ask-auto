@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QTabWidget, QMenuBar, QMenu,
     QStatusBar, QLabel, QMessageBox, QApplication
 )
-from PyQt6.QtCore import Qt, QSettings, QMutex, QMutexLocker
+from PyQt6.QtCore import Qt, QSettings, QMutex, QMutexLocker, QTimer
 from PyQt6.QtGui import QAction, QIcon
 
 import os
@@ -235,14 +235,16 @@ class MainWindow(QMainWindow):
                 self.manage_tab.scan_worker.deleteLater()
                 self.manage_tab.scan_worker = None
 
-        # Manage tab swap worker
+        # Manage tab swap worker + balance fetch worker
         if hasattr(self, 'manage_tab'):
-            if hasattr(self.manage_tab, '_swap_worker') and self.manage_tab._swap_worker is not None:
-                if self.manage_tab._swap_worker.isRunning():
-                    self.manage_tab._swap_worker.quit()
-                    self.manage_tab._swap_worker.wait(3000)
-                self.manage_tab._swap_worker.deleteLater()
-                self.manage_tab._swap_worker = None
+            for attr in ('_swap_worker', '_balance_fetch_worker'):
+                w = getattr(self.manage_tab, attr, None)
+                if w is not None:
+                    if w.isRunning():
+                        w.quit()
+                        w.wait(3000)
+                    w.deleteLater()
+                    setattr(self.manage_tab, attr, None)
 
         # Create tab extra workers
         if hasattr(self, 'create_tab'):
@@ -300,18 +302,37 @@ class MainWindow(QMainWindow):
         """Handle pair click from dashboard — switch to Manage tab and load positions."""
         # Auto-switch network if needed
         current_chain = getattr(self.create_tab.provider, 'chain_id', None) if self.create_tab.provider else None
-        if current_chain is not None and current_chain != chain_id:
+        needs_switch = (current_chain is not None and current_chain != chain_id)
+
+        if needs_switch:
             target_idx = self._CHAIN_TO_NETWORK_IDX.get(chain_id)
             if target_idx is not None and self.create_tab.key_input.text().strip():
                 self.create_tab.network_combo.setCurrentIndex(target_idx)
-                # Reconnect wallet on new network
-                self.create_tab._connect_wallet()
                 chain_names = {56: "BNB", 1: "ETH", 8453: "Base"}
                 self.status_bar.showMessage(
-                    f"Switched to {chain_names.get(chain_id, chain_id)} network", 3000
+                    f"Switching to {chain_names.get(chain_id, chain_id)} network...", 3000
                 )
 
-        # Sync provider before switching (scoped lock, released before setCurrentIndex)
+                # Switch tab first, then defer connect + load so UI renders immediately
+                self.tabs.setCurrentIndex(2)
+
+                def _after_network_switch():
+                    self.create_tab._connect_wallet()
+                    with QMutexLocker(self._provider_mutex):
+                        if self.create_tab.provider and self.create_tab.worker is None:
+                            self.manage_tab.set_provider(self.create_tab.provider)
+                    ids_str = ", ".join(str(tid) for tid in token_ids)
+                    self.manage_tab.token_ids_input.setText(ids_str)
+                    idx = self.manage_tab.scan_protocol_combo.findData(protocol)
+                    if idx >= 0:
+                        self.manage_tab.scan_protocol_combo.setCurrentIndex(idx)
+                    if self.manage_tab.provider:
+                        self.manage_tab._load_positions_by_ids(token_ids, protocol=protocol)
+
+                QTimer.singleShot(0, _after_network_switch)
+                return
+
+        # No network switch needed — sync provider and load immediately
         with QMutexLocker(self._provider_mutex):
             if self.create_tab.provider and self.create_tab.worker is None:
                 self.manage_tab.set_provider(self.create_tab.provider)

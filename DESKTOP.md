@@ -165,13 +165,15 @@ open_positions     — Active positions (persist across app restarts)
 | ScanWalletWorker | Manage | Сканирование всех позиций кошелька |
 | ClosePositionWorker | Manage | Закрытие позиций (decrease + collect + burn) |
 | BatchCloseWorker | Manage | Batch-close V4 позиций в 1 TX (modifyLiquidities) |
+| BatchCollectWorker | Manage | Batch collect fees (V3 + V4) |
 | SwapWorker | Manage | Своп через DexSwap (auto-sell после закрытия) |
+| BalanceFetchWorker | Manage | Async ERC20 balance fetch (не блокирует UI) |
 | QuoteWorker | SwapDialog | Получение котировок для preview |
 
 **ManageTab — ключевые паттерны:**
 - `PriceProgressDelegate` — кастомный QStyledItemDelegate для Range Progress колонки (gradient bar + triangle marker)
 - `QTimer` debounce (200ms) — `_flush_table_updates()` для пакетного обновления таблицы (при загрузке 50+ позиций)
-- `_positions_mutex` (QMutex) — защита `positions_data` dict при конкурентных worker'ах
+- `_positions_mutex` (QMutex) — защита `positions_data` dict при конкурентных worker'ах (snapshot pattern: `with QMutexLocker → dict()` → передача snapshot в workers)
 - `_row_index` dict — O(1) маппинг token_id → row для быстрого обновления
 - PnL: `current_value + fees_earned - initial_investment`
 
@@ -360,6 +362,7 @@ class V4LiquidityProvider:
 nonce = nonce_manager.get_next_nonce()  # Аллокация
 nonce_manager.confirm_transaction(nonce) # После receipt
 nonce_manager.release_nonce(nonce)       # При ошибке (TX не отправлена)
+# Non-sequential release → force re-sync на следующей аллокации (2026-03-13)
 ```
 Интегрирован в 23+ точках (8 src-файлов).
 
@@ -623,7 +626,8 @@ except:
 
 ### UI
 - [x] QMutex защищает provider sync
-- [x] Worker cleanup в closeEvent
+- [x] QMutex snapshot pattern для positions_data (2026-03-13: 15+ мест)
+- [x] Worker cleanup в closeEvent (включая _balance_fetch_worker)
 - [x] BaseException handlers в workers (emit signals, not swallow)
 - [x] threading.excepthook для uncaught
 - [x] Live settings reload
@@ -634,6 +638,8 @@ except:
 - [x] _row_index очищается в _clear_list/_remove_selected
 - [x] SwapPreviewDialog останавливает QuoteWorker при Cancel
 - [x] Session close() для KyberSwap/OKX/DexSwap
+- [x] BalanceFetchWorker — async balance fetch (не блокирует UI)
+- [x] Dashboard pair click — deferred network switch через QTimer
 
 ### Тесты
 - [x] 1312 тестов, все passing

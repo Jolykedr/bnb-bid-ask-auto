@@ -1032,7 +1032,7 @@ class TestV4PositionManager:
         action1 = [bytes([0x02]) + b'\x00' * 32, bytes([0x0d]) + b'\x00' * 32]
         action2 = [bytes([0x02]) + b'\x00' * 32, bytes([0x0d]) + b'\x00' * 32]
 
-        tx_hash, results = pm.multicall(payloads=[action1, action2])
+        tx_hash, results, receipt = pm.multicall(payloads=[action1, action2])
         assert isinstance(tx_hash, str)
         pm.w3.eth.send_raw_transaction.assert_called_once()
 

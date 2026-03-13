@@ -1169,6 +1169,41 @@ class SwapWorker(QThread):
                 pass
 
 
+class BalanceFetchWorker(QThread):
+    """Worker thread for fetching ERC20 balances (avoids blocking UI)."""
+
+    result = pyqtSignal(list)  # tokens list with amounts filled in
+    error = pyqtSignal(str)
+
+    def __init__(self, w3, wallet: str, tokens: list):
+        super().__init__()
+        self.w3 = w3
+        self.wallet = wallet
+        self.tokens = tokens  # list of {'address', 'symbol', 'decimals', 'amount'}
+
+    def run(self):
+        try:
+            erc20_abi = [
+                {"constant": True, "inputs": [{"name": "account", "type": "address"}],
+                 "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "type": "function"}
+            ]
+            for token in self.tokens:
+                try:
+                    contract = self.w3.eth.contract(
+                        address=Web3.to_checksum_address(token['address']), abi=erc20_abi
+                    )
+                    token['amount'] = contract.functions.balanceOf(
+                        Web3.to_checksum_address(self.wallet)
+                    ).call()
+                except Exception as e:
+                    logger.warning(f"Failed to get balance for {token['symbol']}: {e}")
+                    token['amount'] = 0
+            self.result.emit(self.tokens)
+        except Exception as e:
+            logger.error(f"BalanceFetchWorker error: {e}", exc_info=True)
+            self.error.emit(str(e))
+
+
 class ManageTab(QWidget):
     """
     Tab for managing existing liquidity positions.
@@ -1195,6 +1230,7 @@ class ManageTab(QWidget):
         self._positions_mutex = QMutex()  # Protects positions_data access
         self.worker = None
         self._collect_worker = None
+        self._balance_fetch_worker = None
         self.load_workers = []  # Legacy compat — now means _active_workers
         self.scan_worker = None
         self._worker_queue = []  # [(token_id, protocol)] pending work
@@ -1573,9 +1609,10 @@ class ManageTab(QWidget):
             self.token_ids_input.setText(new_ids_str)
 
         # Add to positions data (will be populated when loaded)
-        for token_id in token_ids:
-            if token_id not in self.positions_data:
-                self.positions_data[token_id] = None  # Placeholder
+        with QMutexLocker(self._positions_mutex):
+            for token_id in token_ids:
+                if token_id not in self.positions_data:
+                    self.positions_data[token_id] = None  # Placeholder
 
         # Save and reload
         self._save_positions()
@@ -1592,13 +1629,17 @@ class ManageTab(QWidget):
 
     def _save_positions(self):
         """Save positions to QSettings including protocol info."""
+        # Snapshot under mutex
+        with QMutexLocker(self._positions_mutex):
+            snapshot = dict(self.positions_data)
+
         # Save list of token IDs (for backward compatibility)
-        token_ids = list(self.positions_data.keys())
+        token_ids = list(snapshot.keys())
         self.settings.setValue("token_ids", json.dumps(token_ids))
 
         # Save position protocols - minimal data to restore protocol on reload
         positions_protocols = {}
-        for tid, pos in self.positions_data.items():
+        for tid, pos in snapshot.items():
             if pos and isinstance(pos, dict):
                 protocol = pos.get('protocol', 'v3')
                 positions_protocols[str(tid)] = protocol
@@ -1615,9 +1656,12 @@ class ManageTab(QWidget):
             if not wallet:
                 return
             chain_id = getattr(self.provider, 'chain_id', 56)
+            # Snapshot under mutex
+            with QMutexLocker(self._positions_mutex):
+                snapshot = dict(self.positions_data)
             # Inject chain_id into position dicts before saving
             enriched = {}
-            for tid, pos in self.positions_data.items():
+            for tid, pos in snapshot.items():
                 if isinstance(pos, dict) and pos.get('liquidity', 0) > 0:
                     enriched[tid] = dict(pos, chain_id=chain_id)
             save_open_positions_bulk(wallet, enriched)
@@ -1866,7 +1910,8 @@ class ManageTab(QWidget):
 
     def _update_token_ids_input(self):
         """Update token IDs input field to reflect current positions."""
-        remaining_ids = list(self.positions_data.keys())
+        with QMutexLocker(self._positions_mutex):
+            remaining_ids = list(self.positions_data.keys())
         self.token_ids_input.setText(", ".join(str(tid) for tid in remaining_ids))
 
     def _scan_wallet(self):
@@ -1906,7 +1951,8 @@ class ManageTab(QWidget):
         # Clear existing data
         self.positions_table.setRowCount(0)
         self._row_index.clear()
-        self.positions_data = {}
+        with QMutexLocker(self._positions_mutex):
+            self.positions_data = {}
         self.token_ids_input.clear()
 
         # Stop previous scan if still running
@@ -1950,7 +1996,8 @@ class ManageTab(QWidget):
             liquidity = position.get('liquidity', 0)
             self._log(f"  Found #{token_id}: liquidity={liquidity:,}")
 
-            self.positions_data[token_id] = position
+            with QMutexLocker(self._positions_mutex):
+                self.positions_data[token_id] = position
 
             # Only show in table if not filtering or has liquidity
             if not self.hide_empty_cb.isChecked() or liquidity > 0:
@@ -2343,26 +2390,13 @@ class ManageTab(QWidget):
         fees_item = NumericTableWidgetItem(fees_str, stable_fees)
         self.positions_table.setItem(row, 5, fees_item)
 
-        # PnL — show per-position value relative to proportional initial investment
-        initial_total = self.initial_investment_spin.value()
-        active_positions = sum(
-            1 for p in self.positions_data.values()
-            if isinstance(p, dict) and p.get('liquidity', 0) > 0
-        )
-        if initial_total > 0 and active_positions > 0 and usd_value > 0:
-            initial_per_pos = initial_total / active_positions
-            pnl_val = usd_value + stable_fees - initial_per_pos
-            pnl_sign = "+" if pnl_val >= 0 else ""
-            pnl_str = f"{pnl_sign}${pnl_val:.2f}"
-            pnl_item = NumericTableWidgetItem(pnl_str, pnl_val)
-            pnl_item.setForeground(QColor(76, 175, 80) if pnl_val >= 0 else QColor(255, 107, 107))
-        elif usd_value > 0:
-            # No initial investment set — show current value as "worth"
+        # Per-position value (value + fees). Aggregate PnL is in the summary bar.
+        if usd_value > 0:
+            total_pos_value = usd_value + stable_fees
             pnl_str = f"${usd_value:.2f}"
-            pnl_item = NumericTableWidgetItem(pnl_str, usd_value)
             if stable_fees > 0:
                 pnl_str = f"${usd_value:.2f} +${stable_fees:.4f}"
-                pnl_item = NumericTableWidgetItem(pnl_str, usd_value + stable_fees)
+            pnl_item = NumericTableWidgetItem(pnl_str, total_pos_value)
             pnl_item.setForeground(QColor(200, 200, 200))
         else:
             pnl_item = NumericTableWidgetItem("—", 0.0)
@@ -2430,7 +2464,9 @@ class ManageTab(QWidget):
         if not self.provider:
             return
 
-        token_ids = list(self.positions_data.keys())
+        with QMutexLocker(self._positions_mutex):
+            snapshot = dict(self.positions_data)
+        token_ids = list(snapshot.keys())
         if not token_ids:
             # Try to load from input
             token_ids = self._parse_token_ids()
@@ -2441,7 +2477,7 @@ class ManageTab(QWidget):
         # This ensures V4 Uniswap, V4 PancakeSwap, V3, etc. are loaded with correct managers
         positions_by_protocol = {}
         for token_id in token_ids:
-            pos = self.positions_data.get(token_id)
+            pos = snapshot.get(token_id)
             if pos and isinstance(pos, dict):
                 stored_protocol = pos.get('protocol', None)
             else:
@@ -2478,7 +2514,10 @@ class ManageTab(QWidget):
         total_fees = 0.0
         active_count = 0
 
-        for token_id, position in self.positions_data.items():
+        with QMutexLocker(self._positions_mutex):
+            snapshot = list(self.positions_data.items())
+
+        for token_id, position in snapshot:
             if not isinstance(position, dict):
                 continue
             liquidity = position.get('liquidity', 0)
@@ -2548,15 +2587,17 @@ class ManageTab(QWidget):
 
     def _update_buttons(self):
         """Update button states based on positions."""
-        has_positions = len(self.positions_data) > 0
+        with QMutexLocker(self._positions_mutex):
+            pos_values = list(self.positions_data.values())
+        has_positions = len(pos_values) > 0
         has_active = any(
             p and p.get('liquidity', 0) > 0
-            for p in self.positions_data.values()
+            for p in pos_values
         )
 
         # Count V4 positions with liquidity for batch close
         v4_active_count = sum(
-            1 for p in self.positions_data.values()
+            1 for p in pos_values
             if p and p.get('protocol', '').startswith('v4') and p.get('liquidity', 0) > 0
         )
 
@@ -2598,18 +2639,20 @@ class ManageTab(QWidget):
             QMessageBox.warning(self, "Error", "Please select positions to remove.")
             return
 
-        for token_id in token_ids:
-            if token_id in self.positions_data:
-                del self.positions_data[token_id]
+        with QMutexLocker(self._positions_mutex):
+            for token_id in token_ids:
+                if token_id in self.positions_data:
+                    del self.positions_data[token_id]
+            snapshot = dict(self.positions_data)
 
         # Update input field
-        remaining_ids = list(self.positions_data.keys())
+        remaining_ids = list(snapshot.keys())
         self.token_ids_input.setText(", ".join(str(tid) for tid in remaining_ids))
 
         # Rebuild table
         self.positions_table.setRowCount(0)
         self._row_index.clear()
-        for token_id, position in self.positions_data.items():
+        for token_id, position in snapshot.items():
             if position:
                 self._update_table_row(token_id, position)
 
@@ -2657,8 +2700,10 @@ class ManageTab(QWidget):
             return
 
         # Get all V4 positions with liquidity
+        with QMutexLocker(self._positions_mutex):
+            pos_values = list(self.positions_data.values())
         v4_positions = [
-            p for p in self.positions_data.values()
+            p for p in pos_values
             if p and p.get('protocol', '').startswith('v4') and p.get('liquidity', 0) > 0
         ]
 
@@ -2828,7 +2873,7 @@ class ManageTab(QWidget):
         self.collect_fees_btn.setEnabled(False)
 
         self._collect_worker = BatchCollectWorker(
-            self.provider, self.positions_data, collect_ids, chain_id
+            self.provider, dict(self.positions_data), collect_ids, chain_id
         )
         self._collect_worker.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
         self._collect_worker.collect_result.connect(self._on_batch_collect_finished, Qt.ConnectionType.QueuedConnection)
@@ -2934,7 +2979,7 @@ class ManageTab(QWidget):
         initial_investment = self.initial_investment_spin.value()
 
         self.worker = ClosePositionsWorker(
-            self.provider, token_ids, self.positions_data,
+            self.provider, token_ids, dict(self.positions_data),
             chain_id=chain_id,
             initial_investment=initial_investment,
         )
@@ -3084,7 +3129,6 @@ class ManageTab(QWidget):
     def _show_swap_preview(self, close_data: dict):
         """Show swap preview dialog after successful position close."""
         try:
-            chain_id = getattr(self.provider, 'chain_id', 56)
             w3 = self.provider.w3
 
             # Collect volatile tokens from positions
@@ -3148,27 +3192,41 @@ class ManageTab(QWidget):
                 self._refresh_all_positions()
                 return
 
-            # Fetch current wallet balances (sell entire balance, like web version)
-            erc20_abi = [
-                {"constant": True, "inputs": [{"name": "account", "type": "address"}],
-                 "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "type": "function"}
-            ]
-            wallet = self.provider.account.address
+            # Save close_data for continuation after balance fetch
+            self._close_data = close_data
 
-            for token in tokens_to_sell:
-                try:
-                    contract = w3.eth.contract(
-                        address=Web3.to_checksum_address(token['address']), abi=erc20_abi
-                    )
-                    token['amount'] = contract.functions.balanceOf(
-                        Web3.to_checksum_address(wallet)
-                    ).call()
-                except Exception as e:
-                    self._log(f"Failed to get balance for {token['symbol']}: {e}")
-                    token['amount'] = 0
+            # Fetch balances in background worker (avoids UI freeze)
+            wallet = self.provider.account.address
+            self._log("Fetching token balances...")
+
+            self._balance_fetch_worker = BalanceFetchWorker(w3, wallet, tokens_to_sell)
+            self._balance_fetch_worker.result.connect(
+                self._on_balances_fetched, Qt.ConnectionType.QueuedConnection
+            )
+            self._balance_fetch_worker.error.connect(
+                lambda e: self._on_balance_fetch_error(e), Qt.ConnectionType.QueuedConnection
+            )
+            self._balance_fetch_worker.start()
+
+        except Exception as e:
+            logger.exception(f"Error showing swap preview: {e}")
+            self._log(f"Error showing swap preview: {e}")
+            self._refresh_all_positions()
+
+    def _on_balances_fetched(self, tokens: list):
+        """Handle balance fetch completion — show swap preview or sell."""
+        try:
+            # Cleanup worker
+            if hasattr(self, '_balance_fetch_worker') and self._balance_fetch_worker is not None:
+                self._safe_cleanup_worker(self._balance_fetch_worker)
+                self._balance_fetch_worker = None
+
+            close_data = getattr(self, '_close_data', {})
+            chain_id = getattr(self.provider, 'chain_id', 56)
+            w3 = self.provider.w3
 
             # Filter out zero-balance tokens
-            tokens_to_sell = [t for t in tokens_to_sell if t.get('amount', 0) > 0]
+            tokens_to_sell = [t for t in tokens if t.get('amount', 0) > 0]
 
             if not tokens_to_sell:
                 self._log("No tokens with balance to sell")
@@ -3184,9 +3242,6 @@ class ManageTab(QWidget):
             proxy = getattr(self.provider, 'proxy', None)
             swapper = DexSwap(w3, chain_id, use_kyber=False, proxy=proxy)
             output_token = swapper.get_output_token()
-
-            # Save close_data for PnL display after swap
-            self._close_data = close_data
 
             # Skip preview → sell immediately
             if self.skip_preview_cb.isChecked():
@@ -3216,9 +3271,23 @@ class ManageTab(QWidget):
                 self._refresh_all_positions()
 
         except Exception as e:
-            logger.exception(f"Error showing swap preview: {e}")
-            self._log(f"Error showing swap preview: {e}")
+            logger.exception(f"Error in swap preview: {e}")
+            self._log(f"Error in swap preview: {e}")
             self._refresh_all_positions()
+
+    def _on_balance_fetch_error(self, error: str):
+        """Handle balance fetch failure."""
+        if hasattr(self, '_balance_fetch_worker') and self._balance_fetch_worker is not None:
+            self._safe_cleanup_worker(self._balance_fetch_worker)
+            self._balance_fetch_worker = None
+        self._log(f"Failed to fetch balances: {error}")
+        close_data = getattr(self, '_close_data', {})
+        QMessageBox.information(
+            self, "Success",
+            f"Positions closed!\n\nTX: {close_data.get('tx_hash', 'N/A')}\n\n"
+            f"Could not fetch balances for swap: {error}"
+        )
+        self._refresh_all_positions()
 
     def _on_swap_confirmed(self, tokens: list):
         """Handle swap confirmation from preview dialog."""
@@ -3318,7 +3387,8 @@ class ManageTab(QWidget):
             return
 
         self.positions_table.setRowCount(0)
-        self.positions_data = {}
+        with QMutexLocker(self._positions_mutex):
+            self.positions_data = {}
         self._row_index.clear()
         self.token_ids_input.clear()
         self.close_selected_btn.setEnabled(False)
