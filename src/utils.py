@@ -193,6 +193,9 @@ class NonceManager:
             # If this was the last allocated nonce, reclaim it
             if self._current_nonce is not None and nonce == self._current_nonce - 1:
                 self._current_nonce = nonce
+            else:
+                # Non-sequential release creates a gap; force re-sync on next allocation
+                self._last_sync_time = 0
             logger.debug(f"Released nonce: {nonce}, current: {self._current_nonce}")
 
     def reset(self):

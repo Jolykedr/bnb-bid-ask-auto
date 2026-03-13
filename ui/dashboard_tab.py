@@ -640,6 +640,27 @@ class DashboardTab(QWidget):
             protocol = info['protocol']
             chain_id = info['chain_id']
 
+            # Row container: [delete_btn] [pair_btn]
+            row_widget = QWidget()
+            row_widget.setStyleSheet("background: transparent; border: none;")
+            row_hlayout = QHBoxLayout(row_widget)
+            row_hlayout.setContentsMargins(0, 0, 0, 0)
+            row_hlayout.setSpacing(4)
+
+            # Delete button on the left
+            del_btn = QPushButton("\u2715")
+            del_btn.setFixedSize(22, 22)
+            del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            del_btn.setStyleSheet(
+                f"QPushButton {{ background: transparent; color: {TEXT_MUTED}; "
+                f"font-size: 11px; border: none; border-radius: 11px; }}"
+                f"QPushButton:hover {{ color: {RED}; background-color: rgba(255,107,107,0.15); }}"
+            )
+            del_btn.setToolTip("Remove from dashboard")
+            del_btn.clicked.connect(lambda checked, ids=token_ids: self._remove_pair(ids))
+            row_hlayout.addWidget(del_btn)
+
+            # Pair button
             row_btn = QPushButton()
             row_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             row_btn.setStyleSheet(
@@ -680,24 +701,9 @@ class DashboardTab(QWidget):
             arrow_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             row_layout.addWidget(arrow_lbl)
 
-            self.pairs_container.addWidget(row_btn)
+            row_hlayout.addWidget(row_btn, 1)
 
-            # Delete button (separate from pair click)
-            del_btn = QPushButton("x")
-            del_btn.setFixedSize(20, 20)
-            del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            del_btn.setStyleSheet(
-                f"QPushButton {{ background: transparent; color: {TEXT_MUTED}; "
-                f"font-size: 11px; border: none; border-radius: 10px; }}"
-                f"QPushButton:hover {{ color: {RED}; background-color: rgba(255,107,107,0.15); }}"
-            )
-            del_btn.setToolTip("Remove from dashboard")
-            del_btn.clicked.connect(lambda checked, ids=token_ids: self._remove_pair(ids))
-            # Position delete button on top-right of pair row
-            del_btn.setParent(row_btn)
-            del_btn.move(row_btn.width() - 24, 2)
-            # Re-position on resize
-            row_btn.resizeEvent = lambda event, btn=del_btn, rb=row_btn: btn.move(rb.width() - 24, 2)
+            self.pairs_container.addWidget(row_widget)
 
         self.pairs_container.addStretch()
 

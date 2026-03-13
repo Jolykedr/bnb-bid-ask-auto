@@ -1283,7 +1283,7 @@ class V4PositionManager:
 
             logger.info(f"[V4] TX confirmed, gas used: {receipt.get('gasUsed', 'unknown')}")
 
-            return tx_hash.hex(), []
+            return tx_hash.hex(), [], receipt
 
         except Exception as e:
             if self.nonce_manager and not nonce_handled:
