@@ -102,7 +102,15 @@ In the **Create** tab:
 ### 5. Preview & Create
 Click **Preview** to see exact position breakdown. Review amounts, then click **Create** to deploy.
 
-### 6. Manage Positions
+### 6. Dashboard
+The **Dashboard** tab shows:
+- Realized PnL, win rate, open positions count
+- Cumulative PnL chart (QPainter-rendered)
+- Active pairs with click-to-manage navigation
+- Recent closed trades history
+- Positions persist across app restarts (SQLite storage)
+
+### 7. Manage Positions
 Switch to the **Manage** tab to:
 - View all your active positions
 - Collect accumulated fees
@@ -114,10 +122,10 @@ Switch to the **Manage** tab to:
 
 | Tab | Description |
 |-----|-------------|
+| **Dashboard** | Portfolio overview: PnL stats, active pairs, cumulative chart, recent trades |
 | **Create** | Configure and deploy liquidity ladder |
 | **Manage** | View, collect fees, close existing positions |
 | **Calculator** | Preview distributions without deploying |
-| **Advanced** | Pool creation, manual operations |
 | **Settings** | Wallet management, RPC, chain config |
 
 ---

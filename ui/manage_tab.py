@@ -32,6 +32,7 @@ from src.contracts.v4.pool_manager import V4PoolManager
 from src.liquidity_provider import LiquidityProvider
 from src.multicall.batcher import Multicall3Batcher
 from src.dex_swap import DexSwap
+from src.storage.pnl_store import TradeRecord, save_trade, save_open_positions_bulk, remove_open_positions
 from ui.swap_preview_dialog import SwapPreviewDialog
 
 logger = logging.getLogger(__name__)
@@ -549,6 +550,9 @@ class LoadPositionWorker(QThread):
                         finally:
                             if self.pool_cache:
                                 self.pool_cache.release(pool_key)
+
+            # Stamp protocol so dashboard/close know which DEX this belongs to
+            position['protocol'] = self.protocol
 
             self.position_loaded.emit(self.token_id, position)
 
@@ -1180,6 +1184,8 @@ class ManageTab(QWidget):
 
     # Signal to notify when positions are added externally
     positions_updated = pyqtSignal()
+    # Signal emitted when a trade is recorded to PnL store (for dashboard refresh)
+    trade_recorded = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1599,6 +1605,24 @@ class ManageTab(QWidget):
 
         self.settings.setValue("positions_protocols", json.dumps(positions_protocols))
         self._log(f"Saved {len(token_ids)} positions to storage")
+
+    def _persist_open_positions(self):
+        """Save open positions to SQLite so dashboard can restore them after restart."""
+        try:
+            wallet = None
+            if self.provider and hasattr(self.provider, 'account') and self.provider.account:
+                wallet = self.provider.account.address
+            if not wallet:
+                return
+            chain_id = getattr(self.provider, 'chain_id', 56)
+            # Inject chain_id into position dicts before saving
+            enriched = {}
+            for tid, pos in self.positions_data.items():
+                if isinstance(pos, dict) and pos.get('liquidity', 0) > 0:
+                    enriched[tid] = dict(pos, chain_id=chain_id)
+            save_open_positions_bulk(wallet, enriched)
+        except Exception as e:
+            logger.warning(f"Failed to persist open positions: {e}")
 
     def _load_saved_positions(self):
         """Load saved positions from QSettings."""
@@ -2041,6 +2065,9 @@ class ManageTab(QWidget):
             self._save_positions()
             self._update_pnl_summary()
             self._log(f"All positions loaded ({len(self.positions_data)} total)")
+            self.positions_updated.emit()
+            # Persist open positions to SQLite for dashboard recovery
+            self._persist_open_positions()
 
     def _update_table_row(self, token_id: int, position: dict):
         """Update or add a table row for a position."""
@@ -2738,6 +2765,7 @@ class ManageTab(QWidget):
             if success:
                 self._log(f"SUCCESS: {message}")
                 self._log(f"TX Hash: {data.get('tx_hash', 'N/A')}")
+                self._record_closed_trade(data)
 
                 # Check if auto-sell with preview is pending
                 if getattr(self, '_pending_auto_sell', False) and self._pending_private_key:
@@ -2918,6 +2946,107 @@ class ManageTab(QWidget):
         """Handle progress updates."""
         self._log(message)
 
+    def _record_closed_trade(self, data: dict):
+        """Save a closed trade to the PnL store."""
+        try:
+            positions_data = data.get('positions_data', {})
+            token_ids = data.get('token_ids', [])
+            positions_list = data.get('positions', [])
+            initial = data.get('initial_investment', 0)
+            tx_hash = data.get('tx_hash', 'N/A')
+            chain_id = getattr(self.provider, 'chain_id', 56) if self.provider else 56
+
+            # Collect position dicts
+            pos_dicts = []
+            if positions_data and token_ids:
+                for tid in token_ids:
+                    p = positions_data.get(tid, {})
+                    if p:
+                        pos_dicts.append(p)
+            elif positions_list:
+                pos_dicts = positions_list
+
+            if not pos_dicts:
+                return
+
+            # Build pair name from first position
+            first = pos_dicts[0]
+            sym0 = first.get('token0_symbol', first.get('token0', '???')[:6])
+            sym1 = first.get('token1_symbol', first.get('token1', '???')[:6])
+            pair = f"{sym0}/{sym1}"
+            protocol = first.get('protocol', 'v3')
+
+            # Calculate received value (current value at close time)
+            received = 0.0
+            for pos in pos_dicts:
+                tick_lower = pos.get('tick_lower', 0)
+                tick_upper = pos.get('tick_upper', 0)
+                current_tick = pos.get('current_tick', None)
+                dec0 = pos.get('token0_decimals', 18)
+                dec1 = pos.get('token1_decimals', 18)
+                liq = pos.get('liquidity', 0)
+                t0 = pos.get('token0', '').lower()
+                t1 = pos.get('token1', '').lower()
+                t0_stable = t0 in STABLECOINS
+                t1_stable = t1 in STABLECOINS
+
+                if current_tick is not None and tick_lower < tick_upper and liq > 0:
+                    try:
+                        sqrt_l = 1.0001 ** (tick_lower / 2)
+                        sqrt_u = 1.0001 ** (tick_upper / 2)
+                        sqrt_c = 1.0001 ** (current_tick / 2)
+                        amounts = calculate_amounts(sqrt_c, sqrt_l, sqrt_u, liq)
+                        a0 = amounts.amount0 / (10 ** dec0) if amounts.amount0 > 0 else 0
+                        a1 = amounts.amount1 / (10 ** dec1) if amounts.amount1 > 0 else 0
+
+                        raw_price = pos.get('current_price', 0)
+                        if t0_stable and not t1_stable:
+                            usd = a0 + a1 * (1 / raw_price) if raw_price > 0 else a0
+                        elif t1_stable and not t0_stable:
+                            usd = a1 + a0 * (raw_price if raw_price > 0 else 0)
+                        else:
+                            usd = 0
+                        received += usd
+                    except Exception:
+                        pass
+
+                # Add fees
+                fees0 = pos.get('tokens_owed0', 0)
+                fees1 = pos.get('tokens_owed1', 0)
+                if t0_stable:
+                    received += fees0 / (10 ** dec0)
+                elif t1_stable:
+                    received += fees1 / (10 ** dec1)
+
+            invested = initial if initial > 0 else 0
+            pnl = received - invested if invested > 0 else 0
+            pnl_pct = (pnl / invested * 100) if invested > 0 else 0
+
+            record = TradeRecord(
+                id=None,
+                pair=pair,
+                chain_id=chain_id,
+                protocol=protocol,
+                n_positions=len(pos_dicts),
+                invested_usd=round(invested, 2),
+                received_usd=round(received, 2),
+                pnl_usd=round(pnl, 2),
+                pnl_percent=round(pnl_pct, 1),
+                tx_hash=tx_hash,
+                closed_at=time.time(),
+            )
+            save_trade(record)
+            self._log(f"Trade recorded: {pair} | PnL: ${pnl:+.2f} ({pnl_pct:+.1f}%)")
+            # Remove closed positions from persistent storage
+            # token_ids may be empty for batch close — extract from positions list
+            closed_ids = token_ids
+            if not closed_ids and pos_dicts:
+                closed_ids = [p.get('token_id') for p in pos_dicts if p.get('token_id')]
+            remove_open_positions(closed_ids)
+            self.trade_recorded.emit()
+        except Exception as e:
+            logger.warning(f"Failed to record trade: {e}")
+
     def _on_close_finished(self, success: bool, message: str, data: dict):
         """Handle close completion. Shows swap preview if auto-sell enabled."""
         try:
@@ -2933,6 +3062,7 @@ class ManageTab(QWidget):
             if success:
                 self._log(f"SUCCESS: {message}")
                 self._log(f"TX Hash: {data.get('tx_hash', 'N/A')}")
+                self._record_closed_trade(data)
 
                 # Check if auto-sell with preview is pending
                 if getattr(self, '_pending_auto_sell', False) and self._pending_private_key:

@@ -21,7 +21,7 @@
 | Блокчейн | Web3.py 6+ |
 | Шифрование | AES-256-GCM + PBKDF2 (600k итераций) |
 | Математика | Python Decimal (50-digit precision) |
-| Тесты | pytest (1312 тестов, ~80% покрытие src/) |
+| Тесты | pytest (1307+ тестов, ~80% покрытие src/) |
 | Пакеты | uv (pyproject.toml + uv.lock) |
 | DEX агрегатор | KyberSwap, OKX DEX |
 
@@ -65,10 +65,10 @@ bnb/
 │
 ├── ui/                                # ИНТЕРФЕЙС (PyQt6)
 │   ├── main_window.py                 # MainWindow (4 таба, меню, mutex, worker cleanup)
-│   ├── calculator_tab.py              # Tab 0: Preview лестницы (без блокчейна)
+│   ├── dashboard_tab.py               # Tab 0: Dashboard (PnL stats, chart, active pairs)
 │   ├── create_tab.py                  # Tab 1: Создание позиций (LoadPool, CreateLadder workers)
 │   ├── manage_tab.py                  # Tab 2: Управление (Load, Scan, Close, Swap workers)
-│   ├── advanced_tab.py                # Tab 3: Custom tokens, pool creation V3/V4
+│   ├── calculator_tab.py              # Tab 3: Preview лестницы (без блокчейна)
 │   ├── settings_dialog.py             # Настройки (RPC, gas, slippage, тема)
 │   ├── password_dialog.py             # Мастер-пароль (шифрование ключа)
 │   ├── swap_preview_dialog.py         # Preview свопов (KyberSwap → V3 → V2)
@@ -77,6 +77,10 @@ bnb/
 │   │   └── price_chart.py             # Визуализация позиций (бары, текущая цена)
 │   └── styles/
 │       └── dark_theme.qss             # Dark theme
+│
+├── src/storage/                       # ХРАНИЛИЩЕ
+│   ├── __init__.py
+│   └── pnl_store.py                   # SQLite: trades + open_positions (~/.bnb_ladder/pnl.db)
 │
 ├── tests/                             # ТЕСТЫ (1312 штук)
 │   ├── test_ticks.py                  # 711 строк, tick math
@@ -113,23 +117,42 @@ MainWindow(QMainWindow)
 ├── Menu: File, Edit, View, Help
 ├── StatusBar: Connection + Network labels
 ├── QTabWidget:
-│   ├── Tab 0: CalculatorTab     — Preview (offline)
+│   ├── Tab 0: DashboardTab      — Portfolio overview (PnL, chart, pairs)
 │   ├── Tab 1: CreateTab         — Создание позиций (blockchain)
 │   ├── Tab 2: ManageTab         — Управление позициями
-│   └── Tab 3: AdvancedTab       — Custom tokens, pool creation
+│   └── Tab 3: CalculatorTab     — Preview (offline)
 │
 ├── QMutex: _provider_mutex      — Защита provider при tab switch
+├── Auto chain switch             — Dashboard pair click → переключение сети
 └── Worker cleanup: closeEvent() → _cleanup_workers()
 ```
 
 ### Signal Flow
 
 ```
-AdvancedTab.tokens_updated(list) ──→ MainWindow ──→ CreateTab.update_tokens()
 CreateTab.positions_created(ids) ──→ MainWindow ──→ ManageTab.add_positions()
+ManageTab.trade_recorded()       ──→ MainWindow ──→ DashboardTab.refresh()
+ManageTab.positions_updated()    ──→ MainWindow ──→ DashboardTab.update_positions_data()
+DashboardTab.pair_clicked(ids, protocol, chain_id)
+                                 ──→ MainWindow ──→ auto-switch chain + ManageTab.load_positions
 SettingsDialog.accepted ──→ MainWindow ──→ all tabs.reload_settings()
 QTabWidget.currentChanged ──→ MainWindow._on_tab_changed() [mutex-protected]
 ```
+
+### Storage (SQLite — ~/.bnb_ladder/pnl.db)
+
+```
+trades             — Closed trade records (PnL, win/loss stats)
+open_positions     — Active positions (persist across app restarts)
+```
+
+**Жизненный цикл позиции:**
+1. Создана в CreateTab → token_ids → ManageTab.add_positions()
+2. Загружена воркерами → positions_data[tid] с protocol, chain_id
+3. Сохранена в SQLite (`save_open_positions_bulk`) после загрузки всех воркеров
+4. Отображена в Dashboard (из SQLite при restart, из памяти в текущей сессии)
+5. Закрыта → `remove_open_positions(token_ids)` + `save_trade(record)`
+6. Удалена из Dashboard (автоматически при refresh или вручную кнопкой x)
 
 ### Worker Threads (QThread)
 
@@ -144,9 +167,6 @@ QTabWidget.currentChanged ──→ MainWindow._on_tab_changed() [mutex-protecte
 | BatchCloseWorker | Manage | Batch-close V4 позиций в 1 TX (modifyLiquidities) |
 | SwapWorker | Manage | Своп через DexSwap (auto-sell после закрытия) |
 | QuoteWorker | SwapDialog | Получение котировок для preview |
-| LoadTokenWorker | Advanced | Загрузка информации о токене |
-| CreatePoolWorker | Advanced | Создание V3 пула |
-| CreateV4PoolWorker | Advanced | Создание V4 пула |
 
 **ManageTab — ключевые паттерны:**
 - `PriceProgressDelegate` — кастомный QStyledItemDelegate для Range Progress колонки (gradient bar + triangle marker)
@@ -422,9 +442,11 @@ pytest tests/ --cov=src --cov-report=term-missing
 | pool_factory.py | 100% | test_pool_factory.py |
 | subgraph.py | 100% | test_subgraph.py |
 | crypto.py | ~95% | test_crypto.py (376 строк) |
-| UI layer | 4-16% | Минимальные |
+| storage/pnl_store.py | ~90% | test_dashboard.py |
+| ui/dashboard_tab.py | ~70% | test_dashboard.py |
+| UI layer (other) | 4-16% | Минимальные |
 | okx_dex.py | 0% | — |
-| **Итого** | **~80%** | **1312 тестов** |
+| **Итого** | **~80%** | **1307+ тестов** |
 
 ---
 
@@ -558,7 +580,7 @@ except:
 | KyberSwap thread | Однопоточный UI | Shared session ⚠️ | Thread-local ✓ |
 | NonceManager | Полноценный ✓ | Нет (pending nonce) | Per-wallet lock ✓ |
 | PM.multicall batch | Batch mint/close ✓ | Есть ✓ | Есть ✓ |
-| Tests | 1308 (80%) ✓ | Нет тестов ⚠️ | Нет тестов ⚠️ |
+| Tests | 1307+ (80%) ✓ | Нет тестов ⚠️ | Нет тестов ⚠️ |
 
 ---
 
@@ -571,7 +593,7 @@ except:
 | `config.py` | `STABLECOINS` dict, `STABLE_TOKENS` dict, `is_stablecoin()`, `is_stable_token()`, `get_stablecoin_decimals()` |
 | `ui/create_tab.py` | `_should_invert_price()`, decimal offset, pool loading |
 | `ui/manage_tab.py` | USD value calculation, position display |
-| `ui/advanced_tab.py` | Swap token detection |
+| `ui/dashboard_tab.py` | USD value calculation for active pairs |
 | `src/liquidity_provider.py` | Quote token detection, distribution params |
 | `src/v4_liquidity_provider.py` | Quote token, invert_price, amount assignment |
 | `src/dex_swap.py` | Sell target detection |
@@ -607,7 +629,7 @@ except:
 - [x] Live settings reload
 - [x] _load_pool_worker safe cleanup перед перезаписью
 - [x] _on_finished deferred deleteLater (через finished signal)
-- [x] advanced_tab wait() перед deleteLater
+- [x] advanced_tab wait() перед deleteLater (вкладка удалена)
 - [x] _cleanup_workers покрывает все worker типы
 - [x] _row_index очищается в _clear_list/_remove_selected
 - [x] SwapPreviewDialog останавливает QuoteWorker при Cancel
@@ -638,7 +660,7 @@ except:
 **MEDIUM:**
 - [ ] **M1: V4 close_position не burn-ит NFT** — `build_close_position_payload(burn=False)` по умолчанию. Orphan NFT + dust lock.
 - [ ] **M2: Batcher EIP-1559 maxFeePerGas** — `batcher.py:530` использует `gas_price*2` вместо `baseFee*2+priorityFee`. Сейчас не триггерится.
-- [ ] **M3: advanced_tab deleteLater на running worker** — result signal handler вызывает deleteLater() до завершения run() → потенциальный segfault.
+- [x] **M3: advanced_tab** — вкладка удалена (функционал перенесён в Create tab).
 - [x] **M4: BaseException handlers** — 8 workers без BaseException handler → UI freeze. **ИСПРАВЛЕНО 2026-02-28.**
 - [ ] **M5: _pending_private_key не зерится** — manage_tab.py: приватный ключ остаётся в памяти после swap.
 - [ ] **M6: SwapPreviewDialog QThread segfault** — deleteLater + ref drop при timeout QuoteWorker.wait().
