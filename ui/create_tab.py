@@ -2989,8 +2989,9 @@ class CreateTab(QWidget):
                 liq_str = f"${liq:.0f}"
 
             fee_pct = p.get("fee", 0) / 10_000
+            version_tag = p.get("version", "v3").upper()
             label = (f"{p['token0_symbol']}/{p['token1_symbol']}  "
-                     f"fee={fee_pct:.2f}%  liq={liq_str}  "
+                     f"fee={fee_pct:.2f}%  [{version_tag}]  liq={liq_str}  "
                      f"[{p['pool_address'][:8]}…]")
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, p)

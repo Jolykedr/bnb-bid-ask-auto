@@ -35,7 +35,10 @@ from src.dex_swap import DexSwap
 from src.storage.pnl_store import (
     TradeRecord, save_trade, save_open_positions_bulk, remove_open_positions,
     ClaimedFeeRecord, save_claimed_fees_bulk,
+    get_latest_snapshots_bulk, prune_old_snapshots,
 )
+from src.math.apr import calc_position_apr, calc_aggregate_apr
+from src.receipt_parser import parse_close_receipt, calculate_usd_value
 from ui.swap_preview_dialog import SwapPreviewDialog
 
 logger = logging.getLogger(__name__)
@@ -881,6 +884,18 @@ class ClosePositionsWorker(QThread):
             all_success = all(r[2] for r in results) if results else False
             tx_hashes = [r[1] for r in results if r[1]]
 
+            # Fetch receipts in worker thread (off UI thread)
+            receipts = []
+            if all_success and tx_hashes:
+                for h in tx_hashes:
+                    try:
+                        r = self.provider.w3.eth.get_transaction_receipt(h)
+                        rd = dict(r)
+                        rd['logs'] = [dict(log) for log in rd.get('logs', [])]
+                        receipts.append(rd)
+                    except Exception:
+                        pass
+
             # Build result data
             result_data = {
                 'tx_hash': ', '.join(tx_hashes) if tx_hashes else 'N/A',
@@ -888,6 +903,7 @@ class ClosePositionsWorker(QThread):
                 'initial_investment': self.initial_investment,
                 'positions_data': self.positions_data,
                 'token_ids': self.token_ids,
+                'receipts': receipts,
             }
 
             if all_success:
@@ -939,11 +955,23 @@ class BatchCloseWorker(QThread):
                 timeout=300
             )
 
+            # Fetch receipt in worker thread (off UI thread)
+            receipts = []
+            if success and tx_hash:
+                try:
+                    r = w3.eth.get_transaction_receipt(tx_hash)
+                    rd = dict(r)
+                    rd['logs'] = [dict(log) for log in rd.get('logs', [])]
+                    receipts.append(rd)
+                except Exception:
+                    pass
+
             result_data = {
                 'tx_hash': tx_hash,
                 'gas_used': gas_used,
                 'initial_investment': self.initial_investment,
                 'positions': self.positions,
+                'receipts': receipts,
             }
 
             if success:
@@ -2551,6 +2579,18 @@ class ManageTab(QWidget):
         with QMutexLocker(self._positions_mutex):
             snapshot = list(self.positions_data.items())
 
+        # Collect active token_ids for APR bulk lookup
+        active_token_ids = []
+        for token_id, position in snapshot:
+            if isinstance(position, dict) and position.get('liquidity', 0) > 0:
+                active_token_ids.append(token_id)
+
+        # Fetch previous snapshots for APR calculation
+        prev_snapshots = get_latest_snapshots_bulk(active_token_ids) if active_token_ids else {}
+
+        apr_map = {}    # token_id -> daily_apr
+        value_map = {}  # token_id -> position_value_usd
+
         for token_id, position in snapshot:
             if not isinstance(position, dict):
                 continue
@@ -2570,6 +2610,7 @@ class ManageTab(QWidget):
             token0_is_stable = token0 in STABLECOINS
             token1_is_stable = token1 in STABLECOINS
 
+            pos_usd = 0.0
             try:
                 raw_price = position.get('current_price', 0)
                 if raw_price and raw_price > 0 and tick_lower < tick_upper:
@@ -2579,23 +2620,56 @@ class ManageTab(QWidget):
                         token0, token1, dec0, dec1, cur_tick=current_tick,
                     )
                     if usd:
+                        pos_usd = usd
                         total_value += usd
             except Exception:
                 pass
 
-            # Fees
+            # Fees (USD estimate from stablecoin side)
             fees0 = position.get('tokens_owed0', 0)
             fees1 = position.get('tokens_owed1', 0)
+            fees_usd = 0.0
             if token0_is_stable:
-                total_fees += fees0 / (10 ** dec0)
+                fees_usd = fees0 / (10 ** dec0)
             elif token1_is_stable:
-                total_fees += fees1 / (10 ** dec1)
+                fees_usd = fees1 / (10 ** dec1)
+            total_fees += fees_usd
+
+            # APR snapshot
+            chain_id = position.get('chain_id', 56)
+            protocol = position.get('protocol', 'v3')
+            prev = prev_snapshots.get(token_id)
+            try:
+                apr = calc_position_apr(
+                    token_id, chain_id, protocol,
+                    fees_usd, pos_usd, prev,
+                )
+                apr_map[token_id] = apr
+                value_map[token_id] = pos_usd
+            except Exception:
+                pass
+
+        # Prune old snapshots periodically (max once per hour)
+        now = time.time()
+        last_prune = getattr(self, '_last_snapshot_prune', 0)
+        if now - last_prune > 3600:
+            self._last_snapshot_prune = now
+            try:
+                prune_old_snapshots()
+            except Exception:
+                pass
 
         # Build summary text
         initial = self.initial_investment_spin.value()
         parts = [f"Positions: {active_count}", f"Value: ${total_value:.2f}"]
         if total_fees > 0:
             parts.append(f"Fees: ${total_fees:.4f}")
+
+        # Aggregate APR
+        agg_apr = calc_aggregate_apr(apr_map, value_map)
+        if agg_apr is not None:
+            parts.append(f"APR: {agg_apr:.1f}%/day")
+
         if initial > 0:
             pnl = total_value + total_fees - initial
             pnl_sign = "+" if pnl >= 0 else ""
@@ -2607,6 +2681,10 @@ class ManageTab(QWidget):
             self.pnl_summary_label.setStyleSheet("color: #aaa; font-size: 12px; padding: 4px 8px;")
 
         self.pnl_summary_label.setText(" | ".join(parts))
+
+        # Store APR data for dashboard
+        self._apr_map = apr_map
+        self._value_map = value_map
 
     def _update_buttons(self):
         """Update button states based on positions."""
@@ -3102,47 +3180,13 @@ class ManageTab(QWidget):
             pair = f"{sym0}/{sym1}"
             protocol = first.get('protocol', 'v3')
 
-            # Calculate received value (current value at close time)
-            received = 0.0
-            for pos in pos_dicts:
-                tick_lower = pos.get('tick_lower', 0)
-                tick_upper = pos.get('tick_upper', 0)
-                current_tick = pos.get('current_tick', None)
-                dec0 = pos.get('token0_decimals', 18)
-                dec1 = pos.get('token1_decimals', 18)
-                liq = pos.get('liquidity', 0)
-                t0 = pos.get('token0', '').lower()
-                t1 = pos.get('token1', '').lower()
-                t0_stable = t0 in STABLECOINS
-                t1_stable = t1 in STABLECOINS
+            # Try receipt-based PnL calculation (precise, from worker-fetched receipts)
+            receipts = data.get('receipts', [])
+            received = self._calc_received_from_receipts(receipts, pos_dicts)
 
-                if current_tick is not None and tick_lower < tick_upper and liq > 0:
-                    try:
-                        sqrt_l = 1.0001 ** (tick_lower / 2)
-                        sqrt_u = 1.0001 ** (tick_upper / 2)
-                        sqrt_c = 1.0001 ** (current_tick / 2)
-                        amounts = calculate_amounts(sqrt_c, sqrt_l, sqrt_u, liq)
-                        a0 = amounts.amount0 / (10 ** dec0) if amounts.amount0 > 0 else 0
-                        a1 = amounts.amount1 / (10 ** dec1) if amounts.amount1 > 0 else 0
-
-                        raw_price = pos.get('current_price', 0)
-                        if t0_stable and not t1_stable:
-                            usd = a0 + a1 * (1 / raw_price) if raw_price > 0 else a0
-                        elif t1_stable and not t0_stable:
-                            usd = a1 + a0 * (raw_price if raw_price > 0 else 0)
-                        else:
-                            usd = 0
-                        received += usd
-                    except Exception:
-                        pass
-
-                # Add fees
-                fees0 = pos.get('tokens_owed0', 0)
-                fees1 = pos.get('tokens_owed1', 0)
-                if t0_stable:
-                    received += fees0 / (10 ** dec0)
-                elif t1_stable:
-                    received += fees1 / (10 ** dec1)
+            # Fallback to liquidity math if receipt parsing failed
+            if received <= 0:
+                received = self._calc_received_from_math(pos_dicts)
 
             invested = initial if initial > 0 else 0
             pnl = received - invested if invested > 0 else 0
@@ -3172,6 +3216,111 @@ class ManageTab(QWidget):
             self.trade_recorded.emit()
         except Exception as e:
             logger.warning(f"Failed to record trade: {e}")
+
+    def _calc_received_from_receipts(self, receipts: list, pos_dicts: list) -> float:
+        """Calculate received USD from pre-fetched TX receipts (precise method).
+
+        Receipts are fetched in the worker thread, so no RPC calls on UI thread.
+        Returns 0.0 on any failure — caller falls back to math estimate.
+        """
+        if not receipts or not pos_dicts or not self.provider:
+            return 0.0
+
+        try:
+            wallet = self.provider.account.address
+
+            first = pos_dicts[0]
+            t0 = first.get('token0', '')
+            t1 = first.get('token1', '')
+            dec0 = first.get('token0_decimals', 18)
+            dec1 = first.get('token1_decimals', 18)
+            t0_lower = t0.lower()
+            t1_lower = t1.lower()
+
+            if not t0 or not t1:
+                return 0.0
+
+            # Determine stablecoin
+            stablecoin = None
+            if t0_lower in STABLECOINS:
+                stablecoin = t0_lower
+            elif t1_lower in STABLECOINS:
+                stablecoin = t1_lower
+
+            if not stablecoin:
+                return 0.0
+
+            # Get close price from position data
+            raw_price = first.get('current_price', 0)
+            if not raw_price or raw_price <= 0:
+                return 0.0
+
+            t0_is_stable = t0_lower in STABLECOINS
+            close_price = (1 / raw_price) if t0_is_stable else raw_price
+
+            total_usd = 0.0
+            for receipt_dict in receipts:
+                try:
+                    received = parse_close_receipt(receipt_dict, wallet, t0, t1)
+                    usd = calculate_usd_value(received, t0, t1, close_price, dec0, dec1, stablecoin)
+                    total_usd += usd
+                except Exception as e:
+                    logger.debug(f"Receipt parse failed: {e}")
+                    return 0.0
+
+            if total_usd > 0:
+                self._log(f"Receipt-based PnL: ${total_usd:.2f}")
+
+            return total_usd
+
+        except Exception as e:
+            logger.debug(f"Receipt parsing failed, will use math fallback: {e}")
+            return 0.0
+
+    def _calc_received_from_math(self, pos_dicts: list) -> float:
+        """Calculate received USD using liquidity math (approximate fallback)."""
+        received = 0.0
+        for pos in pos_dicts:
+            tick_lower = pos.get('tick_lower', 0)
+            tick_upper = pos.get('tick_upper', 0)
+            current_tick = pos.get('current_tick', None)
+            dec0 = pos.get('token0_decimals', 18)
+            dec1 = pos.get('token1_decimals', 18)
+            liq = pos.get('liquidity', 0)
+            t0 = pos.get('token0', '').lower()
+            t1 = pos.get('token1', '').lower()
+            t0_stable = t0 in STABLECOINS
+            t1_stable = t1 in STABLECOINS
+
+            if current_tick is not None and tick_lower < tick_upper and liq > 0:
+                try:
+                    sqrt_l = 1.0001 ** (tick_lower / 2)
+                    sqrt_u = 1.0001 ** (tick_upper / 2)
+                    sqrt_c = 1.0001 ** (current_tick / 2)
+                    amounts = calculate_amounts(sqrt_c, sqrt_l, sqrt_u, liq)
+                    a0 = amounts.amount0 / (10 ** dec0) if amounts.amount0 > 0 else 0
+                    a1 = amounts.amount1 / (10 ** dec1) if amounts.amount1 > 0 else 0
+
+                    raw_price = pos.get('current_price', 0)
+                    if t0_stable and not t1_stable:
+                        usd = a0 + a1 * (1 / raw_price) if raw_price > 0 else a0
+                    elif t1_stable and not t0_stable:
+                        usd = a1 + a0 * (raw_price if raw_price > 0 else 0)
+                    else:
+                        usd = 0
+                    received += usd
+                except Exception:
+                    pass
+
+            # Add unclaimed fees
+            fees0 = pos.get('tokens_owed0', 0)
+            fees1 = pos.get('tokens_owed1', 0)
+            if t0_stable:
+                received += fees0 / (10 ** dec0)
+            elif t1_stable:
+                received += fees1 / (10 ** dec1)
+
+        return received
 
     def _on_close_finished(self, success: bool, message: str, data: dict):
         """Handle close completion. Shows swap preview if auto-sell enabled."""

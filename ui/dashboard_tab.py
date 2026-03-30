@@ -24,7 +24,9 @@ import logging
 from src.storage.pnl_store import (
     get_dashboard_stats, get_cumulative_pnl, get_recent_trades,
     get_open_positions, remove_open_positions,
+    get_latest_snapshots_bulk,
 )
+from src.math.apr import calc_aggregate_apr
 
 logger = logging.getLogger(__name__)
 
@@ -624,10 +626,26 @@ class DashboardTab(QWidget):
 
         self.pairs_title.setText(f"Active Pairs ({len(pairs)})")
 
+        # Fetch APR snapshots for all active token_ids
+        all_token_ids = []
+        for info in pairs.values():
+            all_token_ids.extend(info['token_ids'])
+        all_snapshots = get_latest_snapshots_bulk(all_token_ids) if all_token_ids else {}
+
         for (t0, t1), info in pairs.items():
             token_ids = info['token_ids']
             protocol = info['protocol']
             chain_id = info['chain_id']
+
+            # Calculate aggregate APR for this pair
+            pair_apr_map = {}
+            pair_value_map = {}
+            for tid in token_ids:
+                snap = all_snapshots.get(tid)
+                if snap:
+                    pair_apr_map[tid] = snap.smoothed_daily_apr
+                    pair_value_map[tid] = snap.position_value_usd
+            pair_apr = calc_aggregate_apr(pair_apr_map, pair_value_map)
 
             # Row container: [delete_btn] [pair_btn]
             row_widget = QWidget()
@@ -678,8 +696,11 @@ class DashboardTab(QWidget):
 
             row_layout.addStretch()
 
-            # Position count + USD
-            right_lbl = QLabel(f"{info['count']} pos  |  ${info['usd']:.2f}")
+            # Position count + USD + APR
+            right_text = f"{info['count']} pos  |  ${info['usd']:.2f}"
+            if pair_apr is not None:
+                right_text += f"  |  APR: {pair_apr:.1f}%/d"
+            right_lbl = QLabel(right_text)
             right_lbl.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px; background: transparent; border: none;")
             right_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             row_layout.addWidget(right_lbl)

@@ -34,6 +34,18 @@ class TradeRecord:
 
 
 @dataclass
+class FeeSnapshotRecord:
+    id: Optional[int]
+    token_id: int
+    chain_id: int
+    protocol: str
+    unclaimed_fees_usd: float
+    position_value_usd: float
+    smoothed_daily_apr: Optional[float]
+    created_at: float              # unix timestamp
+
+
+@dataclass
 class ClaimedFeeRecord:
     id: Optional[int]
     token_id: int
@@ -76,6 +88,18 @@ def _get_conn() -> sqlite3.Connection:
             fees_usd    REAL DEFAULT 0,
             tx_hash     TEXT,
             collected_at REAL NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fee_snapshots (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_id            INTEGER NOT NULL,
+            chain_id            INTEGER NOT NULL DEFAULT 56,
+            protocol            TEXT NOT NULL DEFAULT 'v3',
+            unclaimed_fees_usd  REAL NOT NULL,
+            position_value_usd  REAL NOT NULL,
+            smoothed_daily_apr  REAL,
+            created_at          REAL NOT NULL
         )
     """)
     conn.execute("""
@@ -430,5 +454,99 @@ def get_open_positions(wallet: str = None) -> dict:
                 'created_at': r[14],
             }
         return result
+    finally:
+        conn.close()
+
+
+# ── Fee Snapshots (APR calculation) ──────────────────────────
+
+def save_fee_snapshot(record: FeeSnapshotRecord) -> int:
+    """Insert a fee snapshot. Returns the row id."""
+    conn = _get_conn()
+    try:
+        cur = conn.execute(
+            """INSERT INTO fee_snapshots
+               (token_id, chain_id, protocol,
+                unclaimed_fees_usd, position_value_usd,
+                smoothed_daily_apr, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (record.token_id, record.chain_id, record.protocol,
+             record.unclaimed_fees_usd, record.position_value_usd,
+             record.smoothed_daily_apr, record.created_at),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def get_latest_snapshot(token_id: int) -> Optional[FeeSnapshotRecord]:
+    """Return the most recent fee snapshot for a token_id."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT id, token_id, chain_id, protocol, "
+            "unclaimed_fees_usd, position_value_usd, "
+            "smoothed_daily_apr, created_at "
+            "FROM fee_snapshots WHERE token_id = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (token_id,)
+        ).fetchone()
+        return FeeSnapshotRecord(*row) if row else None
+    finally:
+        conn.close()
+
+
+def get_latest_snapshots_bulk(token_ids: list) -> dict:
+    """Return latest snapshot per token_id as {token_id: FeeSnapshotRecord}.
+
+    Uses a single query for efficiency.
+    """
+    if not token_ids:
+        return {}
+    conn = _get_conn()
+    try:
+        placeholders = ",".join("?" for _ in token_ids)
+        rows = conn.execute(
+            f"SELECT id, token_id, chain_id, protocol, "
+            f"unclaimed_fees_usd, position_value_usd, "
+            f"smoothed_daily_apr, created_at "
+            f"FROM fee_snapshots "
+            f"WHERE token_id IN ({placeholders}) "
+            f"ORDER BY token_id, created_at DESC",
+            token_ids,
+        ).fetchall()
+
+        result = {}
+        for r in rows:
+            tid = r[1]
+            if tid not in result:  # first row per token_id is latest (ORDER BY DESC)
+                result[tid] = FeeSnapshotRecord(*r)
+        return result
+    finally:
+        conn.close()
+
+
+def prune_old_snapshots(retention_hours: int = 24):
+    """Delete snapshots older than retention_hours, keeping the latest per token_id."""
+    conn = _get_conn()
+    try:
+        cutoff = time.time() - retention_hours * 3600
+        # Keep the latest snapshot per token_id regardless of age
+        conn.execute(
+            """DELETE FROM fee_snapshots
+               WHERE created_at < ?
+               AND id NOT IN (
+                   SELECT id FROM (
+                       SELECT id, token_id,
+                              ROW_NUMBER() OVER (PARTITION BY token_id ORDER BY created_at DESC) AS rn
+                       FROM fee_snapshots
+                   ) WHERE rn = 1
+               )""",
+            (cutoff,),
+        )
+        conn.commit()
+    except Exception:
+        logger.warning("Fee snapshot pruning failed", exc_info=True)
     finally:
         conn.close()

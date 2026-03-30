@@ -12,6 +12,18 @@ logger = logging.getLogger(__name__)
 CODEX_API_URL = "https://graph.codex.io/graphql"
 
 _STABLECOIN_SYMBOLS = {"usdt", "usdc"}
+_V3_FEE_TIERS = {100, 500, 2500, 3000, 10000}
+
+
+def _detect_pool_version(pool_address: str, fee: int, exchange_name: str) -> str:
+    """Detect V3 or V4 based on pool address length, fee tier, and exchange name."""
+    ex_lower = (exchange_name or "").lower()
+    is_v4 = (
+        len(pool_address) != 42
+        or fee not in _V3_FEE_TIERS
+        or "v4" in ex_lower
+    )
+    return "v4" if is_v4 else "v3"
 
 
 def _safe_decimals(val, default=18):
@@ -160,6 +172,9 @@ def search_pools_by_token(
             else:
                 t0, t1 = stable, volatile
 
+            fee_int = int(fee_raw) if fee_raw is not None else 0
+            version = _detect_pool_version(pool_address, fee_int, exchange_name)
+
             filtered.append((liq_usd, {
                 "pool_address": pool_address,
                 "token0_symbol": t0.get("symbol", "???"),
@@ -168,9 +183,10 @@ def search_pools_by_token(
                 "token1_symbol": t1.get("symbol", "???"),
                 "token1_address": t1.get("address", ""),
                 "token1_decimals": _safe_decimals(t1.get("decimals")),
-                "fee": int(fee_raw) if fee_raw is not None else 0,
+                "fee": fee_int,
                 "dex": dex_key,
                 "liquidity_usd": round(liq_usd, 2),
+                "version": version,
             }))
         except (ValueError, TypeError) as e:
             logger.debug("Skipping pair with invalid address: %s", e)
