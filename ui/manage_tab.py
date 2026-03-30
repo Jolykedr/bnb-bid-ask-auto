@@ -2081,8 +2081,9 @@ class ManageTab(QWidget):
         hidden_count = 0
 
         # Batch all updates: disable sorting once
-        # Take snapshot to avoid RuntimeError: dictionary changed size during iteration
-        positions_snapshot = list(self.positions_data.items())
+        # Take snapshot under mutex to avoid RuntimeError: dictionary changed size during iteration
+        with QMutexLocker(self._positions_mutex):
+            positions_snapshot = list(self.positions_data.items())
         self.positions_table.setSortingEnabled(False)
         try:
             for token_id, position in positions_snapshot:
@@ -2134,8 +2135,9 @@ class ManageTab(QWidget):
         if total_found > 0:
             self._log(f"✅ Scan found {total_found} {protocol_name} positions, loading in parallel...")
             # Pre-register IDs with protocol placeholder so they appear in table
-            for tid in token_ids:
-                self.positions_data[tid] = {'protocol': protocol}
+            with QMutexLocker(self._positions_mutex):
+                for tid in token_ids:
+                    self.positions_data[tid] = {'protocol': protocol}
 
             # Load positions in parallel using existing worker pipeline
             # _on_worker_finished will call _save_positions when all workers complete
@@ -2710,7 +2712,7 @@ class ManageTab(QWidget):
 
         # Enable collect fees when any positions are loaded
         # (V4 tokens_owed may be 0 in UI but fees exist on-chain)
-        self.collect_fees_btn.setEnabled(len(self.positions_data) > 0)
+        self.collect_fees_btn.setEnabled(len(pos_values) > 0)
 
     def _get_selected_token_ids(self) -> list:
         """Get token IDs of selected rows."""
@@ -2769,12 +2771,13 @@ class ManageTab(QWidget):
             return
 
         # Filter to only active positions
-        active_ids = [
-            tid for tid in token_ids
-            if tid in self.positions_data
-            and self.positions_data[tid]
-            and self.positions_data[tid].get('liquidity', 0) > 0
-        ]
+        with QMutexLocker(self._positions_mutex):
+            active_ids = [
+                tid for tid in token_ids
+                if tid in self.positions_data
+                and self.positions_data[tid]
+                and self.positions_data[tid].get('liquidity', 0) > 0
+            ]
 
         if not active_ids:
             QMessageBox.warning(self, "Error", "No active positions selected.")
@@ -2784,10 +2787,11 @@ class ManageTab(QWidget):
 
     def _close_all(self):
         """Close all loaded positions."""
-        token_ids = [
-            tid for tid, p in self.positions_data.items()
-            if p and p.get('liquidity', 0) > 0
-        ]
+        with QMutexLocker(self._positions_mutex):
+            token_ids = [
+                tid for tid, p in self.positions_data.items()
+                if p and p.get('liquidity', 0) > 0
+            ]
         if not token_ids:
             QMessageBox.warning(self, "Error", "No active positions to close.")
             return
@@ -2973,8 +2977,10 @@ class ManageTab(QWidget):
         self.batch_close_btn.setEnabled(False)
         self.collect_fees_btn.setEnabled(False)
 
+        with QMutexLocker(self._positions_mutex):
+            positions_snapshot = dict(self.positions_data)
         self._collect_worker = BatchCollectWorker(
-            self.provider, dict(self.positions_data), collect_ids, chain_id
+            self.provider, positions_snapshot, collect_ids, chain_id
         )
         self._collect_worker.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
         self._collect_worker.collect_result.connect(self._on_batch_collect_finished, Qt.ConnectionType.QueuedConnection)
@@ -3303,9 +3309,9 @@ class ManageTab(QWidget):
 
                     raw_price = pos.get('current_price', 0)
                     if t0_stable and not t1_stable:
-                        usd = a0 + a1 * (1 / raw_price) if raw_price > 0 else a0
+                        usd = (a0 + a1 * (1 / raw_price)) if raw_price > 0 else a0
                     elif t1_stable and not t0_stable:
-                        usd = a1 + a0 * (raw_price if raw_price > 0 else 0)
+                        usd = (a1 + a0 * raw_price) if raw_price > 0 else a1
                     else:
                         usd = 0
                     received += usd

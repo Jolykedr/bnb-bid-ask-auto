@@ -1057,6 +1057,7 @@ class CreateTab(QWidget):
         self._pool_create_worker = None
         self._search_pool_worker = None
         self._ref_price_worker = None
+        self._dying_workers = []  # Cancelled workers still running — prevent GC segfault
         self._price_deviation = None  # Current pool price deviation from market
         self._reference_price = None  # Reference market price
         self._ref_liq_usd = None      # Reference pool liquidity USD
@@ -2365,6 +2366,22 @@ class CreateTab(QWidget):
         self.worker.create_result.connect(self._on_finished)
         self.worker.start()
 
+    def _safe_cleanup_worker(self, worker):
+        """Safely cleanup a worker — keep Python reference if still running."""
+        if worker.isRunning():
+            self._dying_workers.append(worker)
+            worker.finished.connect(lambda w=worker: self._cleanup_dead_worker(w))
+        else:
+            worker.deleteLater()
+
+    def _cleanup_dead_worker(self, worker):
+        """Remove a cancelled worker from _dying_workers after it finishes."""
+        try:
+            self._dying_workers.remove(worker)
+        except ValueError:
+            pass
+        worker.deleteLater()
+
     def _on_progress(self, message: str):
         """Handle progress updates."""
         self._log(message)
@@ -2375,11 +2392,11 @@ class CreateTab(QWidget):
         self.create_btn.setEnabled(True)
         self.preview_btn.setEnabled(True)
 
-        # Defer cleanup to finished signal (thread may still be running when create_result emits)
+        # Defer cleanup — keep reference alive until thread finishes
         if self.worker is not None:
             w = self.worker
             self.worker = None
-            w.finished.connect(w.deleteLater)
+            self._safe_cleanup_worker(w)
 
         if success:
             self._log(f"SUCCESS: {message}")

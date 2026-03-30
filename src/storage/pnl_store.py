@@ -359,7 +359,7 @@ def save_open_positions_bulk(wallet: str, positions: dict):
     conn = _get_conn()
     try:
         for tid, pos in positions.items():
-            if not isinstance(pos, dict) or pos.get('liquidity', 0) <= 0:
+            if not isinstance(pos, dict) or int(pos.get('liquidity', 0)) <= 0:
                 continue
             pos_with_id = dict(pos, token_id=tid)
             conn.execute(

@@ -365,7 +365,7 @@ def calc_usd_from_liquidity(
     from config import is_stablecoin
 
     if liquidity <= 0 or current_price <= 0:
-        return None
+        return 0.0
 
     t0_is_stable = is_stablecoin(token0)
     invert = t0_is_stable  # token0 is stablecoin → price is inverted
@@ -379,7 +379,7 @@ def calc_usd_from_liquidity(
         else:
             pool_price = current_price * (10 ** dec_offset)
         if pool_price <= 0:
-            return None
+            return 0.0
         derived_tick = math.log(pool_price) / math.log(1.0001)
         sqrt_cur = 1.0001 ** (derived_tick / 2)
 
@@ -395,4 +395,4 @@ def calc_usd_from_liquidity(
     else:
         usd_val = amt1_human + amt0_human * current_price
 
-    return round(usd_val, 4) if usd_val > 0 else None
+    return round(usd_val, 4) if usd_val > 0 else 0.0

@@ -62,3 +62,7 @@ licensing/.keys/
 licensing/HOWTO.md
 private_key.pem
 *.pem
+
+# Audit
+AUDIT.md
+AUDIT_*.md

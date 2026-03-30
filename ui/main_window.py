@@ -248,7 +248,8 @@ class MainWindow(QMainWindow):
 
         # Create tab extra workers
         if hasattr(self, 'create_tab'):
-            for attr in ('_load_pool_worker', '_balance_worker', '_pool_create_worker'):
+            for attr in ('_load_pool_worker', '_balance_worker', '_pool_create_worker',
+                         '_search_pool_worker', '_ref_price_worker'):
                 w = getattr(self.create_tab, attr, None)
                 if w is not None:
                     if w.isRunning():
@@ -256,6 +257,14 @@ class MainWindow(QMainWindow):
                         w.wait(3000)
                     w.deleteLater()
                     setattr(self.create_tab, attr, None)
+            # Clean up dying workers
+            for w in getattr(self.create_tab, '_dying_workers', []):
+                if w.isRunning():
+                    w.quit()
+                    w.wait(2000)
+                w.deleteLater()
+            if hasattr(self.create_tab, '_dying_workers'):
+                self.create_tab._dying_workers.clear()
 
     def _on_tab_changed(self, index):
         """Handle tab change."""

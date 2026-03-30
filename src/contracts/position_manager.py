@@ -288,8 +288,8 @@ class UniswapV3PositionManager:
                     'amount0': event['args']['amount0'],
                     'amount1': event['args']['amount1']
                 }
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to parse IncreaseLiquidity event: {e}")
 
         # Fallback: парсим Transfer event для получения tokenId
         try:
@@ -303,8 +303,8 @@ class UniswapV3PositionManager:
                         'amount0': 0,
                         'amount1': 0
                     }
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to parse Transfer event: {e}")
 
         return None
 

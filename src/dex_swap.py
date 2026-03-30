@@ -1228,7 +1228,7 @@ class DexSwap:
                         f"router={quote.router_address[:10]}..., route={quote.route_description}")
 
             # 2. Build route (получить calldata)
-            slippage_bips = max(int(slippage * 100), 300)  # minimum 3% for volatile tokens
+            slippage_bips = max(int(slippage * 100), 10)  # minimum 0.1%
             build = self.kyber_client.build_route(
                 quote.route_summary, wallet_address, wallet_address, slippage_bips
             )
