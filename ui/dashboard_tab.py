@@ -434,8 +434,8 @@ class DashboardTab(QWidget):
 
     def _load_open_stats(self):
         """Update open positions / invested cards from live position data."""
-        from config import STABLECOINS
-        from src.math.liquidity import calculate_amounts
+        from config import STABLECOINS, is_stablecoin
+        from src.math.liquidity import calc_usd_from_liquidity
 
         open_count = 0
         total_invested = 0.0
@@ -457,25 +457,19 @@ class DashboardTab(QWidget):
             t0 = pos.get('token0', '').lower()
             t1 = pos.get('token1', '').lower()
 
-            if current_tick is not None and tick_lower < tick_upper:
-                try:
-                    sqrt_l = 1.0001 ** (tick_lower / 2)
-                    sqrt_u = 1.0001 ** (tick_upper / 2)
-                    sqrt_c = 1.0001 ** (current_tick / 2)
-                    amounts = calculate_amounts(sqrt_c, sqrt_l, sqrt_u, liq)
-                    a0 = amounts.amount0 / (10 ** dec0) if amounts.amount0 > 0 else 0
-                    a1 = amounts.amount1 / (10 ** dec1) if amounts.amount1 > 0 else 0
-
-                    raw_price = pos.get('current_price', 0)
-                    if t0 in STABLECOINS and t1 not in STABLECOINS:
-                        usd = a0 + a1 * (1 / raw_price) if raw_price > 0 else a0
-                    elif t1 in STABLECOINS and t0 not in STABLECOINS:
-                        usd = a1 + a0 * (raw_price if raw_price > 0 else 0)
-                    else:
-                        usd = 0
-                    total_invested += usd
-                except Exception:
-                    pass
+            try:
+                raw_price = pos.get('current_price', 0)
+                if raw_price and raw_price > 0 and tick_lower < tick_upper:
+                    t0_is_stable = t0 in STABLECOINS
+                    human_price = (1 / raw_price) if t0_is_stable else raw_price
+                    usd = calc_usd_from_liquidity(
+                        tick_lower, tick_upper, liq, human_price,
+                        t0, t1, dec0, dec1, cur_tick=current_tick,
+                    )
+                    if usd:
+                        total_invested += usd
+            except Exception:
+                pass
 
         # Count unique pairs
         pairs_set = set()
@@ -565,6 +559,7 @@ class DashboardTab(QWidget):
     def _load_active_pairs(self):
         """Build active pairs list from live positions data."""
         from config import STABLECOINS
+        from src.math.liquidity import calc_usd_from_liquidity
 
         # Clear existing pair widgets
         while self.pairs_container.count() > 0:
@@ -603,24 +598,18 @@ class DashboardTab(QWidget):
             dec1 = pos.get('token1_decimals', 18)
             liq = pos.get('liquidity', 0)
 
-            if current_tick is not None and tick_lower < tick_upper and liq > 0:
+            if tick_lower < tick_upper and liq > 0:
                 try:
-                    from src.math.liquidity import calculate_amounts
-                    sqrt_l = 1.0001 ** (tick_lower / 2)
-                    sqrt_u = 1.0001 ** (tick_upper / 2)
-                    sqrt_c = 1.0001 ** (current_tick / 2)
-                    amounts = calculate_amounts(sqrt_c, sqrt_l, sqrt_u, liq)
-                    a0 = amounts.amount0 / (10 ** dec0) if amounts.amount0 > 0 else 0
-                    a1 = amounts.amount1 / (10 ** dec1) if amounts.amount1 > 0 else 0
-
                     raw_price = pos.get('current_price', 0)
-                    if t0 in STABLECOINS and t1 not in STABLECOINS:
-                        usd = a0 + a1 * (1 / raw_price) if raw_price > 0 else a0
-                    elif t1 in STABLECOINS and t0 not in STABLECOINS:
-                        usd = a1 + a0 * (raw_price if raw_price > 0 else 0)
-                    else:
-                        usd = 0
-                    pairs[key]['usd'] += usd
+                    if raw_price and raw_price > 0:
+                        t0_is_stable = t0 in STABLECOINS
+                        human_price = (1 / raw_price) if t0_is_stable else raw_price
+                        usd = calc_usd_from_liquidity(
+                            tick_lower, tick_upper, liq, human_price,
+                            t0, t1, dec0, dec1, cur_tick=current_tick,
+                        )
+                        if usd:
+                            pairs[key]['usd'] += usd
                 except Exception:
                     pass
 

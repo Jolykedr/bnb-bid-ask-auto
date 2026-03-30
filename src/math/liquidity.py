@@ -10,6 +10,7 @@ Uniswap V3 Liquidity Mathematics
 - L = amount1 / (sqrt(current) - sqrt(lower))
 """
 
+import math
 from decimal import Decimal, getcontext
 from dataclasses import dataclass
 
@@ -342,3 +343,56 @@ def calculate_liquidity_from_usd(
                 sqrt_price_upper=sqrt_price_upper,
                 amount1=amount1
             )
+
+
+def calc_usd_from_liquidity(
+    tick_lower: int,
+    tick_upper: int,
+    liquidity: int,
+    current_price: float,
+    token0: str,
+    token1: str,
+    t0_dec: int,
+    t1_dec: int,
+    cur_tick: int | None = None,
+) -> float | None:
+    """Calculate USD value of a position from on-chain liquidity + ticks.
+
+    When cur_tick is provided (from on-chain slot0), uses it directly to avoid
+    the precision loss of price→tick float roundtrip.
+    Returns None on calculation error.
+    """
+    from config import is_stablecoin
+
+    if liquidity <= 0 or current_price <= 0:
+        return None
+
+    t0_is_stable = is_stablecoin(token0)
+    invert = t0_is_stable  # token0 is stablecoin → price is inverted
+
+    if cur_tick is not None:
+        sqrt_cur = 1.0001 ** (cur_tick / 2)
+    else:
+        dec_offset = t1_dec - t0_dec
+        if invert:
+            pool_price = 1.0 / current_price * (10 ** dec_offset)
+        else:
+            pool_price = current_price * (10 ** dec_offset)
+        if pool_price <= 0:
+            return None
+        derived_tick = math.log(pool_price) / math.log(1.0001)
+        sqrt_cur = 1.0001 ** (derived_tick / 2)
+
+    sqrt_lower = 1.0001 ** (tick_lower / 2)
+    sqrt_upper = 1.0001 ** (tick_upper / 2)
+
+    result = calculate_amounts(sqrt_cur, sqrt_lower, sqrt_upper, liquidity)
+    amt0_human = result.amount0 / (10 ** t0_dec)
+    amt1_human = result.amount1 / (10 ** t1_dec)
+
+    if invert:
+        usd_val = amt0_human + amt1_human * current_price
+    else:
+        usd_val = amt1_human + amt0_human * current_price
+
+    return round(usd_val, 4) if usd_val > 0 else None

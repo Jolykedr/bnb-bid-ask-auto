@@ -23,7 +23,7 @@ import logging
 from web3 import Web3
 from config import V3_DEXES, is_stablecoin, STABLECOINS, STABLE_TOKENS
 from src.math.ticks import tick_to_price
-from src.math.liquidity import calculate_amounts
+from src.math.liquidity import calculate_amounts, calc_usd_from_liquidity
 from src.contracts.position_manager import UniswapV3PositionManager
 from src.contracts.pool_factory import PoolFactory
 from src.contracts.v4 import V4PositionManager, V4Protocol
@@ -32,7 +32,10 @@ from src.contracts.v4.pool_manager import V4PoolManager
 from src.liquidity_provider import LiquidityProvider
 from src.multicall.batcher import Multicall3Batcher
 from src.dex_swap import DexSwap
-from src.storage.pnl_store import TradeRecord, save_trade, save_open_positions_bulk, remove_open_positions
+from src.storage.pnl_store import (
+    TradeRecord, save_trade, save_open_positions_bulk, remove_open_positions,
+    ClaimedFeeRecord, save_claimed_fees_bulk,
+)
 from ui.swap_preview_dialog import SwapPreviewDialog
 
 logger = logging.getLogger(__name__)
@@ -136,28 +139,59 @@ def _load_v4_position_to_dict(
         pool_state = pool_mgr.get_pool_state(v4_pos.pool_key)
         if pool_state.initialized:
             position['current_tick'] = pool_state.tick
-            for addr_field, dec_key, sym_key in [
-                (v4_pos.pool_key.currency0, 'token0_decimals', 'token0_symbol'),
-                (v4_pos.pool_key.currency1, 'token1_decimals', 'token1_symbol'),
-            ]:
-                if addr_field and addr_field != "0x0000000000000000000000000000000000000000":
-                    try:
-                        tc = w3.eth.contract(
-                            address=Web3.to_checksum_address(addr_field),
-                            abi=[
-                                {"constant": True, "inputs": [], "name": "decimals",
-                                 "outputs": [{"name": "", "type": "uint8"}], "type": "function"},
-                                {"constant": True, "inputs": [], "name": "symbol",
-                                 "outputs": [{"name": "", "type": "string"}], "type": "function"},
-                            ]
-                        )
-                        position[dec_key] = tc.functions.decimals().call()
-                        position[sym_key] = tc.functions.symbol().call()
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to get decimals for {addr_field} (token {token_id}): {e}. "
-                            f"NOT defaulting to 18 — prices may be wrong."
-                        )
+
+            # Batch token info: 4 sequential RPC → 1 Multicall3
+            c0 = v4_pos.pool_key.currency0
+            c1 = v4_pos.pool_key.currency1
+            zero_addr = "0x0000000000000000000000000000000000000000"
+            c0_is_native = (not c0) or c0 == zero_addr
+            c1_is_native = (not c1) or c1 == zero_addr
+
+            # Native token (zero address) = 18 decimals always
+            native_symbol = 'BNB' if chain_id == 56 else 'ETH'
+            if c0_is_native:
+                position['token0_decimals'] = 18
+                position['token0_symbol'] = native_symbol
+            if c1_is_native:
+                position['token1_decimals'] = 18
+                position['token1_symbol'] = native_symbol
+
+            if not c0_is_native and not c1_is_native:
+                # Both are ERC20 — batch both
+                try:
+                    from src.utils import batch_read_token_info
+                    t0_dec, t1_dec, t0_sym, t1_sym = batch_read_token_info(w3, c0, c1)
+                    position['token0_decimals'] = t0_dec
+                    position['token1_decimals'] = t1_dec
+                    position['token0_symbol'] = t0_sym
+                    position['token1_symbol'] = t1_sym
+                except Exception as e:
+                    logger.warning(
+                        f"Batch token info failed for token {token_id}: {e}. "
+                        f"NOT defaulting to 18 — prices may be wrong."
+                    )
+            elif not c0_is_native or not c1_is_native:
+                # One is native, one is ERC20 — fetch only the ERC20 one
+                erc20_addr = c1 if c0_is_native else c0
+                dec_key = 'token1_decimals' if c0_is_native else 'token0_decimals'
+                sym_key = 'token1_symbol' if c0_is_native else 'token0_symbol'
+                try:
+                    tc = w3.eth.contract(
+                        address=Web3.to_checksum_address(erc20_addr),
+                        abi=[
+                            {"constant": True, "inputs": [], "name": "decimals",
+                             "outputs": [{"name": "", "type": "uint8"}], "type": "function"},
+                            {"constant": True, "inputs": [], "name": "symbol",
+                             "outputs": [{"name": "", "type": "string"}], "type": "function"},
+                        ]
+                    )
+                    position[dec_key] = tc.functions.decimals().call()
+                    position[sym_key] = tc.functions.symbol().call()
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to get token info for {erc20_addr} (token {token_id}): {e}. "
+                        f"NOT defaulting to 18 — prices may be wrong."
+                    )
 
             dec0 = position.get('token0_decimals', 18)
             dec1 = position.get('token1_decimals', 18)
@@ -2537,26 +2571,15 @@ class ManageTab(QWidget):
             token1_is_stable = token1 in STABLECOINS
 
             try:
-                if current_tick is not None and tick_lower < tick_upper:
-                    sqrt_lower = 1.0001 ** (tick_lower / 2)
-                    sqrt_upper = 1.0001 ** (tick_upper / 2)
-                    sqrt_current = 1.0001 ** (current_tick / 2)
-                    amounts = calculate_amounts(sqrt_current, sqrt_lower, sqrt_upper, liquidity)
-                    a0 = amounts.amount0 / (10 ** dec0) if amounts.amount0 > 0 else 0
-                    a1 = amounts.amount1 / (10 ** dec1) if amounts.amount1 > 0 else 0
-
-                    raw_price = position.get('current_price', 0)
-                    if token0_is_stable and not token1_is_stable:
-                        # token0 is USD; raw_price = token1/token0; invert to get USD per volatile
-                        if raw_price and raw_price > 0:
-                            usd = a0 + a1 * (1 / raw_price)
-                        else:
-                            usd = a0
-                    elif token1_is_stable and not token0_is_stable:
-                        usd = a1 + a0 * (raw_price if raw_price > 0 else 0)
-                    else:
-                        usd = 0
-                    total_value += usd
+                raw_price = position.get('current_price', 0)
+                if raw_price and raw_price > 0 and tick_lower < tick_upper:
+                    human_price = (1 / raw_price) if token0_is_stable else raw_price
+                    usd = calc_usd_from_liquidity(
+                        tick_lower, tick_upper, liquidity, human_price,
+                        token0, token1, dec0, dec1, cur_tick=current_tick,
+                    )
+                    if usd:
+                        total_value += usd
             except Exception:
                 pass
 
@@ -2893,9 +2916,14 @@ class ManageTab(QWidget):
 
             if success:
                 tx_hashes = data.get('tx_hashes', [])
+                collected_ids = data.get('token_ids', [])
                 self._log(f"SUCCESS: {message}")
                 for tx_hash in tx_hashes:
                     self._log(f"TX Hash: {tx_hash}")
+
+                # Record claimed fees
+                self._save_claimed_fees(collected_ids, tx_hashes)
+
                 QMessageBox.information(
                     self, "Collect Fees Success",
                     f"{message}\n\nTX: {', '.join(tx_hashes) if tx_hashes else 'N/A'}"
@@ -2907,6 +2935,59 @@ class ManageTab(QWidget):
         except Exception as e:
             logger.exception(f"Error in _on_batch_collect_finished: {e}")
             self._log(f"Error in collect fees handler: {e}")
+
+    def _save_claimed_fees(self, token_ids: list, tx_hashes: list):
+        """Record claimed fees from positions that were just collected."""
+        try:
+            tx_hash_str = tx_hashes[0] if tx_hashes else ''
+            now = time.time()
+            records = []
+
+            with QMutexLocker(self._positions_mutex):
+                snapshot = dict(self.positions_data)
+
+            for tid in token_ids:
+                pos = snapshot.get(tid)
+                if not pos or not isinstance(pos, dict):
+                    continue
+
+                fees0 = pos.get('tokens_owed0', 0)
+                fees1 = pos.get('tokens_owed1', 0)
+                if fees0 <= 0 and fees1 <= 0:
+                    continue
+
+                dec0 = pos.get('token0_decimals', 18)
+                dec1 = pos.get('token1_decimals', 18)
+                t0 = pos.get('token0', '').lower()
+                t1 = pos.get('token1', '').lower()
+                f0_human = fees0 / (10 ** dec0)
+                f1_human = fees1 / (10 ** dec1)
+
+                # Estimate USD from stablecoin side
+                fees_usd = 0.0
+                if is_stablecoin(t0):
+                    fees_usd = f0_human
+                elif is_stablecoin(t1):
+                    fees_usd = f1_human
+
+                records.append(ClaimedFeeRecord(
+                    id=None,
+                    token_id=tid,
+                    chain_id=pos.get('chain_id', 56),
+                    protocol=pos.get('protocol', 'v3'),
+                    fees_token0=f0_human,
+                    fees_token1=f1_human,
+                    fees_usd=fees_usd,
+                    tx_hash=tx_hash_str,
+                    collected_at=now,
+                ))
+
+            if records:
+                save_claimed_fees_bulk(records)
+                total_usd = sum(r.fees_usd for r in records)
+                self._log(f"Recorded {len(records)} fee claims (${total_usd:.4f} USD)")
+        except Exception as e:
+            logger.warning(f"Failed to save claimed fees: {e}")
 
     def _close_positions(self, token_ids: list):
         """Close specified positions."""

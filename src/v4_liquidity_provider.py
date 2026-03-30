@@ -998,23 +998,30 @@ class V4LiquidityProvider:
                 self.account.address, Web3.to_checksum_address(permit2_addr)
             ).call()
 
-        # Permit2 allowances (complex return type, keep as individual calls)
-        permit2 = self.w3.eth.contract(
-            address=Web3.to_checksum_address(permit2_addr),
-            abi=PERMIT2_ABI
-        )
-
-        quote_permit2_data = permit2.functions.allowance(
-            self.account.address,
-            Web3.to_checksum_address(quote_token),
-            Web3.to_checksum_address(pos_manager_addr)
-        ).call()
-
-        base_permit2_data = permit2.functions.allowance(
-            self.account.address,
-            Web3.to_checksum_address(base_token),
-            Web3.to_checksum_address(pos_manager_addr)
-        ).call()
+        # Permit2 allowances — batch 2 calls into 1 Multicall3
+        try:
+            batch_p2 = BatchRPC(self.w3)
+            batch_p2.add_permit2_allowance(permit2_addr, self.account.address, quote_token, pos_manager_addr)
+            batch_p2.add_permit2_allowance(permit2_addr, self.account.address, base_token, pos_manager_addr)
+            p2_results = batch_p2.execute()
+            quote_permit2_data = p2_results[0] if p2_results[0] is not None else (0, 0, 0)
+            base_permit2_data = p2_results[1] if p2_results[1] is not None else (0, 0, 0)
+        except Exception as e:
+            logger.warning(f"Batch Permit2 check failed: {e}, falling back to individual calls")
+            permit2 = self.w3.eth.contract(
+                address=Web3.to_checksum_address(permit2_addr),
+                abi=PERMIT2_ABI
+            )
+            quote_permit2_data = permit2.functions.allowance(
+                self.account.address,
+                Web3.to_checksum_address(quote_token),
+                Web3.to_checksum_address(pos_manager_addr)
+            ).call()
+            base_permit2_data = permit2.functions.allowance(
+                self.account.address,
+                Web3.to_checksum_address(base_token),
+                Web3.to_checksum_address(pos_manager_addr)
+            ).call()
 
         # Build approval status dicts
         quote_approvals = {

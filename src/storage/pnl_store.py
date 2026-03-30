@@ -33,6 +33,19 @@ class TradeRecord:
     closed_at: float         # unix timestamp
 
 
+@dataclass
+class ClaimedFeeRecord:
+    id: Optional[int]
+    token_id: int
+    chain_id: int
+    protocol: str            # v3, v3_uniswap, v4, v4_pancake
+    fees_token0: float       # amount in token0 human-readable
+    fees_token1: float       # amount in token1 human-readable
+    fees_usd: float          # estimated USD value at collection time
+    tx_hash: str
+    collected_at: float      # unix timestamp
+
+
 def _get_conn() -> sqlite3.Connection:
     os.makedirs(DB_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -50,6 +63,19 @@ def _get_conn() -> sqlite3.Connection:
             pnl_percent  REAL NOT NULL,
             tx_hash     TEXT,
             closed_at   REAL NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS claimed_fees (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_id    INTEGER NOT NULL,
+            chain_id    INTEGER NOT NULL DEFAULT 56,
+            protocol    TEXT NOT NULL DEFAULT 'v3',
+            fees_token0 REAL DEFAULT 0,
+            fees_token1 REAL DEFAULT 0,
+            fees_usd    REAL DEFAULT 0,
+            tx_hash     TEXT,
+            collected_at REAL NOT NULL
         )
     """)
     conn.execute("""
@@ -187,6 +213,83 @@ def delete_trade(trade_id: int):
     try:
         conn.execute("DELETE FROM trades WHERE id = ?", (trade_id,))
         conn.commit()
+    finally:
+        conn.close()
+
+
+# ── Claimed Fees tracking ─────────────────────────────────
+
+def save_claimed_fee(record: ClaimedFeeRecord) -> int:
+    """Insert a claimed fee record. Returns the row id."""
+    conn = _get_conn()
+    try:
+        cur = conn.execute(
+            """INSERT INTO claimed_fees
+               (token_id, chain_id, protocol,
+                fees_token0, fees_token1, fees_usd,
+                tx_hash, collected_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (record.token_id, record.chain_id, record.protocol,
+             record.fees_token0, record.fees_token1, record.fees_usd,
+             record.tx_hash, record.collected_at),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def save_claimed_fees_bulk(records: List[ClaimedFeeRecord]):
+    """Insert multiple claimed fee records in one transaction."""
+    if not records:
+        return
+    conn = _get_conn()
+    try:
+        conn.executemany(
+            """INSERT INTO claimed_fees
+               (token_id, chain_id, protocol,
+                fees_token0, fees_token1, fees_usd,
+                tx_hash, collected_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            [(r.token_id, r.chain_id, r.protocol,
+              r.fees_token0, r.fees_token1, r.fees_usd,
+              r.tx_hash, r.collected_at) for r in records],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_claimed_fees(token_id: int = None) -> List[ClaimedFeeRecord]:
+    """Return claimed fee records, optionally filtered by token_id."""
+    conn = _get_conn()
+    try:
+        if token_id is not None:
+            rows = conn.execute(
+                "SELECT id, token_id, chain_id, protocol, "
+                "fees_token0, fees_token1, fees_usd, tx_hash, collected_at "
+                "FROM claimed_fees WHERE token_id = ? ORDER BY collected_at DESC",
+                (token_id,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, token_id, chain_id, protocol, "
+                "fees_token0, fees_token1, fees_usd, tx_hash, collected_at "
+                "FROM claimed_fees ORDER BY collected_at DESC"
+            ).fetchall()
+        return [ClaimedFeeRecord(*r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_total_claimed_fees_usd() -> float:
+    """Return total USD value of all claimed fees."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(fees_usd), 0) FROM claimed_fees"
+        ).fetchone()
+        return row[0]
     finally:
         conn.close()
 

@@ -205,19 +205,27 @@ class V4PoolManager:
         pool_id = self._compute_pool_id(pool_key)
 
         try:
-            # Use StateView if available (Uniswap V4) — PoolManager.getSlot0 doesn't exist there
-            if self.state_view_contract:
-                slot0 = self.state_view_contract.functions.getSlot0(pool_id).call()
-                liquidity = self.state_view_contract.functions.getLiquidity(pool_id).call()
-            else:
-                # Direct query to PoolManager (PancakeSwap V4)
-                slot0 = self.contract.functions.getSlot0(pool_id).call()
-                liquidity = self.contract.functions.getLiquidity(pool_id).call()
+            target = self.state_view_contract or self.contract
+            target_addr = target.address
 
-            sqrt_price_x96 = slot0[0]
-            tick = slot0[1]
-            protocol_fee = slot0[2]
-            lp_fee = slot0[3]
+            # Batch: getSlot0 + getLiquidity in 1 Multicall3 call (2 RPC → 1)
+            from src.utils import BatchRPC
+            batch = BatchRPC(self.w3)
+            batch.add_v4_slot0(target_addr, pool_id)
+            batch.add_v4_liquidity(target_addr, pool_id)
+            results = batch.execute()
+
+            slot0_data = results[0]
+            liquidity = results[1] if results[1] is not None else 0
+
+            if slot0_data:
+                sqrt_price_x96 = slot0_data['sqrtPriceX96']
+                tick = slot0_data['tick']
+                protocol_fee = slot0_data['protocol_fee']
+                lp_fee = slot0_data['lp_fee']
+            else:
+                # Multicall decoded nothing — fallback to sequential
+                raise ValueError("Batch slot0 decode returned None")
 
             return V4PoolState(
                 pool_id=pool_id,
@@ -229,16 +237,31 @@ class V4PoolManager:
                 initialized=sqrt_price_x96 > 0
             )
         except Exception as e:
-            logger.error(f"[V4 PoolManager] getSlot0 failed: {e}")
-            return V4PoolState(
-                pool_id=pool_id,
-                sqrt_price_x96=0,
-                tick=0,
-                liquidity=0,
-                protocol_fee=0,
-                lp_fee=0,
-                initialized=False
-            )
+            # Fallback: sequential calls (e.g. Multicall3 not available)
+            try:
+                target = self.state_view_contract or self.contract
+                slot0 = target.functions.getSlot0(pool_id).call()
+                liq = target.functions.getLiquidity(pool_id).call()
+                return V4PoolState(
+                    pool_id=pool_id,
+                    sqrt_price_x96=slot0[0],
+                    tick=slot0[1],
+                    liquidity=liq,
+                    protocol_fee=slot0[2],
+                    lp_fee=slot0[3],
+                    initialized=slot0[0] > 0
+                )
+            except Exception as e2:
+                logger.error(f"[V4 PoolManager] getSlot0 failed: {e2}")
+                return V4PoolState(
+                    pool_id=pool_id,
+                    sqrt_price_x96=0,
+                    tick=0,
+                    liquidity=0,
+                    protocol_fee=0,
+                    lp_fee=0,
+                    initialized=False
+                )
 
     def is_pool_initialized(self, pool_key: PoolKey) -> bool:
         """Check if a pool is initialized."""

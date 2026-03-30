@@ -80,6 +80,7 @@ MULTICALL3_ABI = [
 # Minimal ERC20 ABI for utility functions
 ERC20_MINIMAL_ABI = [
     {"inputs": [], "name": "decimals", "outputs": [{"type": "uint8"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "symbol", "outputs": [{"type": "string"}], "stateMutability": "view", "type": "function"},
     {"inputs": [{"name": "account", "type": "address"}], "name": "balanceOf", "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
     {"inputs": [{"name": "owner", "type": "address"}, {"name": "spender", "type": "address"}], "name": "allowance", "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
 ]
@@ -725,21 +726,94 @@ class BatchRPC:
 
     def add_erc20_symbol(self, token_address: str):
         """Add symbol() call for ERC20."""
-        # symbol() selector = 0x95d89b41
-        call_data = bytes.fromhex('95d89b41')
+        token = self.w3.eth.contract(
+            address=Web3.to_checksum_address(token_address),
+            abi=ERC20_MINIMAL_ABI
+        )
+        call_data = token.functions.symbol()._encode_transaction_data()
 
         def decode_string(data: bytes) -> str:
-            if len(data) < 64:
-                # Try as raw bytes (some tokens return non-standard)
-                return data.rstrip(b'\x00').decode('utf-8', errors='replace') if data else '???'
-            try:
-                offset = int.from_bytes(data[0:32], 'big')
-                length = int.from_bytes(data[offset:offset+32], 'big')
-                return data[offset+32:offset+32+length].decode('utf-8', errors='replace')
-            except Exception:
-                return '???'
+            if len(data) >= 64:
+                try:
+                    from eth_abi import decode as abi_decode
+                    return abi_decode(["string"], data)[0]
+                except Exception:
+                    pass
+            # Fallback: some tokens return bytes32 instead of string
+            if len(data) >= 32:
+                try:
+                    return data[:32].rstrip(b'\x00').decode('utf-8').strip()
+                except Exception:
+                    pass
+            return ""
 
         self.add_call(token_address, call_data, decode_string)
+
+    # ── V4 & Permit2 helpers ──────────────────────────────────────────
+
+    def add_pool_liquidity(self, pool_address: str):
+        """Add V3 liquidity() call — returns pool's current liquidity (uint128)."""
+        # liquidity() selector = 0x1a686502
+        call_data = bytes.fromhex('1a686502')
+
+        def decode_uint128(data: bytes) -> int:
+            if len(data) >= 32:
+                return int.from_bytes(data[:32], 'big')
+            return 0
+
+        self.add_call(pool_address, call_data, decode_uint128)
+
+    def add_v4_slot0(self, target_address: str, pool_id: bytes):
+        """Add V4 getSlot0(bytes32) call — returns (sqrtPriceX96, tick, protocolFee, lpFee)."""
+        # getSlot0(bytes32) selector = 0xc815641c
+        call_data = bytes.fromhex('c815641c') + pool_id.rjust(32, b'\x00')
+
+        def decode_v4_slot0(data: bytes) -> dict:
+            if len(data) < 128:
+                return None
+            sqrt_price_x96 = int.from_bytes(data[0:32], 'big')
+            tick_raw = int.from_bytes(data[32:64], 'big')
+            tick = tick_raw - 2**256 if tick_raw >= 2**255 else tick_raw
+            protocol_fee = int.from_bytes(data[64:96], 'big')
+            lp_fee = int.from_bytes(data[96:128], 'big')
+            return {
+                'sqrtPriceX96': sqrt_price_x96,
+                'tick': tick,
+                'protocol_fee': protocol_fee,
+                'lp_fee': lp_fee,
+            }
+
+        self.add_call(target_address, call_data, decode_v4_slot0)
+
+    def add_v4_liquidity(self, target_address: str, pool_id: bytes):
+        """Add V4 getLiquidity(bytes32) call — returns pool's current liquidity (uint128)."""
+        # getLiquidity(bytes32) selector = 0xfa6793d5
+        call_data = bytes.fromhex('fa6793d5') + pool_id.rjust(32, b'\x00')
+
+        def decode_uint128(data: bytes) -> int:
+            if len(data) >= 32:
+                return int.from_bytes(data[:32], 'big')
+            return 0
+
+        self.add_call(target_address, call_data, decode_uint128)
+
+    def add_permit2_allowance(self, permit2_address: str, owner: str, token: str, spender: str):
+        """Add Permit2 allowance(address,address,address) — returns (amount, expiration, nonce)."""
+        # allowance(address,address,address) selector = 0x927da105
+        owner_bytes = bytes.fromhex(Web3.to_checksum_address(owner)[2:]).rjust(32, b'\x00')
+        token_bytes = bytes.fromhex(Web3.to_checksum_address(token)[2:]).rjust(32, b'\x00')
+        spender_bytes = bytes.fromhex(Web3.to_checksum_address(spender)[2:]).rjust(32, b'\x00')
+        call_data = bytes.fromhex('927da105') + owner_bytes + token_bytes + spender_bytes
+
+        def decode_permit2_allowance(data: bytes) -> tuple:
+            if len(data) < 96:
+                return (0, 0, 0)
+            amount = int.from_bytes(data[0:32], 'big')
+            expiration = int.from_bytes(data[32:64], 'big')
+            nonce = int.from_bytes(data[64:96], 'big')
+            return (amount, expiration, nonce)
+
+        self.add_call(permit2_address, call_data, decode_permit2_allowance)
 
     # ── End position loading helpers ──────────────────────────────────
 
@@ -814,6 +888,41 @@ def get_token_info_batch(
             output[token]['decimals'] = cache.get_decimals(token)
 
     return output
+
+
+def batch_read_token_info(
+    w3: Web3, token0: str, token1: str
+) -> tuple:
+    """Batch-read decimals + symbol for both tokens in 1 Multicall3 RPC call.
+
+    Returns (t0_decimals, t1_decimals, t0_symbol, t1_symbol).
+    Falls back to sequential reads if Multicall3 fails.
+    """
+    batch = BatchRPC(w3)
+    batch.add_decimals(token0)       # [0]
+    batch.add_decimals(token1)       # [1]
+    batch.add_erc20_symbol(token0)   # [2]
+    batch.add_erc20_symbol(token1)   # [3]
+
+    results = batch.execute()  # auto-fallback inside
+
+    t0_dec = results[0]
+    t1_dec = results[1]
+    t0_sym = results[2] or ""
+    t1_sym = results[3] or ""
+
+    if t0_dec is None:
+        raise RuntimeError(
+            f"Failed to read decimals for token0 {token0} — "
+            f"cannot safely proceed (wrong decimals cause catastrophic amount errors)"
+        )
+    if t1_dec is None:
+        raise RuntimeError(
+            f"Failed to read decimals for token1 {token1} — "
+            f"cannot safely proceed (wrong decimals cause catastrophic amount errors)"
+        )
+
+    return t0_dec, t1_dec, t0_sym, t1_sym
 
 
 # ── Pool Info Cache ─────────────────────────────────────────────────────
