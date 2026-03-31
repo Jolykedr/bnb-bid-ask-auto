@@ -67,3 +67,8 @@ private_key.pem
 # Audit
 AUDIT.md
 AUDIT_*.md
+
+# License server deployment (contains server IP, SSH credentials)
+license-server/deploy.sh
+license-server/setup_ssl.sh
+license-server/licenses.db
