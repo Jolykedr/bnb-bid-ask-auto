@@ -33,8 +33,12 @@ from .utils import NonceManager, DecimalsCache, GasEstimator
 POSITION_MANAGER_TO_FACTORY = {
     # Uniswap V3 on BSC
     "0x7b8A01B39D58278b5DE7e48c8449c9f4F5170613".lower(): "0xdB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7",
-    # PancakeSwap V3 on BSC
+    # PancakeSwap V3 on BSC / ETH / Base (same PM + same factory across chains)
     "0x46A15B0b27311cedF172AB29E4f4766fbE7F4364".lower(): "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
+    # Uniswap V3 on Ethereum
+    "0xC36442b4a4522E871399CD717aBDD847Ab11FE88".lower(): "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+    # Uniswap V3 on Base
+    "0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1".lower(): "0x33128a8fC17869897dcE68Ed026d694621f6FDfD",
 }
 
 

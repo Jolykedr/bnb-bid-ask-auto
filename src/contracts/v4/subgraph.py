@@ -88,15 +88,20 @@ query GetV4Pool {
                 logger.debug(f"[API] Pool found: {pool is not None}")
 
                 if pool:
-                    logger.info(f"[API] Pool tokens: {pool.get('token0', {}).get('symbol')}/{pool.get('token1', {}).get('symbol')}")
+                    token0 = pool.get('token0') or {}
+                    token1 = pool.get('token1') or {}
+                    if not token0 or not token1:
+                        logger.warning(f"[API] Pool missing token data: token0={pool.get('token0')}, token1={pool.get('token1')}")
+                    else:
+                        logger.info(f"[API] Pool tokens: {token0.get('symbol')}/{token1.get('symbol')}")
                     return V4PoolInfo(
                         pool_id=pool["poolId"],
-                        token0_address=pool["token0"]["address"],
-                        token1_address=pool["token1"]["address"],
-                        token0_symbol=pool["token0"]["symbol"],
-                        token1_symbol=pool["token1"]["symbol"],
-                        token0_decimals=int(pool["token0"]["decimals"]),
-                        token1_decimals=int(pool["token1"]["decimals"]),
+                        token0_address=token0["address"],
+                        token1_address=token1["address"],
+                        token0_symbol=token0["symbol"],
+                        token1_symbol=token1["symbol"],
+                        token0_decimals=int(token0["decimals"]),
+                        token1_decimals=int(token1["decimals"]),
                         fee_tier=int(float(pool["feeTier"])),
                         tick_spacing=int(pool["tickSpacing"]),
                         current_tick=0,  # Not available in API

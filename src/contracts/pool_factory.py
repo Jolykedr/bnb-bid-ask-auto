@@ -500,6 +500,11 @@ class PoolFactory:
         sqrt_price = math.sqrt(adjusted_price)
         sqrt_price_x96 = int(sqrt_price * (2 ** 96))
 
+        # Clamp to Uniswap V3 TickMath valid range to prevent on-chain revert
+        MIN_SQRT_RATIO = 4295128739
+        MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342
+        sqrt_price_x96 = max(MIN_SQRT_RATIO, min(MAX_SQRT_RATIO, sqrt_price_x96))
+
         # Build transaction
         nonce = self.nonce_manager.get_next_nonce() if self.nonce_manager else \
                 self.w3.eth.get_transaction_count(self.account.address, 'pending')

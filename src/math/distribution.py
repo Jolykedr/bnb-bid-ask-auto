@@ -246,16 +246,24 @@ def calculate_bid_ask_distribution(
         aligned_offset = 0
 
     for i in range(n_positions):
-        # ВСЕ позиции имеют одинаковую ширину = ticks_per_position
+        # Позиции 0..N-2 имеют ширину ticks_per_position (floor-aligned).
+        # Последняя позиция (N-1) расширяется до границы диапазона,
+        # чтобы покрыть весь запрошенный ценовой диапазон без пропусков.
         # Порядок: позиция 0 ближе к текущей цене, позиция N-1 дальше
         if positions_go_down:
             # Позиции идут ВНИЗ от tick_upper_aligned к tick_lower_aligned
             pos_tick_upper = tick_upper_aligned - i * ticks_per_position
-            pos_tick_lower = tick_upper_aligned - (i + 1) * ticks_per_position
+            if i == n_positions - 1:
+                pos_tick_lower = tick_lower_aligned
+            else:
+                pos_tick_lower = tick_upper_aligned - (i + 1) * ticks_per_position
         else:
             # Позиции идут ВВЕРХ от tick_lower_aligned к tick_upper_aligned
             pos_tick_lower = tick_lower_aligned + i * ticks_per_position
-            pos_tick_upper = tick_lower_aligned + (i + 1) * ticks_per_position
+            if i == n_positions - 1:
+                pos_tick_upper = tick_upper_aligned
+            else:
+                pos_tick_upper = tick_lower_aligned + (i + 1) * ticks_per_position
 
         # Цены для позиции (инвертируем обратно если нужно, для отображения пользователю)
         # These are HUMAN-READABLE prices (no decimal adjustment)

@@ -334,8 +334,10 @@ def calculate_liquidity_from_usd(
             )
         else:
             # Позиция НИЖЕ: используем volatile (token1)
+            # Pool price = token1/token0 = volatile/stablecoin,
+            # so USD * pool_price = volatile tokens
             avg_price = (price_lower + price_upper) / 2
-            amount1_in_tokens = usd_amount / avg_price
+            amount1_in_tokens = usd_amount * avg_price
             amount1 = usd_to_wei(amount1_in_tokens, token1_decimals)
             return calculate_liquidity(
                 sqrt_price_current=sqrt_price_current,

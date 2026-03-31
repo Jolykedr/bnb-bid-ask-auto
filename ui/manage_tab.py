@@ -3761,6 +3761,10 @@ class ManageTab(QWidget):
             self._swap_worker.swap_result.connect(self._on_swap_finished, Qt.ConnectionType.QueuedConnection)
             self._swap_worker.start()
         except Exception as e:
+            self.progress_bar.hide()
+            self.close_selected_btn.setEnabled(True)
+            self.close_all_btn.setEnabled(True)
+            self.batch_close_btn.setEnabled(True)
             logger.exception(f"Error starting swap: {e}")
             self._log(f"Error starting swap: {e}")
 
