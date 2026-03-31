@@ -536,7 +536,39 @@ class LiquidityProvider:
 
         pool_create_sqrt_price = None  # Set when pool needs creation (batched with mint)
 
-        # Расчёт позиций
+        # CRITICAL: Verify token decimals on-chain before any calculations
+        # Wrong decimals cause catastrophic tick offsets and amount errors (e.g., 10^12x on BASE USDC)
+        # Fail hard if RPC cannot confirm decimals — never trust UI/config values blindly
+        for token_addr, label, cfg_dec in [
+            (config.token0, "token0", config.token0_decimals),
+            (config.token1, "token1", config.token1_decimals),
+        ]:
+            try:
+                erc20 = self.w3.eth.contract(
+                    address=Web3.to_checksum_address(token_addr), abi=ERC20_ABI
+                )
+                actual_dec = erc20.functions.decimals().call()
+                if actual_dec != cfg_dec:
+                    logger.warning(
+                        f"[V3 create_ladder] {label} decimals MISMATCH: "
+                        f"config={cfg_dec}, on-chain={actual_dec}. Overriding."
+                    )
+                    if label == "token0":
+                        config.token0_decimals = actual_dec
+                    else:
+                        config.token1_decimals = actual_dec
+            except Exception as e:
+                return LadderResult(
+                    positions=[],
+                    tx_hash=None,
+                    gas_used=None,
+                    token_ids=[],
+                    success=False,
+                    error=f"Failed to read {label} decimals on-chain: {e}. "
+                          f"Cannot safely proceed — wrong decimals cause catastrophic amount errors."
+                )
+
+        # Расчёт позиций (AFTER decimals verification — ticks depend on correct decimals)
         positions = self.preview_ladder(config)
 
         # Проверка порядка токенов для Uniswap (token0 < token1 по адресу)

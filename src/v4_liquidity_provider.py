@@ -1318,6 +1318,7 @@ class V4LiquidityProvider:
 
         # CRITICAL: Verify token decimals on-chain before any calculations
         # Stale/wrong decimals cause catastrophic tick offsets and absurd pool prices
+        # Fail hard if RPC cannot confirm decimals — never trust UI/config values blindly
         for token_addr, label, cfg_dec in [
             (config.token0, "token0", config.token0_decimals),
             (config.token1, "token1", config.token1_decimals),
@@ -1337,7 +1338,16 @@ class V4LiquidityProvider:
                     else:
                         config.token1_decimals = actual_dec
             except Exception as e:
-                logger.warning(f"[create_ladder] Could not verify {label} decimals: {e}")
+                return V4LadderResult(
+                    positions=[],
+                    tx_hash=None,
+                    gas_used=None,
+                    token_ids=[],
+                    pool_created=False,
+                    success=False,
+                    error=f"Failed to read {label} decimals on-chain: {e}. "
+                          f"Cannot safely proceed — wrong decimals cause catastrophic amount errors."
+                )
 
         # Validate fee
         if config.fee_percent < 0 or config.fee_percent > 100:
