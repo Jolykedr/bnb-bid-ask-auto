@@ -50,6 +50,7 @@ logs/
 debug_*.py
 test_*.py
 !tests/test_*.py
+tests/RUN_TESTS.md
 
 # Temporary files
 *.tmp

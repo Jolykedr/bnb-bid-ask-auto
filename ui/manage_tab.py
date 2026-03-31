@@ -1731,6 +1731,77 @@ class ManageTab(QWidget):
         self.settings.setValue("positions_protocols", json.dumps(positions_protocols))
         self._log(f"Saved {len(token_ids)} positions to storage")
 
+    def _recalc_invested_usd(self):
+        """Recalculate invested_usd from on-chain position data.
+
+        Called after positions are loaded. Compares preview-based invested_usd
+        with on-chain calculated value. Updates if deviation is within 30%.
+        """
+        invested_map = getattr(self, '_invested_usd_map', {})
+        if not invested_map:
+            return
+
+        updated = 0
+        with QMutexLocker(self._positions_mutex):
+            snapshot = {tid: dict(pos) for tid, pos in self.positions_data.items()
+                        if isinstance(pos, dict) and pos.get('liquidity', 0) > 0}
+
+        for tid, pos in snapshot.items():
+            if tid not in invested_map or invested_map[tid] <= 0:
+                continue
+
+            old_usd = invested_map[tid]
+
+            tick_lower = pos.get('tick_lower', 0)
+            tick_upper = pos.get('tick_upper', 0)
+            liquidity = pos.get('liquidity', 0)
+            current_tick = pos.get('current_tick')
+            dec0 = pos.get('token0_decimals', 18)
+            dec1 = pos.get('token1_decimals', 18)
+            token0 = pos.get('token0', '').lower()
+            token1 = pos.get('token1', '').lower()
+            raw_price = pos.get('current_price', 0)
+
+            if not raw_price or raw_price <= 0 or tick_lower >= tick_upper:
+                continue
+
+            try:
+                token0_is_stable = is_stablecoin(token0)
+                human_price = (1 / raw_price) if token0_is_stable else raw_price
+
+                new_usd = calc_usd_from_liquidity(
+                    tick_lower, tick_upper, liquidity, human_price,
+                    token0, token1, dec0, dec1, cur_tick=current_tick,
+                )
+            except Exception as e:
+                logger.debug(f"[Recalc] #{tid}: calc failed: {e}")
+                continue
+
+            if not new_usd or new_usd <= 0:
+                continue
+
+            deviation = abs(new_usd - old_usd) / old_usd
+            if deviation > 0.30:
+                logger.warning(
+                    f"[Recalc] #{tid}: SKIP — deviation {deviation:.0%} "
+                    f"(preview=${old_usd:.2f} → on-chain=${new_usd:.2f})"
+                )
+                continue
+
+            if abs(new_usd - old_usd) > 0.01:
+                logger.info(
+                    f"[Recalc] #{tid}: ${old_usd:.2f} → ${new_usd:.2f} "
+                    f"(Δ${new_usd - old_usd:+.2f}, {deviation:.1%})"
+                )
+                invested_map[tid] = new_usd
+                updated += 1
+
+        if updated:
+            logger.info(f"[Recalc] Updated invested_usd for {updated} positions")
+            total_invested = sum(invested_map.values())
+            if total_invested > 0:
+                self.initial_investment_spin.setValue(total_invested)
+
     def _persist_open_positions(self):
         """Save open positions to SQLite so dashboard can restore them after restart."""
         try:
@@ -1740,6 +1811,10 @@ class ManageTab(QWidget):
             if not wallet:
                 return
             chain_id = getattr(self.provider, 'chain_id', 56)
+
+            # Recalculate invested_usd from on-chain data before saving
+            self._recalc_invested_usd()
+
             # Snapshot under mutex
             with QMutexLocker(self._positions_mutex):
                 snapshot = dict(self.positions_data)
@@ -1778,6 +1853,21 @@ class ManageTab(QWidget):
                 self._log(f"Loaded {len(token_ids)} saved position IDs")
         except Exception as e:
             self._log(f"Error loading saved positions: {e}")
+
+        # Restore invested_usd from SQLite
+        try:
+            open_pos = get_open_positions()
+            if open_pos:
+                self._invested_usd_map = {}
+                for tid, pos in open_pos.items():
+                    inv = pos.get('invested_usd', 0)
+                    if inv > 0:
+                        self._invested_usd_map[tid] = inv
+                total = sum(self._invested_usd_map.values())
+                if total > 0:
+                    self.initial_investment_spin.setValue(total)
+        except Exception:
+            pass
 
     def _add_single_id(self):
         """Add single token ID to the list."""
@@ -3293,6 +3383,13 @@ class ManageTab(QWidget):
                 with QMutexLocker(self._positions_mutex):
                     for tid in closed_ids:
                         self.positions_data.pop(tid, None)
+            # Update invested spinbox with remaining positions
+            invested_map = getattr(self, '_invested_usd_map', {})
+            if invested_map and closed_ids:
+                for tid in closed_ids:
+                    invested_map.pop(tid, None)
+                remaining = sum(invested_map.values())
+                self.initial_investment_spin.setValue(remaining)
             self.trade_recorded.emit()
         except Exception as e:
             logger.warning(f"Failed to record trade: {e}")
