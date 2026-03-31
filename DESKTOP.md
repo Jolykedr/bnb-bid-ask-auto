@@ -175,7 +175,10 @@ open_positions     — Active positions (persist across app restarts)
 - `QTimer` debounce (200ms) — `_flush_table_updates()` для пакетного обновления таблицы (при загрузке 50+ позиций)
 - `_positions_mutex` (QMutex) — защита `positions_data` dict при конкурентных worker'ах (snapshot pattern: `with QMutexLocker → dict()` → передача snapshot в workers)
 - `_row_index` dict — O(1) маппинг token_id → row для быстрого обновления
-- PnL: `current_value + fees_earned - initial_investment`
+- PnL (live): `current_value + unclaimed_fees(both sides) + claimed_fees - invested_usd`
+- PnL (realized): `received + previously_claimed - invested` (deferred after swap if auto-sell)
+- invested_usd: auto from CreateTab signal → per-position in SQLite, recalc ±30% sanity check
+- Fees: stable + volatile×price (both sides, like web pnl.py:533-540)
 
 **Паттерн lifecycle:**
 ```python
@@ -584,6 +587,12 @@ except:
 | NonceManager | Полноценный ✓ | Нет (pending nonce) | Per-wallet lock ✓ |
 | PM.multicall batch | Batch mint/close ✓ | Есть ✓ | Есть ✓ |
 | Tests | 1307+ (80%) ✓ | Нет тестов ⚠️ | Нет тестов ⚠️ |
+| PnL fees | Both sides (stable + volatile×price) ✓ | Both sides ✓ | Нет PnL ⚠️ |
+| Claimed fees in PnL | ✓ (live + realized) | ✓ | Нет ⚠️ |
+| Auto invested_usd | ✓ (signal from CreateTab + DB) | ✓ (TrackedPosition) | Нет ⚠️ |
+| Invested recalc | ✓ (±30% sanity check) | ✓ (background task) | Нет ⚠️ |
+| V3 decimals on-chain | ✓ (create_ladder verifies) | ✓ | Нет ⚠️ |
+| Deferred trade record | ✓ (after swap completes) | ✓ (single endpoint) | Нет ⚠️ |
 
 ---
 
@@ -642,7 +651,7 @@ except:
 - [x] Dashboard pair click — deferred network switch через QTimer
 
 ### Тесты
-- [x] 1312 тестов, все passing
+- [x] 1287 тестов passing (4 pre-existing N1 bug, 2 skipped)
 - [x] Math coverage 99-100%
 - [x] Contract coverage 100% (V3 PM, pool factory)
 - [ ] UI layer coverage 4-16% — **НИЗКОЕ**
@@ -685,6 +694,16 @@ except:
 - [ ] **L7: V3 pool init по upper bound** — config.current_price = верхняя граница, не реальная цена
 - [ ] **L8: Missing chainId** — transaction params без chainId (defense-in-depth)
 - [x] **L9: create_tab lambda late binding** — _load_pool_worker.finished lambda → worker reload crash. **ИСПРАВЛЕНО 2026-02-28 (audit v3).**
+
+### Исправлено 2026-03-31 — PnL parity + decimals safety
+- [x] **PnL fees both sides** — unclaimed fees теперь считают stable + volatile×price (было: только stable)
+- [x] **Claimed fees in PnL** — добавлены в live и realized PnL через get_claimed_fees_usd_for_tokens()
+- [x] **Auto invested_usd** — CreateTab → MainWindow → ManageTab signal chain, per-position в SQLite
+- [x] **Background recalc invested** — _recalc_invested_usd() с ±30% sanity check
+- [x] **Deferred trade recording** — trade записывается ПОСЛЕ swap при auto-sell (было: ДО)
+- [x] **V3 decimals on-chain** — create_ladder теперь верифицирует decimals on-chain (как V4)
+- [x] **LoadPoolWorker hard fail** — ошибка вместо default 18 при сбое RPC decimals
+- [x] **LoadPositionWorker hard fail** — skip позиции вместо default 18
 
 ---
 
