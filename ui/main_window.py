@@ -286,7 +286,7 @@ class MainWindow(QMainWindow):
         if hasattr(self.manage_tab, 'positions_data'):
             self.dashboard_tab.update_positions_data(self.manage_tab.positions_data)
 
-    def _on_positions_created(self, token_ids: list):
+    def _on_positions_created(self, token_ids: list, invested_usd: float = 0):
         """Handle new positions created in Create tab."""
         # Add positions to Manage tab
         if token_ids:
@@ -295,8 +295,8 @@ class MainWindow(QMainWindow):
             if self.create_tab.provider:
                 self.manage_tab.set_provider(self.create_tab.provider)
 
-            # Add the new positions
-            self.manage_tab.add_positions(token_ids)
+            # Add the new positions with invested amount
+            self.manage_tab.add_positions(token_ids, invested_usd)
 
             # Show notification in status bar
             self.status_bar.showMessage(

@@ -36,6 +36,7 @@ from src.storage.pnl_store import (
     TradeRecord, save_trade, save_open_positions_bulk, remove_open_positions,
     ClaimedFeeRecord, save_claimed_fees_bulk,
     get_latest_snapshots_bulk, prune_old_snapshots,
+    get_claimed_fees_usd_for_tokens, get_open_positions,
 )
 from src.math.apr import calc_position_apr, calc_aggregate_apr
 from src.receipt_parser import parse_close_receipt, calculate_usd_value
@@ -540,8 +541,17 @@ class LoadPositionWorker(QThread):
                             results2 = batch2.execute()
 
                             pool_addr = results2[0]
-                            dec0 = results2[1] if results2[1] is not None else 18
-                            dec1 = results2[2] if results2[2] is not None else 18
+                            dec0 = results2[1]
+                            dec1 = results2[2]
+                            if dec0 is None or dec1 is None:
+                                self.error.emit(
+                                    self.token_id,
+                                    f"Failed to read decimals on-chain "
+                                    f"(dec0={'OK' if dec0 is not None else 'FAILED'}, "
+                                    f"dec1={'OK' if dec1 is not None else 'FAILED'}). "
+                                    f"Check RPC connection."
+                                )
+                                return
                             sym0 = results2[3] or '???'
                             sym1 = results2[4] or '???'
 
@@ -1654,12 +1664,13 @@ class ManageTab(QWidget):
             self.status_label.setText("Connect wallet in Create tab to manage positions")
             self.pool_factory = None
 
-    def add_positions(self, token_ids: list):
+    def add_positions(self, token_ids: list, invested_usd: float = 0):
         """
         Add positions to the list (called externally when new positions are created).
 
         Args:
             token_ids: List of new token IDs to add
+            invested_usd: Total USD invested for this ladder (distributed per position)
         """
         # Add to input field
         current_text = self.token_ids_input.text().strip()
@@ -1670,11 +1681,22 @@ class ManageTab(QWidget):
         else:
             self.token_ids_input.setText(new_ids_str)
 
+        # Store invested_usd per position for DB persistence
+        per_position_usd = invested_usd / len(token_ids) if token_ids and invested_usd > 0 else 0
+
         # Add to positions data (will be populated when loaded)
         with QMutexLocker(self._positions_mutex):
             for token_id in token_ids:
                 if token_id not in self.positions_data:
                     self.positions_data[token_id] = None  # Placeholder
+                # Store invested_usd mapping for later persistence
+                if not hasattr(self, '_invested_usd_map'):
+                    self._invested_usd_map = {}
+                self._invested_usd_map[token_id] = per_position_usd
+
+        # Auto-fill initial investment spinbox
+        if invested_usd > 0:
+            self.initial_investment_spin.setValue(invested_usd)
 
         # Save and reload
         self._save_positions()
@@ -1682,7 +1704,7 @@ class ManageTab(QWidget):
         if self.provider:
             self._load_positions_by_ids(token_ids)
 
-        self._log(f"Added new positions: {token_ids}")
+        self._log(f"Added new positions: {token_ids} (invested: ${invested_usd:.2f})")
         self.positions_updated.emit()
 
     def _log(self, message: str):
@@ -1721,11 +1743,15 @@ class ManageTab(QWidget):
             # Snapshot under mutex
             with QMutexLocker(self._positions_mutex):
                 snapshot = dict(self.positions_data)
-            # Inject chain_id into position dicts before saving
+            # Inject chain_id and invested_usd into position dicts before saving
+            invested_map = getattr(self, '_invested_usd_map', {})
             enriched = {}
             for tid, pos in snapshot.items():
                 if isinstance(pos, dict) and pos.get('liquidity', 0) > 0:
-                    enriched[tid] = dict(pos, chain_id=chain_id)
+                    pos_enriched = dict(pos, chain_id=chain_id)
+                    if tid in invested_map:
+                        pos_enriched['invested_usd'] = invested_map[tid]
+                    enriched[tid] = pos_enriched
             save_open_positions_bulk(wallet, enriched)
         except Exception as e:
             logger.warning(f"Failed to persist open positions: {e}")
@@ -2445,21 +2471,22 @@ class ManageTab(QWidget):
         fees1_formatted = fees1 / (10 ** dec1) if fees1 > 0 else 0
 
         # Show fees as volatile / stablecoin
+        raw_price = position.get('current_price', 0)
         if token0_is_stable and not token1_is_stable:
             fees_str = f"{fees1_formatted:.6f} / {fees0_formatted:.4f}"
-            stable_fees = fees0_formatted
+            total_fees_usd = fees0_formatted + (fees1_formatted * (1 / raw_price) if raw_price > 0 else 0)
         else:
             fees_str = f"{fees0_formatted:.6f} / {fees1_formatted:.4f}"
-            stable_fees = fees1_formatted
-        fees_item = NumericTableWidgetItem(fees_str, stable_fees)
+            total_fees_usd = fees1_formatted + (fees0_formatted * raw_price if raw_price > 0 else 0)
+        fees_item = NumericTableWidgetItem(fees_str, total_fees_usd)
         self.positions_table.setItem(row, 5, fees_item)
 
         # Per-position value (value + fees). Aggregate PnL is in the summary bar.
         if usd_value > 0:
-            total_pos_value = usd_value + stable_fees
+            total_pos_value = usd_value + total_fees_usd
             pnl_str = f"${usd_value:.2f}"
-            if stable_fees > 0:
-                pnl_str = f"${usd_value:.2f} +${stable_fees:.4f}"
+            if total_fees_usd > 0:
+                pnl_str = f"${usd_value:.2f} +${total_fees_usd:.4f}"
             pnl_item = NumericTableWidgetItem(pnl_str, total_pos_value)
             pnl_item.setForeground(QColor(200, 200, 200))
         else:
@@ -2627,14 +2654,16 @@ class ManageTab(QWidget):
             except Exception:
                 pass
 
-            # Fees (USD estimate from stablecoin side)
+            # Fees (USD estimate from both sides)
             fees0 = position.get('tokens_owed0', 0)
             fees1 = position.get('tokens_owed1', 0)
+            f0_human = fees0 / (10 ** dec0) if fees0 > 0 else 0
+            f1_human = fees1 / (10 ** dec1) if fees1 > 0 else 0
             fees_usd = 0.0
             if token0_is_stable:
-                fees_usd = fees0 / (10 ** dec0)
+                fees_usd = f0_human + (f1_human * (1 / raw_price) if raw_price > 0 else 0)
             elif token1_is_stable:
-                fees_usd = fees1 / (10 ** dec1)
+                fees_usd = f1_human + (f0_human * raw_price if raw_price > 0 else 0)
             total_fees += fees_usd
 
             # APR snapshot
@@ -2661,11 +2690,26 @@ class ManageTab(QWidget):
             except Exception:
                 pass
 
+        # Claimed fees from DB
+        claimed_fees_total = get_claimed_fees_usd_for_tokens(active_token_ids) if active_token_ids else 0
+
         # Build summary text
         initial = self.initial_investment_spin.value()
+        # Fallback: read invested from open_positions DB if spinbox is 0
+        if initial <= 0 and active_token_ids:
+            try:
+                open_pos = get_open_positions()
+                initial = sum(
+                    open_pos[tid].get('invested_usd', 0)
+                    for tid in active_token_ids if tid in open_pos
+                )
+            except Exception:
+                pass
         parts = [f"Positions: {active_count}", f"Value: ${total_value:.2f}"]
         if total_fees > 0:
             parts.append(f"Fees: ${total_fees:.4f}")
+        if claimed_fees_total > 0:
+            parts.append(f"Claimed: ${claimed_fees_total:.2f}")
 
         # Aggregate APR
         agg_apr = calc_aggregate_apr(apr_map, value_map)
@@ -2673,7 +2717,7 @@ class ManageTab(QWidget):
             parts.append(f"APR: {agg_apr:.1f}%/day")
 
         if initial > 0:
-            pnl = total_value + total_fees - initial
+            pnl = total_value + total_fees + claimed_fees_total - initial
             pnl_sign = "+" if pnl >= 0 else ""
             pnl_pct = (pnl / initial * 100) if initial > 0 else 0
             parts.append(f"PnL: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_pct:.1f}%)")
@@ -2915,13 +2959,15 @@ class ManageTab(QWidget):
             if success:
                 self._log(f"SUCCESS: {message}")
                 self._log(f"TX Hash: {data.get('tx_hash', 'N/A')}")
-                self._record_closed_trade(data)
 
                 # Check if auto-sell with preview is pending
                 if getattr(self, '_pending_auto_sell', False) and self._pending_private_key:
+                    # Defer trade recording until swap completes
+                    self._deferred_trade_data = data
                     self._log("Preparing swap preview...")
                     self._show_swap_preview(data)
                 else:
+                    self._record_closed_trade(data)
                     QMessageBox.information(
                         self, "Batch Close Success",
                         f"All positions closed successfully in 1 transaction!\n\n"
@@ -3047,12 +3093,13 @@ class ManageTab(QWidget):
                 f0_human = fees0 / (10 ** dec0)
                 f1_human = fees1 / (10 ** dec1)
 
-                # Estimate USD from stablecoin side
+                # Estimate USD from both sides
                 fees_usd = 0.0
+                raw_price = pos.get('current_price', 0)
                 if is_stablecoin(t0):
-                    fees_usd = f0_human
+                    fees_usd = f0_human + (f1_human * (1 / raw_price) if raw_price > 0 else 0)
                 elif is_stablecoin(t1):
-                    fees_usd = f1_human
+                    fees_usd = f1_human + (f0_human * raw_price if raw_price > 0 else 0)
 
                 records.append(ClaimedFeeRecord(
                     id=None,
@@ -3186,15 +3233,37 @@ class ManageTab(QWidget):
             pair = f"{sym0}/{sym1}"
             protocol = first.get('protocol', 'v3')
 
-            # Try receipt-based PnL calculation (precise, from worker-fetched receipts)
-            receipts = data.get('receipts', [])
-            received = self._calc_received_from_receipts(receipts, pos_dicts)
+            # If swap was performed, use swap total_usd as received
+            received_from_swap = data.get('received_from_swap', 0)
+            if received_from_swap > 0:
+                received = received_from_swap
+            else:
+                # Try receipt-based PnL calculation (precise, from worker-fetched receipts)
+                receipts = data.get('receipts', [])
+                received = self._calc_received_from_receipts(receipts, pos_dicts)
 
-            # Fallback to liquidity math if receipt parsing failed
-            if received <= 0:
-                received = self._calc_received_from_math(pos_dicts)
+                # Fallback to liquidity math if receipt parsing failed
+                if received <= 0:
+                    received = self._calc_received_from_math(pos_dicts)
 
+            # Add previously claimed fees (collected before close)
+            closed_token_ids = [p.get('token_id') for p in pos_dicts if p.get('token_id')]
+            if not closed_token_ids:
+                closed_token_ids = token_ids
+            previously_claimed = get_claimed_fees_usd_for_tokens(closed_token_ids)
+            received += previously_claimed
+
+            # Fallback invested from DB if manual spinbox is 0
             invested = initial if initial > 0 else 0
+            if invested <= 0 and closed_token_ids:
+                try:
+                    open_pos = get_open_positions()
+                    invested = sum(
+                        open_pos[tid].get('invested_usd', 0)
+                        for tid in closed_token_ids if tid in open_pos
+                    )
+                except Exception:
+                    pass
             pnl = received - invested if invested > 0 else 0
             pnl_pct = (pnl / invested * 100) if invested > 0 else 0
 
@@ -3219,6 +3288,11 @@ class ManageTab(QWidget):
             if not closed_ids and pos_dicts:
                 closed_ids = [p.get('token_id') for p in pos_dicts if p.get('token_id')]
             remove_open_positions(closed_ids)
+            # Remove from in-memory tracking so _refresh_all_positions skips them
+            if closed_ids:
+                with QMutexLocker(self._positions_mutex):
+                    for tid in closed_ids:
+                        self.positions_data.pop(tid, None)
             self.trade_recorded.emit()
         except Exception as e:
             logger.warning(f"Failed to record trade: {e}")
@@ -3297,6 +3371,7 @@ class ManageTab(QWidget):
             t1 = pos.get('token1', '').lower()
             t0_stable = t0 in STABLECOINS
             t1_stable = t1 in STABLECOINS
+            raw_price = pos.get('current_price', 0)
 
             if current_tick is not None and tick_lower < tick_upper and liq > 0:
                 try:
@@ -3307,7 +3382,6 @@ class ManageTab(QWidget):
                     a0 = amounts.amount0 / (10 ** dec0) if amounts.amount0 > 0 else 0
                     a1 = amounts.amount1 / (10 ** dec1) if amounts.amount1 > 0 else 0
 
-                    raw_price = pos.get('current_price', 0)
                     if t0_stable and not t1_stable:
                         usd = (a0 + a1 * (1 / raw_price)) if raw_price > 0 else a0
                     elif t1_stable and not t0_stable:
@@ -3318,13 +3392,15 @@ class ManageTab(QWidget):
                 except Exception:
                     pass
 
-            # Add unclaimed fees
+            # Add unclaimed fees (both sides)
             fees0 = pos.get('tokens_owed0', 0)
             fees1 = pos.get('tokens_owed1', 0)
+            f0_h = fees0 / (10 ** dec0) if fees0 > 0 else 0
+            f1_h = fees1 / (10 ** dec1) if fees1 > 0 else 0
             if t0_stable:
-                received += fees0 / (10 ** dec0)
+                received += f0_h + (f1_h * (1 / raw_price) if raw_price > 0 else 0)
             elif t1_stable:
-                received += fees1 / (10 ** dec1)
+                received += f1_h + (f0_h * raw_price if raw_price > 0 else 0)
 
         return received
 
@@ -3343,13 +3419,15 @@ class ManageTab(QWidget):
             if success:
                 self._log(f"SUCCESS: {message}")
                 self._log(f"TX Hash: {data.get('tx_hash', 'N/A')}")
-                self._record_closed_trade(data)
 
                 # Check if auto-sell with preview is pending
                 if getattr(self, '_pending_auto_sell', False) and self._pending_private_key:
+                    # Defer trade recording until swap completes
+                    self._deferred_trade_data = data
                     self._log("Preparing swap preview...")
                     self._show_swap_preview(data)
                 else:
+                    self._record_closed_trade(data)
                     QMessageBox.information(
                         self, "Success",
                         f"Positions closed successfully!\n\nTX: {data.get('tx_hash', 'N/A')}"
@@ -3420,6 +3498,11 @@ class ManageTab(QWidget):
 
             if not tokens_to_sell:
                 self._log("No volatile tokens to sell (all stablecoins)")
+                # Record deferred trade since no swap will happen
+                deferred = getattr(self, '_deferred_trade_data', None)
+                if deferred:
+                    self._record_closed_trade(deferred)
+                    self._deferred_trade_data = None
                 QMessageBox.information(
                     self, "Success",
                     f"Positions closed!\n\nTX: {close_data.get('tx_hash', 'N/A')}\n\n"
@@ -3447,6 +3530,11 @@ class ManageTab(QWidget):
         except Exception as e:
             logger.exception(f"Error showing swap preview: {e}")
             self._log(f"Error showing swap preview: {e}")
+            # Record deferred trade since swap won't happen
+            deferred = getattr(self, '_deferred_trade_data', None)
+            if deferred:
+                self._record_closed_trade(deferred)
+                self._deferred_trade_data = None
             self._refresh_all_positions()
 
     def _on_balances_fetched(self, tokens: list):
@@ -3466,6 +3554,11 @@ class ManageTab(QWidget):
 
             if not tokens_to_sell:
                 self._log("No tokens with balance to sell")
+                # Record deferred trade since no swap will happen
+                deferred = getattr(self, '_deferred_trade_data', None)
+                if deferred:
+                    self._record_closed_trade(deferred)
+                    self._deferred_trade_data = None
                 QMessageBox.information(
                     self, "Success",
                     f"Positions closed!\n\nTX: {close_data.get('tx_hash', 'N/A')}\n\n"
@@ -3499,6 +3592,11 @@ class ManageTab(QWidget):
 
             if result != SwapPreviewDialog.DialogCode.Accepted:
                 self._log("Swap cancelled by user")
+                # Record deferred trade since no swap will happen
+                deferred = getattr(self, '_deferred_trade_data', None)
+                if deferred:
+                    self._record_closed_trade(deferred)
+                    self._deferred_trade_data = None
                 QMessageBox.information(
                     self, "Success",
                     f"Positions closed!\n\nTX: {close_data.get('tx_hash', 'N/A')}\n\n"
@@ -3509,6 +3607,11 @@ class ManageTab(QWidget):
         except Exception as e:
             logger.exception(f"Error in swap preview: {e}")
             self._log(f"Error in swap preview: {e}")
+            # Record deferred trade since swap won't happen
+            deferred = getattr(self, '_deferred_trade_data', None)
+            if deferred:
+                self._record_closed_trade(deferred)
+                self._deferred_trade_data = None
             self._refresh_all_positions()
 
     def _on_balance_fetch_error(self, error: str):
@@ -3517,6 +3620,11 @@ class ManageTab(QWidget):
             self._safe_cleanup_worker(self._balance_fetch_worker)
             self._balance_fetch_worker = None
         self._log(f"Failed to fetch balances: {error}")
+        # Record deferred trade since swap won't happen
+        deferred = getattr(self, '_deferred_trade_data', None)
+        if deferred:
+            self._record_closed_trade(deferred)
+            self._deferred_trade_data = None
         close_data = getattr(self, '_close_data', {})
         QMessageBox.information(
             self, "Success",
@@ -3603,12 +3711,27 @@ class ManageTab(QWidget):
 
             self._log(f"Swap total: ${total_usd:.2f}")
 
+            # Record trade with swap results (deferred from close)
+            deferred = getattr(self, '_deferred_trade_data', None)
+            if deferred:
+                deferred['received_from_swap'] = total_usd
+                deferred['swap_tx_hashes'] = [
+                    s.get('tx_hash') for s in swaps if s.get('tx_hash')
+                ]
+                self._record_closed_trade(deferred)
+                self._deferred_trade_data = None
+
             QMessageBox.information(self, "Close & Sell Complete", result_msg)
             self._refresh_all_positions()
 
         except Exception as e:
             logger.exception(f"Error in _on_swap_finished: {e}")
             self._log(f"Error in swap handler: {e}")
+            # Swap failed — record trade from close data (fallback)
+            deferred = getattr(self, '_deferred_trade_data', None)
+            if deferred:
+                self._record_closed_trade(deferred)
+                self._deferred_trade_data = None
 
     def _clear_list(self):
         """Clear the positions list."""

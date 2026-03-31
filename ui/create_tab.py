@@ -286,8 +286,16 @@ class LoadPoolWorker(QThread):
 
         token0_symbol = results2[0] or '???'
         token1_symbol = results2[1] or '???'
-        decimals0 = results2[2] if results2[2] is not None else 18
-        decimals1 = results2[3] if results2[3] is not None else 18
+        decimals0 = results2[2]
+        decimals1 = results2[3]
+        if decimals0 is None or decimals1 is None:
+            self.result.emit({
+                'error': f"Failed to read token decimals on-chain. "
+                         f"dec0={'OK' if decimals0 is not None else 'FAILED'}, "
+                         f"dec1={'OK' if decimals1 is not None else 'FAILED'}. "
+                         f"Check RPC connection."
+            })
+            return
 
         # Calculate pool price
         pool_price = None
@@ -1045,8 +1053,8 @@ class CreateTab(QWidget):
     - Transaction execution
     """
 
-    # Signal emitted when new positions are created
-    positions_created = pyqtSignal(list)
+    # Signal emitted when new positions are created (token_ids, invested_usd)
+    positions_created = pyqtSignal(list, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1543,6 +1551,9 @@ class CreateTab(QWidget):
         # Initialize token inputs with default addresses
         self._on_token0_combo_changed(0)
         self._on_token1_combo_changed(0)
+
+        # Default to Uniswap V4 (triggers _on_protocol_changed to show correct fee UI)
+        self.protocol_combo.setCurrentIndex(3)
 
     def _toggle_key_visibility(self):
         """Toggle private key visibility."""
@@ -2418,10 +2429,10 @@ class CreateTab(QWidget):
                 f"Token IDs: {data.get('token_ids', [])}"
             )
 
-            # Emit signal with new token IDs for manage tab
+            # Emit signal with new token IDs + invested amount for manage tab
             token_ids = data.get('token_ids', [])
             if token_ids:
-                self.positions_created.emit(token_ids)
+                self.positions_created.emit(token_ids, self.total_usd_spin.value())
 
             # Refresh balances
             self._update_balances()
@@ -3105,6 +3116,28 @@ class CreateTab(QWidget):
         self.pool_info_label.setText(f"Error: {error_msg[:100]}")
         self.pool_info_label.setStyleSheet("color: #e94560;")
 
+    def _set_combo_symbol(self, combo: 'QComboBox', symbol: str):
+        """Set combo box to show the given symbol, adding it if not present.
+
+        Blocks signals to prevent _on_tokenX_combo_changed from overwriting
+        the address field that was already set by pool loading.
+        """
+        if not symbol or symbol == '???':
+            return
+        # Check if symbol already exists in combo
+        for i in range(combo.count()):
+            text = combo.itemText(i)
+            if text == symbol or text == f"[Custom] {symbol}":
+                combo.blockSignals(True)
+                combo.setCurrentIndex(i)
+                combo.blockSignals(False)
+                return
+        # Not found — add and select
+        combo.blockSignals(True)
+        combo.addItem(symbol)
+        combo.setCurrentIndex(combo.count() - 1)
+        combo.blockSignals(False)
+
     def _on_pool_data_loaded(self, data: dict):
         """Apply loaded pool data to UI (runs on main thread)."""
         from src.contracts.v4.constants import V4Protocol
@@ -3131,12 +3164,22 @@ class CreateTab(QWidget):
                 if subgraph:
                     self.token0_input.setText(subgraph.token0_address)
                     self.token1_input.setText(subgraph.token1_address)
+                    self._set_combo_symbol(self.token0_combo, subgraph.token0_symbol)
+                    self._set_combo_symbol(self.token1_combo, subgraph.token1_symbol)
                     self.tick_spacing_spin.setValue(subgraph.tick_spacing)
                     self.tick_spacing_auto_cb.setChecked(False)
                     self.tick_spacing_spin.setEnabled(True)
                     self._token0_decimals = subgraph.token0_decimals
                     self._token1_decimals = subgraph.token1_decimals
-                elif 'ui_dec0' in data:
+                else:
+                    # Fallback symbols from token info
+                    sym0 = data.get('token0_symbol')
+                    sym1 = data.get('token1_symbol')
+                    if sym0:
+                        self._set_combo_symbol(self.token0_combo, sym0)
+                    if sym1:
+                        self._set_combo_symbol(self.token1_combo, sym1)
+                if not subgraph and 'ui_dec0' in data:
                     self._token0_decimals = data['ui_dec0']
                     self._token1_decimals = data['ui_dec1']
 
@@ -3207,6 +3250,12 @@ class CreateTab(QWidget):
             fee = data.get('fee', 0)
             display_price = data.get('display_price')
             display_pair = data.get('display_pair', '???/???')
+
+            # Update combo boxes with correct symbols
+            parts = display_pair.split('/')
+            if len(parts) == 2:
+                self._set_combo_symbol(self.token0_combo, parts[0])
+                self._set_combo_symbol(self.token1_combo, parts[1])
 
             # Set fee combo
             fee_map = {500: 0, 2500: 1, 3000: 2, 10000: 3}

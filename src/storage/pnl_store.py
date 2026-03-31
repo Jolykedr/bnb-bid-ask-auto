@@ -121,6 +121,13 @@ def _get_conn() -> sqlite3.Connection:
             created_at  REAL NOT NULL
         )
     """)
+    # Migration: add invested_usd column to open_positions
+    try:
+        conn.execute("ALTER TABLE open_positions ADD COLUMN invested_usd REAL DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
     conn.commit()
     return conn
 
@@ -318,6 +325,23 @@ def get_total_claimed_fees_usd() -> float:
         conn.close()
 
 
+def get_claimed_fees_usd_for_tokens(token_ids: list) -> float:
+    """Return total claimed fees USD for specific token_ids."""
+    if not token_ids:
+        return 0.0
+    conn = _get_conn()
+    try:
+        placeholders = ",".join("?" for _ in token_ids)
+        row = conn.execute(
+            f"SELECT COALESCE(SUM(fees_usd), 0) FROM claimed_fees "
+            f"WHERE token_id IN ({placeholders})",
+            token_ids,
+        ).fetchone()
+        return row[0]
+    finally:
+        conn.close()
+
+
 # ── Open Positions persistence ────────────────────────────
 
 def save_open_position(wallet: str, pos: dict):
@@ -329,8 +353,9 @@ def save_open_position(wallet: str, pos: dict):
                (token_id, wallet, chain_id, protocol,
                 token0, token1, token0_symbol, token1_symbol,
                 token0_decimals, token1_decimals,
-                fee, tick_lower, tick_upper, liquidity, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                fee, tick_lower, tick_upper, liquidity, created_at,
+                invested_usd)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 pos.get('token_id'),
                 wallet.lower(),
@@ -347,6 +372,7 @@ def save_open_position(wallet: str, pos: dict):
                 pos.get('tick_upper', 0),
                 str(pos.get('liquidity', 0)),
                 time.time(),
+                pos.get('invested_usd', 0),
             ),
         )
         conn.commit()
@@ -367,8 +393,9 @@ def save_open_positions_bulk(wallet: str, positions: dict):
                    (token_id, wallet, chain_id, protocol,
                     token0, token1, token0_symbol, token1_symbol,
                     token0_decimals, token1_decimals,
-                    fee, tick_lower, tick_upper, liquidity, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    fee, tick_lower, tick_upper, liquidity, created_at,
+                    invested_usd)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     tid,
                     wallet.lower(),
@@ -385,6 +412,7 @@ def save_open_positions_bulk(wallet: str, positions: dict):
                     pos.get('tick_upper', 0),
                     str(pos.get('liquidity', 0)),
                     time.time(),
+                    pos.get('invested_usd', 0),
                 ),
             )
         conn.commit()
@@ -420,7 +448,8 @@ def get_open_positions(wallet: str = None) -> dict:
                 "SELECT token_id, wallet, chain_id, protocol, "
                 "token0, token1, token0_symbol, token1_symbol, "
                 "token0_decimals, token1_decimals, "
-                "fee, tick_lower, tick_upper, liquidity, created_at "
+                "fee, tick_lower, tick_upper, liquidity, created_at, "
+                "invested_usd "
                 "FROM open_positions WHERE wallet = ?",
                 (wallet.lower(),)
             ).fetchall()
@@ -429,7 +458,8 @@ def get_open_positions(wallet: str = None) -> dict:
                 "SELECT token_id, wallet, chain_id, protocol, "
                 "token0, token1, token0_symbol, token1_symbol, "
                 "token0_decimals, token1_decimals, "
-                "fee, tick_lower, tick_upper, liquidity, created_at "
+                "fee, tick_lower, tick_upper, liquidity, created_at, "
+                "invested_usd "
                 "FROM open_positions"
             ).fetchall()
 
@@ -452,6 +482,7 @@ def get_open_positions(wallet: str = None) -> dict:
                 'tick_upper': r[12],
                 'liquidity': int(r[13]) if r[13] else 0,
                 'created_at': r[14],
+                'invested_usd': r[15] if len(r) > 15 else 0,
             }
         return result
     finally:
