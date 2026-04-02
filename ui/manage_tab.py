@@ -318,68 +318,42 @@ class PriceProgressDelegate(QStyledItemDelegate):
             painter.restore()
             return
 
-        # --- Compute the visible range (wider than position) ---
-        # The bar shows ~3x the position range, centered on position midpoint
-        pos_range = price_upper - price_lower
-        padding = pos_range * 1.0  # 1x padding on each side
-        vis_min = max(0, price_lower - padding)
-        vis_max = price_upper + padding
-
-        # Make sure current_price is visible too
-        if current_price < vis_min:
-            vis_min = current_price - pos_range * 0.2
-        if current_price > vis_max:
-            vis_max = current_price + pos_range * 0.2
-        vis_min = max(0, vis_min)
-
-        vis_range = vis_max - vis_min
-        if vis_range <= 0:
-            vis_range = 1
-
-        def price_to_x(p):
-            frac = (p - vis_min) / vis_range
-            return bar_rect.left() + int(frac * bar_rect.width())
-
-        # --- Bar background track ---
+        # --- Bar = full position range (lower to upper) ---
         bar_rect_full = rect.adjusted(0, 0, 0, -(rect.height() - bar_height - 2))
         bar_rect = bar_rect_full
         bar_rect.moveTop(bar_y)
 
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(QColor(30, 33, 43)))
-        painter.drawRoundedRect(bar_rect, 4, 4)
-
-        # --- Position range segment (highlighted) ---
-        seg_left = price_to_x(price_lower)
-        seg_right = price_to_x(price_upper)
-        seg_left = max(bar_rect.left(), min(seg_left, bar_rect.right()))
-        seg_right = max(seg_left + 2, min(seg_right, bar_rect.right()))
-
         if in_range:
-            gradient = QLinearGradient(seg_left, 0, seg_right, 0)
-            gradient.setColorAt(0, QColor(0, 184, 148))
-            gradient.setColorAt(1, QColor(76, 175, 80))
+            # In-range: colored bar showing progress (red→green)
+            progress = 0.5
+            if price_upper > price_lower:
+                progress = (current_price - price_lower) / (price_upper - price_lower)
+                progress = max(0.0, min(1.0, progress))
+
+            r = int(220 * (1 - progress) + 0 * progress)
+            g = int(50 * (1 - progress) + 184 * progress)
+            b = int(50 * (1 - progress) + 100 * progress)
+
+            gradient = QLinearGradient(bar_rect.left(), 0, bar_rect.right(), 0)
+            gradient.setColorAt(0, QColor(r, g, b))
+            gradient.setColorAt(1, QColor(min(255, r + 30), min(255, g + 30), min(255, b + 10)))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(gradient))
+            painter.drawRoundedRect(bar_rect, 4, 4)
         else:
-            gradient = QLinearGradient(seg_left, 0, seg_right, 0)
-            gradient.setColorAt(0, QColor(255, 152, 0))
-            gradient.setColorAt(1, QColor(255, 107, 53))
+            # Out-of-range: gray bar with subtle border
+            painter.setPen(QPen(QColor(80, 85, 100), 1))
+            painter.setBrush(QBrush(QColor(45, 48, 58)))
+            painter.drawRoundedRect(bar_rect, 4, 4)
 
-        painter.setBrush(QBrush(gradient))
-        seg_rect = QRect(seg_left, bar_rect.top() + 1, seg_right - seg_left, bar_rect.height() - 2)
-        painter.drawRoundedRect(seg_rect, 3, 3)
-
-        # --- Position range border (subtle bracket marks) ---
-        pen = QPen(QColor(100, 100, 110), 1)
-        painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        bracket_h = 3
-        painter.drawLine(seg_left, bar_rect.top() - 1, seg_left, bar_rect.top() - 1 - bracket_h)
-        painter.drawLine(seg_left, bar_rect.bottom() + 1, seg_left, bar_rect.bottom() + 1 + bracket_h)
-        painter.drawLine(seg_right, bar_rect.top() - 1, seg_right, bar_rect.top() - 1 - bracket_h)
-        painter.drawLine(seg_right, bar_rect.bottom() + 1, seg_right, bar_rect.bottom() + 1 + bracket_h)
-
-        # --- Current price marker (vertical line + small triangle) ---
-        cp_x = price_to_x(current_price)
+        # --- Current price marker (vertical line + triangle) ---
+        # Position within bar: price relative to [lower, upper]
+        if price_upper > price_lower:
+            cp_frac = (current_price - price_lower) / (price_upper - price_lower)
+            cp_frac = max(-0.15, min(1.15, cp_frac))  # allow slight overflow
+        else:
+            cp_frac = 0.5
+        cp_x = bar_rect.left() + int(cp_frac * bar_rect.width())
         cp_x = max(bar_rect.left() + 1, min(cp_x, bar_rect.right() - 1))
 
         pen = QPen(QColor(255, 255, 255), 2)
@@ -422,7 +396,7 @@ class PriceProgressDelegate(QStyledItemDelegate):
         if in_range:
             painter.setPen(QColor(0, 230, 180))
         else:
-            painter.setPen(QColor(255, 152, 0))
+            painter.setPen(QColor(150, 150, 160))
         painter.drawText(
             cp_x - 30, label_y, 60, label_h,
             Qt.AlignmentFlag.AlignCenter,
@@ -1433,6 +1407,7 @@ class ManageTab(QWidget):
         self.positions_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.positions_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.positions_table.setSortingEnabled(True)
+        self.positions_table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
         self.positions_table.setMinimumHeight(550)
 
         table_layout.addWidget(self.positions_table)
@@ -1502,16 +1477,12 @@ class ManageTab(QWidget):
         self.max_impact_spin.setFixedWidth(75)
         close_settings_layout.addWidget(self.max_impact_spin)
 
-        close_settings_layout.addWidget(QLabel("Initial $:"))
+        # Hidden spinbox — kept for API compat, auto-populated from DB
         self.initial_investment_spin = QDoubleSpinBox()
         self.initial_investment_spin.setRange(0, 10000000)
         self.initial_investment_spin.setValue(0)
         self.initial_investment_spin.setDecimals(2)
-        self.initial_investment_spin.setToolTip(
-            "Enter your initial investment to calculate PnL after closing positions"
-        )
-        self.initial_investment_spin.setFixedWidth(85)
-        close_settings_layout.addWidget(self.initial_investment_spin)
+        self.initial_investment_spin.setVisible(False)
 
         close_settings_layout.addWidget(QLabel("Swap DEX:"))
         self.swap_mode_combo = QComboBox()
@@ -2571,14 +2542,28 @@ class ManageTab(QWidget):
         fees_item = NumericTableWidgetItem(fees_str, total_fees_usd)
         self.positions_table.setItem(row, 5, fees_item)
 
-        # Per-position value (value + fees). Aggregate PnL is in the summary bar.
+        # PnL = (current value + fees) - invested
+        invested = 0.0
+        try:
+            open_pos = get_open_positions()
+            invested = open_pos.get(token_id, {}).get('invested_usd', 0)
+        except Exception:
+            pass
+
         if usd_value > 0:
             total_pos_value = usd_value + total_fees_usd
-            pnl_str = f"${usd_value:.2f}"
-            if total_fees_usd > 0:
-                pnl_str = f"${usd_value:.2f} +${total_fees_usd:.4f}"
-            pnl_item = NumericTableWidgetItem(pnl_str, total_pos_value)
-            pnl_item.setForeground(QColor(200, 200, 200))
+            if invested > 0:
+                pnl = total_pos_value - invested
+                pnl_pct = (pnl / invested * 100)
+                sign = "+" if pnl >= 0 else ""
+                pnl_str = f"{sign}${pnl:.2f}"
+                if abs(pnl_pct) >= 0.1:
+                    pnl_str += f"\n{sign}{pnl_pct:.1f}%"
+                pnl_item = NumericTableWidgetItem(pnl_str, pnl)
+                pnl_item.setForeground(QColor("#00b894") if pnl >= 0 else QColor("#ff6b6b"))
+            else:
+                pnl_item = NumericTableWidgetItem(f"${total_pos_value:.2f}", total_pos_value)
+                pnl_item.setForeground(QColor(200, 200, 200))
         else:
             pnl_item = NumericTableWidgetItem("—", 0.0)
         self.positions_table.setItem(row, 6, pnl_item)
