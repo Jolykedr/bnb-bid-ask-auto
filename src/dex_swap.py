@@ -833,15 +833,7 @@ class DexSwap:
             else:
                 logger.info(f"V3 swap: DIRECT fee={best_fee/10000}%, expected out = {expected_out}")
 
-            # Price impact check (только для direct свапов — для multi-hop сложно определить pool)
-            if not is_multi_hop:
-                impact_error = self._check_price_impact(from_token, to_token, amount_in, expected_out, best_fee)
-                if impact_error:
-                    return SwapResult(
-                        success=False, tx_hash=None, from_token=from_token, to_token=to_token,
-                        from_amount=amount_in, to_amount=0, to_amount_usd=0, gas_used=0,
-                        error=impact_error
-                    )
+            # Price impact проверяется в swap() перед роутингом
 
             # Рассчитать минимум с учётом слипажа
             min_out = int(expected_out * (100 - slippage) / 100)
@@ -1443,6 +1435,25 @@ class DexSwap:
                     gas_used=0,
                     error="Zero balance"
                 )
+
+            # Price impact check (перед любым swap mode)
+            if self.max_price_impact > 0:
+                try:
+                    pi_expected, pi_fee, _ = self.get_quote_v3(from_token, to_token, amount_in)
+                    if pi_expected > 0 and pi_fee > 0:
+                        impact_error = self._check_price_impact(
+                            from_token, to_token, amount_in, pi_expected, pi_fee
+                        )
+                        if impact_error:
+                            return SwapResult(
+                                success=False, tx_hash=None,
+                                from_token=from_token, to_token=to_token,
+                                from_amount=amount_in, to_amount=0,
+                                to_amount_usd=0, gas_used=0,
+                                error=impact_error
+                            )
+                except Exception as e:
+                    logger.debug(f"Pre-swap price impact check skipped: {e}")
 
             # Принудительный режим: только один метод
             if swap_mode == self.SWAP_MODE_KYBER:

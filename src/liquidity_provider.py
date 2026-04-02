@@ -641,17 +641,20 @@ class LiquidityProvider:
                     import math
                     # current_price is user price (USD/volatile)
                     # Pool price = token1/token0 (sorted by address)
-                    stablecoin_is_sorted_token0 = config.token1.lower() < config.token0.lower()
+                    # Use dynamically detected `stablecoin` (line 592) and sorted `token0` (line 579)
+                    stablecoin_is_sorted_token0 = stablecoin.lower() == token0.lower()
                     if stablecoin_is_sorted_token0:
-                        # stablecoin = token0 in pool → pool price = volatile/stablecoin = 1/user_price
                         pool_price = 1.0 / config.current_price
-                        t0_dec = config.token1_decimals  # stablecoin
-                        t1_dec = config.token0_decimals  # volatile
                     else:
-                        # stablecoin = token1 in pool → pool price = stablecoin/volatile = user_price
                         pool_price = config.current_price
-                        t0_dec = config.token0_decimals  # volatile
-                        t1_dec = config.token1_decimals  # stablecoin
+
+                    # Map sorted pool token0/token1 to on-chain-verified decimals
+                    if token0.lower() == config.token0.lower():
+                        t0_dec = config.token0_decimals
+                        t1_dec = config.token1_decimals
+                    else:
+                        t0_dec = config.token1_decimals
+                        t1_dec = config.token0_decimals
 
                     adjusted_price = pool_price * (10 ** (t1_dec - t0_dec))
                     if adjusted_price <= 0:
