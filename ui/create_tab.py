@@ -2428,7 +2428,23 @@ class CreateTab(QWidget):
             token_ids = data.get('token_ids', [])
             if token_ids:
                 ladder_group_id = str(uuid.uuid4())
-                self.positions_created.emit(token_ids, self.total_usd_spin.value(), ladder_group_id)
+                # Store per-position USD amounts (proportional to distribution weight)
+                # so ManageTab can use them instead of equal split
+                total_usd = self.total_usd_spin.value()
+                preview = getattr(self, 'positions', []) or []
+                if len(preview) == len(token_ids):
+                    raw = [getattr(p, 'usd_amount', 0) for p in preview]
+                    raw_sum = sum(raw)
+                    if raw_sum > 0:
+                        self._last_per_position_usd = {
+                            tid: a / raw_sum * total_usd
+                            for tid, a in zip(token_ids, raw)
+                        }
+                    else:
+                        self._last_per_position_usd = {}
+                else:
+                    self._last_per_position_usd = {}
+                self.positions_created.emit(token_ids, total_usd, ladder_group_id)
 
             QMessageBox.information(
                 self, "Success",

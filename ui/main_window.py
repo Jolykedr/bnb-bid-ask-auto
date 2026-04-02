@@ -306,7 +306,9 @@ class MainWindow(QMainWindow):
                 self.manage_tab.set_provider(self.create_tab.provider)
 
             # Add the new positions with invested amount and ladder group
-            self.manage_tab.add_positions(token_ids, invested_usd, ladder_group_id)
+            # Pass per-position USD if available (proportional to distribution weight)
+            per_position_usd = getattr(self.create_tab, '_last_per_position_usd', {})
+            self.manage_tab.add_positions(token_ids, invested_usd, ladder_group_id, per_position_usd)
 
             # Show notification in status bar
             self.status_bar.showMessage(

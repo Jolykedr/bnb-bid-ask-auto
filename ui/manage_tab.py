@@ -1635,14 +1635,17 @@ class ManageTab(QWidget):
             self.status_label.setText("Connect wallet in Create tab to manage positions")
             self.pool_factory = None
 
-    def add_positions(self, token_ids: list, invested_usd: float = 0, ladder_group_id: str = ""):
+    def add_positions(self, token_ids: list, invested_usd: float = 0,
+                      ladder_group_id: str = "", per_position_usd: dict = None):
         """
         Add positions to the list (called externally when new positions are created).
 
         Args:
             token_ids: List of new token IDs to add
-            invested_usd: Total USD invested for this ladder (distributed per position)
+            invested_usd: Total USD invested for this ladder
             ladder_group_id: UUID grouping these positions as one ladder
+            per_position_usd: {token_id: usd} proportional to distribution weight.
+                Falls back to equal split if not provided.
         """
         # Add to input field
         current_text = self.token_ids_input.text().strip()
@@ -1653,8 +1656,9 @@ class ManageTab(QWidget):
         else:
             self.token_ids_input.setText(new_ids_str)
 
-        # Store invested_usd per position for DB persistence
-        per_position_usd = invested_usd / len(token_ids) if token_ids and invested_usd > 0 else 0
+        # Per-position invested: use proportional amounts from distribution preview,
+        # fallback to equal split (like web version: CreatePage.tsx lines 300-307)
+        equal_split = invested_usd / len(token_ids) if token_ids and invested_usd > 0 else 0
 
         # Add to positions data (will be populated when loaded)
         with QMutexLocker(self._positions_mutex):
@@ -1664,16 +1668,13 @@ class ManageTab(QWidget):
                 # Store invested_usd mapping for later persistence
                 if not hasattr(self, '_invested_usd_map'):
                     self._invested_usd_map = {}
-                self._invested_usd_map[token_id] = per_position_usd
+                pos_usd = (per_position_usd or {}).get(token_id, equal_split)
+                self._invested_usd_map[token_id] = pos_usd
                 # Store ladder_group_id mapping
                 if ladder_group_id:
                     if not hasattr(self, '_ladder_group_map'):
                         self._ladder_group_map = {}
                     self._ladder_group_map[token_id] = ladder_group_id
-
-        # Auto-fill initial investment spinbox
-        if invested_usd > 0:
-            self.initial_investment_spin.setValue(invested_usd)
 
         # Save and reload
         self._save_positions()
@@ -1709,14 +1710,18 @@ class ManageTab(QWidget):
         self._log(f"Saved {len(token_ids)} positions to storage")
 
     def _recalc_invested_usd(self):
-        """Recalculate invested_usd from on-chain position data.
+        """One-time recalculation of invested_usd from on-chain data.
 
-        Called after positions are loaded. Compares preview-based invested_usd
-        with on-chain calculated value. Updates if deviation is within 30%.
+        Only runs once per position — corrects preview→on-chain difference
+        right after creation. Skips positions already recalculated to avoid
+        overwriting the original invested amount with current market value.
         """
         invested_map = getattr(self, '_invested_usd_map', {})
         if not invested_map:
             return
+
+        # Track which positions have already been recalculated
+        recalced = getattr(self, '_recalced_token_ids', set())
 
         updated = 0
         with QMutexLocker(self._positions_mutex):
@@ -1725,6 +1730,9 @@ class ManageTab(QWidget):
 
         for tid, pos in snapshot.items():
             if tid not in invested_map or invested_map[tid] <= 0:
+                continue
+            # Only recalc once — after that, preserve the original invested value
+            if tid in recalced:
                 continue
 
             old_usd = invested_map[tid]
@@ -1752,33 +1760,29 @@ class ManageTab(QWidget):
                 )
             except Exception as e:
                 logger.debug(f"[Recalc] #{tid}: calc failed: {e}")
+                recalced.add(tid)
                 continue
 
             if not new_usd or new_usd <= 0:
+                recalced.add(tid)
                 continue
 
             deviation = abs(new_usd - old_usd) / old_usd
-            if deviation > 5.0:
-                # Only skip extreme outliers (>500%) — likely a calculation error
-                logger.warning(
-                    f"[Recalc] #{tid}: SKIP — deviation {deviation:.0%} "
-                    f"(preview=${old_usd:.2f} → on-chain=${new_usd:.2f})"
-                )
-                continue
+            # Mark as recalculated regardless of whether we update
+            recalced.add(tid)
 
-            if abs(new_usd - old_usd) > 0.01:
+            if abs(new_usd - old_usd) > 0.001:
                 logger.info(
-                    f"[Recalc] #{tid}: ${old_usd:.2f} → ${new_usd:.2f} "
-                    f"(Δ${new_usd - old_usd:+.2f}, {deviation:.1%})"
+                    f"[Recalc] #{tid}: ${old_usd:.4f} → ${new_usd:.4f} "
+                    f"(Δ${new_usd - old_usd:+.4f}, {deviation:.1%})"
                 )
                 invested_map[tid] = new_usd
                 updated += 1
 
+        self._recalced_token_ids = recalced
+
         if updated:
             logger.info(f"[Recalc] Updated invested_usd for {updated} positions")
-            total_invested = sum(invested_map.values())
-            if total_invested > 0:
-                self.initial_investment_spin.setValue(total_invested)
 
     def _persist_open_positions(self):
         """Save open positions to SQLite so dashboard can restore them after restart."""
@@ -1841,10 +1845,14 @@ class ManageTab(QWidget):
             if open_pos:
                 self._invested_usd_map = {}
                 self._ladder_group_map = {}
+                # Positions restored from DB already have their invested_usd —
+                # mark them as recalculated so _recalc_invested_usd won't overwrite
+                self._recalced_token_ids = set()
                 for tid, pos in open_pos.items():
                     inv = pos.get('invested_usd', 0)
                     if inv > 0:
                         self._invested_usd_map[tid] = inv
+                        self._recalced_token_ids.add(tid)
                     gid = pos.get('ladder_group_id')
                     if gid:
                         self._ladder_group_map[tid] = gid
@@ -2791,9 +2799,12 @@ class ManageTab(QWidget):
         # Claimed fees from DB
         claimed_fees_total = get_claimed_fees_usd_for_tokens(active_token_ids) if active_token_ids else 0
 
-        # Build summary text
-        initial = self.initial_investment_spin.value()
-        # Fallback: read invested from open_positions DB if spinbox is 0
+        # Build summary text — invested must match only the LOADED positions,
+        # not all open positions (user may have multiple ladders across pools)
+        initial = 0.0
+        invested_map = getattr(self, '_invested_usd_map', {})
+        if active_token_ids and invested_map:
+            initial = sum(invested_map.get(tid, 0) for tid in active_token_ids)
         if initial <= 0 and active_token_ids:
             try:
                 open_pos = get_open_positions()
