@@ -2,12 +2,13 @@
 V4 PoolManager Wrapper
 
 Handles pool initialization and state queries for V4.
+Includes off-chain fee calculation (ported from web backend).
 """
 
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from web3 import Web3
 from eth_abi import encode, decode
 
@@ -426,3 +427,307 @@ class V4PoolManager:
                 lp_fee=0,
                 initialized=False
             )
+
+
+# ── V4 Fee Calculation (off-chain) ────────────────────────────────────
+
+
+def compute_position_id(
+    owner: str, tick_lower: int, tick_upper: int, salt: int
+) -> bytes:
+    """
+    Compute V4 positionId = keccak256(abi.encodePacked(owner, tickLower, tickUpper, salt)).
+
+    Args:
+        owner: PositionManager contract address (NOT the wallet)
+        tick_lower: Lower tick (signed int24)
+        tick_upper: Upper tick (signed int24)
+        salt: NFT token ID (used as bytes32 salt)
+
+    Returns:
+        bytes32 position ID
+    """
+    owner_bytes = bytes.fromhex(owner[2:] if owner.startswith('0x') else owner)  # 20 bytes
+
+    def int24_to_bytes(val: int) -> bytes:
+        if val < 0:
+            val = (1 << 24) + val  # two's complement
+        return val.to_bytes(3, 'big')
+
+    packed = (
+        owner_bytes                          # 20 bytes
+        + int24_to_bytes(tick_lower)         # 3 bytes
+        + int24_to_bytes(tick_upper)         # 3 bytes
+        + salt.to_bytes(32, 'big')           # 32 bytes
+    )  # total: 58 bytes
+    return Web3.keccak(packed)
+
+
+def calculate_unclaimed_fees(
+    fee_growth_global0: int, fee_growth_global1: int,
+    fg_outside0_lower: int, fg_outside1_lower: int,
+    fg_outside0_upper: int, fg_outside1_upper: int,
+    fg_inside0_last: int, fg_inside1_last: int,
+    liquidity: int, current_tick: int,
+    tick_lower: int, tick_upper: int,
+) -> Tuple[int, int]:
+    """
+    Calculate unclaimed fees for a V4 position (pure math, no RPC).
+
+    Mirrors Uniswap V4 fee accounting exactly:
+    feeGrowthInside = global - below - above
+    fees = (feeGrowthInside - feeGrowthInsideLast) * liquidity / Q128
+
+    Returns:
+        (fees0_raw, fees1_raw) in wei
+    """
+    MOD = 1 << 256
+    Q128 = 1 << 128
+
+    # feeGrowthBelow
+    if current_tick >= tick_lower:
+        fg_below0, fg_below1 = fg_outside0_lower, fg_outside1_lower
+    else:
+        fg_below0 = (fee_growth_global0 - fg_outside0_lower) % MOD
+        fg_below1 = (fee_growth_global1 - fg_outside1_lower) % MOD
+
+    # feeGrowthAbove
+    if current_tick < tick_upper:
+        fg_above0, fg_above1 = fg_outside0_upper, fg_outside1_upper
+    else:
+        fg_above0 = (fee_growth_global0 - fg_outside0_upper) % MOD
+        fg_above1 = (fee_growth_global1 - fg_outside1_upper) % MOD
+
+    # feeGrowthInside
+    fg_inside0 = (fee_growth_global0 - fg_below0 - fg_above0) % MOD
+    fg_inside1 = (fee_growth_global1 - fg_below1 - fg_above1) % MOD
+
+    # Unclaimed fees (raw wei)
+    fees0 = ((fg_inside0 - fg_inside0_last) % MOD) * liquidity // Q128
+    fees1 = ((fg_inside1 - fg_inside1_last) % MOD) * liquidity // Q128
+    return fees0, fees1
+
+
+def get_v4_unclaimed_fees(
+    w3: Web3,
+    positions: List[dict],
+    chain_id: int,
+    protocol: V4Protocol,
+) -> Dict[int, Tuple[int, int]]:
+    """
+    Batch-read fee accumulators and compute unclaimed fees for V4 positions.
+
+    Args:
+        w3: Web3 instance
+        positions: List of position dicts with keys:
+            token_id, pool_key (PoolKey), tick_lower, tick_upper, liquidity
+        chain_id: Chain ID
+        protocol: V4Protocol (UNISWAP or PANCAKESWAP)
+
+    Returns:
+        {token_id: (fees0_raw, fees1_raw)} — raw wei amounts
+    """
+    if not positions:
+        return {}
+
+    from ...utils import BatchRPC
+
+    addresses = get_v4_addresses(chain_id, protocol)
+    if not addresses:
+        logger.warning(f"[V4 Fees] No addresses for chain={chain_id}, protocol={protocol}")
+        return {}
+
+    # Pick target contract: StateView (Uniswap) or PoolManager (PancakeSwap)
+    if protocol == V4Protocol.UNISWAP and addresses.state_view:
+        fee_target = Web3.to_checksum_address(addresses.state_view)
+        tick_fn_selector = bytes.fromhex('7c40f1fe')   # getTickInfo(bytes32, int24)
+    else:
+        fee_target = Web3.to_checksum_address(addresses.pool_manager)
+        tick_fn_selector = bytes.fromhex('5aa208a4')   # getPoolTickInfo(bytes32, int24)
+
+    fee_globals_selector = bytes.fromhex('9ec538c8')    # getFeeGrowthGlobals(bytes32)
+    slot0_selector = bytes.fromhex('c815641c')          # getSlot0(bytes32)
+    pos_info_selector = bytes.fromhex('97fd7b42')       # getPositionInfo(bytes32, bytes32)
+
+    pm_address = Web3.to_checksum_address(addresses.position_manager)
+
+    # Build a PoolManager instance to compute pool IDs
+    pool_mgr = V4PoolManager(w3, protocol=protocol, chain_id=chain_id)
+
+    # Group positions by pool_key tuple for deduplication
+    pool_groups: Dict[tuple, List[dict]] = {}
+    for pos in positions:
+        pk = pos['pool_key']
+        key = (pk.currency0.lower(), pk.currency1.lower(), pk.fee, pk.tick_spacing, pk.hooks.lower())
+        pool_groups.setdefault(key, []).append(pos)
+
+    # ── Build batch calls ──────────────────────────────────────────
+    batch = BatchRPC(w3)
+    call_map = []  # tracks what each call index means
+
+    for pool_key_tuple, group in pool_groups.items():
+        pk = group[0]['pool_key']
+        pool_id = pool_mgr._compute_pool_id(pk)
+        pool_id_padded = pool_id if len(pool_id) == 32 else pool_id.rjust(32, b'\x00')
+
+        # 1) getFeeGrowthGlobals(poolId)
+        batch.add_call(
+            fee_target,
+            fee_globals_selector + pool_id_padded,
+            _decode_fee_growth_globals,
+        )
+        call_map.append(('fee_globals', pool_key_tuple))
+
+        # 2) getSlot0(poolId) — need current tick
+        batch.add_call(
+            fee_target,
+            slot0_selector + pool_id_padded,
+            _decode_slot0_tick,
+        )
+        call_map.append(('slot0', pool_key_tuple))
+
+        # 3) getTickInfo for unique ticks in this pool group
+        unique_ticks = set()
+        for p in group:
+            unique_ticks.add(p['tick_lower'])
+            unique_ticks.add(p['tick_upper'])
+
+        for tick in sorted(unique_ticks):
+            tick_encoded = _encode_int24(tick)
+            batch.add_call(
+                fee_target,
+                tick_fn_selector + pool_id_padded + tick_encoded,
+                _decode_tick_info,
+            )
+            call_map.append(('tick', pool_key_tuple, tick))
+
+        # 4) getPositionInfo(poolId, positionId) for each position
+        for p in group:
+            position_id = compute_position_id(
+                pm_address, p['tick_lower'], p['tick_upper'], p['token_id']
+            )
+            batch.add_call(
+                fee_target,
+                pos_info_selector + pool_id_padded + position_id,
+                _decode_position_info,
+            )
+            call_map.append(('pos', pool_key_tuple, p['token_id']))
+
+    # ── Execute batch ──────────────────────────────────────────────
+    try:
+        results = batch.execute()
+    except Exception as e:
+        logger.error(f"[V4 Fees] Batch RPC failed: {e}")
+        return {}
+
+    # ── Parse results into lookup dicts ────────────────────────────
+    pool_fee_globals: Dict[tuple, Tuple[int, int]] = {}
+    pool_current_tick: Dict[tuple, int] = {}
+    tick_info: Dict[tuple, Dict[int, Tuple[int, int]]] = {}   # pool_key -> {tick: (fg0, fg1)}
+    pos_fee_inside: Dict[int, Tuple[int, int, int]] = {}      # token_id -> (liq, fg0last, fg1last)
+
+    for i, entry in enumerate(call_map):
+        val = results[i] if i < len(results) else None
+        if val is None:
+            continue
+
+        if entry[0] == 'fee_globals':
+            pool_fee_globals[entry[1]] = val
+        elif entry[0] == 'slot0':
+            pool_current_tick[entry[1]] = val
+        elif entry[0] == 'tick':
+            pkt = entry[1]
+            tick_info.setdefault(pkt, {})[entry[2]] = val
+        elif entry[0] == 'pos':
+            pos_fee_inside[entry[2]] = val
+
+    # ── Compute fees per position ──────────────────────────────────
+    fees_result: Dict[int, Tuple[int, int]] = {}
+
+    for pool_key_tuple, group in pool_groups.items():
+        fg = pool_fee_globals.get(pool_key_tuple)
+        ct = pool_current_tick.get(pool_key_tuple)
+        tinfo = tick_info.get(pool_key_tuple, {})
+
+        if fg is None or ct is None:
+            logger.warning(f"[V4 Fees] Missing globals/slot0 for pool {pool_key_tuple[0][:10]}.../{pool_key_tuple[1][:10]}...")
+            for p in group:
+                fees_result[p['token_id']] = (0, 0)
+            continue
+
+        fg0_global, fg1_global = fg
+
+        for p in group:
+            tid = p['token_id']
+            pfi = pos_fee_inside.get(tid)
+            lower_info = tinfo.get(p['tick_lower'])
+            upper_info = tinfo.get(p['tick_upper'])
+
+            if pfi is None or lower_info is None or upper_info is None:
+                logger.warning(f"[V4 Fees] Missing data for token {tid}")
+                fees_result[tid] = (0, 0)
+                continue
+
+            liq_from_pool, fg_inside0_last, fg_inside1_last = pfi
+            pos_liquidity = p.get('liquidity', 0) or liq_from_pool
+
+            if pos_liquidity == 0:
+                fees_result[tid] = (0, 0)
+                continue
+
+            fees_result[tid] = calculate_unclaimed_fees(
+                fg0_global, fg1_global,
+                lower_info[0], lower_info[1],  # fg_outside0/1 lower
+                upper_info[0], upper_info[1],  # fg_outside0/1 upper
+                fg_inside0_last, fg_inside1_last,
+                pos_liquidity, ct,
+                p['tick_lower'], p['tick_upper'],
+            )
+
+    return fees_result
+
+
+# ── Batch RPC decoders (private) ──────────────────────────────────────
+
+
+def _encode_int24(val: int) -> bytes:
+    """Encode int24 as ABI-padded bytes32."""
+    if val < 0:
+        val = (1 << 256) + val
+    return val.to_bytes(32, 'big')
+
+
+def _decode_fee_growth_globals(data: bytes) -> Tuple[int, int]:
+    """Decode (uint256, uint256) → (feeGrowthGlobal0, feeGrowthGlobal1)."""
+    if len(data) < 64:
+        return None
+    fg0 = int.from_bytes(data[0:32], 'big')
+    fg1 = int.from_bytes(data[32:64], 'big')
+    return (fg0, fg1)
+
+
+def _decode_slot0_tick(data: bytes) -> int:
+    """Decode getSlot0 → extract current tick (int24 at offset 32)."""
+    if len(data) < 64:
+        return None
+    tick_raw = int.from_bytes(data[32:64], 'big')
+    return tick_raw - (1 << 256) if tick_raw >= (1 << 255) else tick_raw
+
+
+def _decode_tick_info(data: bytes) -> Tuple[int, int]:
+    """Decode getTickInfo → (feeGrowthOutside0X128, feeGrowthOutside1X128) at offsets +64, +96."""
+    if len(data) < 128:
+        return None
+    fg0 = int.from_bytes(data[64:96], 'big')
+    fg1 = int.from_bytes(data[96:128], 'big')
+    return (fg0, fg1)
+
+
+def _decode_position_info(data: bytes) -> Tuple[int, int, int]:
+    """Decode getPositionInfo(poolId, positionId) → (liquidity, fgInside0Last, fgInside1Last)."""
+    if len(data) < 96:
+        return None
+    liquidity = int.from_bytes(data[0:32], 'big')
+    fg0 = int.from_bytes(data[32:64], 'big')
+    fg1 = int.from_bytes(data[64:96], 'big')
+    return (liquidity, fg0, fg1)

@@ -94,7 +94,18 @@ def _load_v4_position_to_dict(
         'tokens_owed0': 0,
         'tokens_owed1': 0,
         'protocol': protocol_str,
+        'pool_key': v4_pos.pool_key,
     }
+
+    # Compute unclaimed fees via batch RPC
+    try:
+        from src.contracts.v4.pool_manager import get_v4_unclaimed_fees
+        fees = get_v4_unclaimed_fees(w3, [position], chain_id, target_protocol)
+        if token_id in fees:
+            position['tokens_owed0'] = fees[token_id][0]
+            position['tokens_owed1'] = fees[token_id][1]
+    except Exception as e:
+        logger.debug(f"[V4 Fees] Could not compute fees for token {token_id}: {e}")
 
     # V4 pool cache key includes tick_spacing
     v4_pool_key = (
@@ -1771,6 +1782,16 @@ class ManageTab(QWidget):
             # Mark as recalculated regardless of whether we update
             recalced.add(tid)
 
+            # Sanity check: reject if on-chain value deviates >30% from preview.
+            # Normal rounding is <5%; anything beyond 30% likely indicates
+            # bad RPC data, wrong decimals, or stale price (matches web logic).
+            if deviation > 0.30:
+                logger.warning(
+                    f"[Recalc] #{tid}: skipped, deviation too large "
+                    f"(${old_usd:.4f} → ${new_usd:.4f}, {deviation:.1%})"
+                )
+                continue
+
             if abs(new_usd - old_usd) > 0.001:
                 logger.info(
                     f"[Recalc] #{tid}: ${old_usd:.4f} → ${new_usd:.4f} "
@@ -2496,21 +2517,17 @@ class ManageTab(QWidget):
                 amount0_human = amounts.amount0 / (10 ** dec0) if amounts.amount0 > 0 else 0
                 amount1_human = amounts.amount1 / (10 ** dec1) if amounts.amount1 > 0 else 0
 
+                price = position.get('current_price', 0)
+                price_ok = price and price > 0
+
                 if token0_is_stable and not token1_is_stable:
-                    # token0 is USD, token1 is volatile; raw price = token1/token0
-                    # current_price (inverted) = USD per volatile token
-                    if price_upper > 0 and price_lower > 0:
-                        mid_price = (price_lower + price_upper) / 2
-                        usd_value = amount0_human + amount1_human * mid_price
-                    else:
-                        usd_value = amount0_human
+                    # token0 = stablecoin (USD), token1 = volatile
+                    # current_price = USD per volatile (inverted)
+                    usd_value = amount0_human + (amount1_human * price if price_ok else 0)
                 elif token1_is_stable and not token0_is_stable:
-                    # token1 is USD, token0 is volatile; raw price = token1/token0
-                    raw_current = position.get('current_price', 0)
-                    if raw_current and raw_current > 0:
-                        usd_value = amount1_human + amount0_human * raw_current
-                    else:
-                        usd_value = amount1_human
+                    # token1 = stablecoin (USD), token0 = volatile
+                    # current_price = USD per volatile (raw)
+                    usd_value = amount1_human + (amount0_human * price if price_ok else 0)
                 else:
                     # No stablecoin — show raw L as fallback
                     usd_value = -1

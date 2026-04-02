@@ -1079,6 +1079,7 @@ class CreateTab(QWidget):
         self._token1_decimals = 18
         self._loaded_pool_fee = None
         self._loaded_pool_id_bytes = None
+        self._tokens_auto_filled = False
         self.setup_ui()
         self._load_saved_wallet()
         self._load_proxy_from_settings()
@@ -1092,6 +1093,7 @@ class CreateTab(QWidget):
         self._loaded_pool_id_bytes = None
         self._token0_decimals = 18
         self._token1_decimals = 18
+        self._tokens_auto_filled = False
         self.positions = []
         # Clear pool info display
         if hasattr(self, 'pool_info_label'):
@@ -3061,10 +3063,21 @@ class CreateTab(QWidget):
         pool_addr = pool_data["pool_address"]
         self.pool_input.setText(pool_addr)
         self.pool_search_results.setVisible(False)
+
+        is_v4 = pool_data.get("version") == "v4"
+        if is_v4:
+            # Codex already has token addresses — pre-fill them so that
+            # LoadPoolWorker's fallback (when subgraph is unavailable)
+            # can read decimals/symbols on-chain from the correct addresses.
+            self.token0_input.setText(pool_data.get("token0_address", ""))
+            self.token1_input.setText(pool_data.get("token1_address", ""))
+            self._tokens_auto_filled = False  # treat as "manual" so _load_pool_info keeps them
+
         self._load_pool_info()
 
     def _load_pool_info(self):
         """Load pool info via worker thread (non-blocking)."""
+        was_auto_filled = getattr(self, '_tokens_auto_filled', False)
         self._reset_pool_state()
 
         pool_input = self.pool_input.text().strip()
@@ -3095,7 +3108,13 @@ class CreateTab(QWidget):
         rpc_url = self.rpc_input.text().strip() or BNB_CHAIN.rpc_url
         proxy = self._get_proxy_config()
 
-        # Existing token inputs for V4 fallback
+        # V4 fallback: if subgraph is down, worker uses existing token addresses
+        # to read decimals/symbols on-chain. But if addresses were auto-filled
+        # by a PREVIOUS pool load (V3 or V4), they belong to a different pool
+        # and must not be reused. Only pass them if user entered them manually.
+        if is_v4 and was_auto_filled:
+            self.token0_input.clear()
+            self.token1_input.clear()
         existing_t0 = self.token0_input.text().strip()
         existing_t1 = self.token1_input.text().strip()
 
@@ -3183,6 +3202,7 @@ class CreateTab(QWidget):
                 if subgraph:
                     self.token0_input.setText(subgraph.token0_address)
                     self.token1_input.setText(subgraph.token1_address)
+                    self._tokens_auto_filled = True
                     self._set_combo_symbol(self.token0_combo, subgraph.token0_symbol)
                     self._set_combo_symbol(self.token1_combo, subgraph.token1_symbol)
                     self.tick_spacing_spin.setValue(subgraph.tick_spacing)
@@ -3228,7 +3248,16 @@ class CreateTab(QWidget):
                         f"Price: {price_str} | Token addresses auto-filled!"
                     )
                 else:
-                    self.pool_info_label.setText(f"✅ V4 Pool found on {protocol_name}!\nFee: {fee_percent}%")
+                    if data.get('token0_symbol'):
+                        self.pool_info_label.setText(
+                            f"✅ V4 Pool found on {protocol_name}!\n"
+                            f"Fee: {fee_percent}% | {data['token0_symbol']}/{data.get('token1_symbol', '???')}"
+                        )
+                    else:
+                        self.pool_info_label.setText(
+                            f"✅ V4 Pool found on {protocol_name}!\n"
+                            f"Fee: {fee_percent}% — enter token addresses manually"
+                        )
                 self.pool_info_label.setStyleSheet("color: #00b894;")
 
                 # Fetch reference price for V4 pool
@@ -3260,9 +3289,10 @@ class CreateTab(QWidget):
             self._loaded_v3_pool_address = pool_address
             self._detected_v3_dex = data.get('detected_dex')
 
-            # Set token inputs
+            # Set token inputs (auto-filled from V3 pool contract)
             self.token0_input.setText(data.get('ui_token0', ''))
             self.token1_input.setText(data.get('ui_token1', ''))
+            self._tokens_auto_filled = True
             self._token0_decimals = data.get('ui_dec0', 18)
             self._token1_decimals = data.get('ui_dec1', 18)
 

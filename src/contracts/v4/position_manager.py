@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 from .abis import V4_POSITION_MANAGER_ABI, PANCAKE_V4_POSITION_MANAGER_ABI, V4Actions, PancakeV4Actions
 from .constants import V4Protocol, get_v4_addresses
-from .pool_manager import PoolKey
+from .pool_manager import PoolKey, get_v4_unclaimed_fees
 from ...utils import NonceManager
 
 
@@ -1807,7 +1807,7 @@ class V4PositionManager:
             address: Wallet address
 
         Returns:
-            List of dicts with position info
+            List of dicts with position info (including unclaimed fees)
         """
         positions = []
         token_ids = self.get_position_token_ids(address)
@@ -1821,7 +1821,6 @@ class V4PositionManager:
                     'tick_lower': position.tick_lower,
                     'tick_upper': position.tick_upper,
                     'liquidity': position.liquidity,
-                    # V4 doesn't have tokens_owed in position struct
                     'tokens_owed0': 0,
                     'tokens_owed1': 0,
                     # Add currency info from pool_key
@@ -1832,5 +1831,19 @@ class V4PositionManager:
                 positions.append(position_dict)
             except Exception as e:
                 logger.error(f"[V4] Error getting position {token_id}: {e}")
+
+        # Batch-compute unclaimed fees for all positions
+        if positions:
+            try:
+                fees = get_v4_unclaimed_fees(
+                    self.w3, positions, self.chain_id, self.protocol
+                )
+                for pos in positions:
+                    tid = pos['token_id']
+                    if tid in fees:
+                        pos['tokens_owed0'] = fees[tid][0]
+                        pos['tokens_owed1'] = fees[tid][1]
+            except Exception as e:
+                logger.error(f"[V4 Fees] Failed to compute unclaimed fees: {e}")
 
         return positions
