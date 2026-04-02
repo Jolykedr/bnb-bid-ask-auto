@@ -296,6 +296,24 @@ class V4LiquidityProvider:
             token1_decimals=config.token1_decimals,
         )
 
+        # Remap decimals so distribution ALWAYS gets volatile=token0, stablecoin=token1.
+        # This matches the web backend convention (positions.py:716-728) and ensures
+        # calculate_liquidity_from_usd uses the correct amount formula after token swap.
+        t0_is_stable = is_stablecoin(config.token0)
+        t1_is_stable = is_stablecoin(config.token1)
+        if t0_is_stable and not t1_is_stable:
+            dist_t0_dec = config.token1_decimals   # volatile
+            dist_t1_dec = config.token0_decimals   # stablecoin
+            dist_t1_stable = True
+        elif t1_is_stable and not t0_is_stable:
+            dist_t0_dec = config.token0_decimals   # volatile
+            dist_t1_dec = config.token1_decimals   # stablecoin
+            dist_t1_stable = True
+        else:
+            dist_t0_dec = config.token0_decimals
+            dist_t1_dec = config.token1_decimals
+            dist_t1_stable = False
+
         positions = calculate_bid_ask_distribution(
             current_price=config.current_price,
             lower_price=config.lower_price,
@@ -303,9 +321,9 @@ class V4LiquidityProvider:
             n_positions=config.n_positions,
             fee_tier=fee_percent_to_v4(config.fee_percent),  # Use V4 fee format internally
             distribution_type=config.distribution_type,
-            token0_decimals=config.token0_decimals,
-            token1_decimals=config.token1_decimals,
-            token1_is_stable=is_stablecoin(config.token1),
+            token0_decimals=dist_t0_dec,
+            token1_decimals=dist_t1_dec,
+            token1_is_stable=dist_t1_stable,
             allow_custom_fee=True,  # V4 supports custom fees
             tick_spacing=tick_spacing,  # Pass actual tick_spacing for proper alignment
             invert_price=config.invert_price,  # Invert price for TOKEN/USD → pool price conversion
@@ -1834,7 +1852,7 @@ class V4LiquidityProvider:
                     error=f"Invalid tick range: tick_lower {tick_lower} >= tick_upper {tick_upper}"
                 )
 
-            logger.debug(f"Position {i}: ticks=[{tick_lower}, {tick_upper}], liq={pos.liquidity}, usd=${pos.usd_amount:.2f}")
+            logger.info(f"Position {i}: LIQUIDITY={pos.liquidity}, usd=${pos.usd_amount:.2f}")
             logger.debug(f"  amount0_max={amount0_max}, amount1_max={amount1_max}")
 
             # Add ONLY the MINT_POSITION action (not SETTLE_PAIR yet)

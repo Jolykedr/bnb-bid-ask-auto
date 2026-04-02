@@ -232,24 +232,23 @@ class LiquidityProvider:
             Список позиций с рассчитанными параметрами
         """
         from config import is_stablecoin
-        # Determine if we need to invert price based on token order
-        # Pool price = token1/token0
-        # If token1 is stablecoin: pool price = USD price → invert_price = False
-        # If token0 is stablecoin: pool price = 1/USD price → invert_price = True
-        #
-        # We check by comparing sorted addresses - in Uniswap, token0 < token1 by address
-        # config.token0 and config.token1 are what user entered (token0=volatile, token1=stable)
-        # After sorting: if stable becomes token0 in pool → need to invert
+        # Determine invert_price using dynamic stablecoin detection (not hardcoded config.token1)
         t0_addr = Web3.to_checksum_address(config.token0).lower()
         t1_addr = Web3.to_checksum_address(config.token1).lower()
 
-        # config.token1 is stablecoin (user's input)
-        # If stablecoin address > volatile address, stablecoin IS token1 in pool
-        # Pool price = stablecoin/volatile = USD price → NO inversion
-        # If stablecoin address < volatile address, stablecoin IS token0 in pool
-        # Pool price = volatile/stablecoin = 1/USD price → NEED inversion
-        stablecoin_is_token1_in_pool = t1_addr > t0_addr
-        invert_price = not stablecoin_is_token1_in_pool
+        t0_is_stable = is_stablecoin(config.token0)
+        t1_is_stable = is_stablecoin(config.token1)
+
+        # Find stablecoin address, then check if it's pool's currency0 (lower address)
+        if t0_is_stable and not t1_is_stable:
+            stablecoin_addr = t0_addr
+        elif t1_is_stable and not t0_is_stable:
+            stablecoin_addr = t1_addr
+        else:
+            stablecoin_addr = t1_addr  # fallback: assume config.token1 is quote
+
+        sorted_currency0 = min(t0_addr, t1_addr)
+        invert_price = (stablecoin_addr == sorted_currency0)
 
         # Compute decimal tick offset for mixed-decimal pairs (e.g. USDC 6 / token 18 on BASE)
         dec_offset = compute_decimal_tick_offset(
@@ -260,8 +259,22 @@ class LiquidityProvider:
         )
 
         logger.info(f"Token order: config.token0={t0_addr[:10]}..., config.token1={t1_addr[:10]}...")
-        logger.info(f"Stablecoin is token1 in pool: {stablecoin_is_token1_in_pool}")
         logger.info(f"invert_price: {invert_price}, decimal_tick_offset: {dec_offset}")
+
+        # Remap decimals so distribution ALWAYS gets volatile=token0, stablecoin=token1.
+        # Matches web backend convention — ensures correct amount formula after token swap.
+        if t0_is_stable and not t1_is_stable:
+            dist_t0_dec = config.token1_decimals   # volatile
+            dist_t1_dec = config.token0_decimals   # stablecoin
+            dist_t1_stable = True
+        elif t1_is_stable and not t0_is_stable:
+            dist_t0_dec = config.token0_decimals   # volatile
+            dist_t1_dec = config.token1_decimals   # stablecoin
+            dist_t1_stable = True
+        else:
+            dist_t0_dec = config.token0_decimals
+            dist_t1_dec = config.token1_decimals
+            dist_t1_stable = False
 
         positions = calculate_bid_ask_distribution(
             current_price=config.current_price,
@@ -270,9 +283,9 @@ class LiquidityProvider:
             n_positions=config.n_positions,
             fee_tier=config.fee_tier,
             distribution_type=config.distribution_type,
-            token0_decimals=config.token0_decimals,
-            token1_decimals=config.token1_decimals,
-            token1_is_stable=is_stablecoin(config.token1),
+            token0_decimals=dist_t0_dec,
+            token1_decimals=dist_t1_dec,
+            token1_is_stable=dist_t1_stable,
             invert_price=invert_price,
             decimal_tick_offset=dec_offset
         )
