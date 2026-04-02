@@ -449,15 +449,19 @@ class LoadPositionWorker(QThread):
             # Determine position manager address
             pm_address = self.provider.position_manager_address
 
-            if self.protocol == "v3_uniswap":
-                try:
-                    chain_id = getattr(self.provider, 'chain_id', 56)
+            # Resolve correct V3 PM address from config (provider may be V4)
+            try:
+                chain_id = getattr(self.provider, 'chain_id', 56)
+                if self.protocol == "v3_uniswap":
                     if chain_id in V3_DEXES and "uniswap" in V3_DEXES[chain_id]:
-                        uniswap_config = V3_DEXES[chain_id]["uniswap"]
-                        pm_address = uniswap_config.position_manager
+                        pm_address = V3_DEXES[chain_id]["uniswap"].position_manager
                         logger.debug(f"[V3 Load] Using Uniswap V3 PM: {pm_address}")
-                except Exception as pm_err:
-                    logger.warning(f"[V3 Load] Error resolving Uniswap V3 PM: {pm_err}")
+                elif self.protocol == "v3" or self.protocol == "v3_pancake":
+                    if chain_id in V3_DEXES and "pancakeswap" in V3_DEXES[chain_id]:
+                        pm_address = V3_DEXES[chain_id]["pancakeswap"].position_manager
+                        logger.debug(f"[V3 Load] Using PancakeSwap V3 PM: {pm_address}")
+            except Exception as pm_err:
+                logger.warning(f"[V3 Load] Error resolving V3 PM: {pm_err}")
 
             # Phase 1: ownerOf + positions in one multicall (2 calls → 1 RPC)
             batch1 = BatchRPC(self.provider.w3)
@@ -783,10 +787,33 @@ class ClosePositionsWorker(QThread):
             if v3_pancake_ids:
                 self.progress.emit(f"Closing {len(v3_pancake_ids)} PancakeSwap V3 positions...")
                 try:
-                    tx_hash, success, gas_used = self.provider.close_positions(
-                        v3_pancake_ids,
-                        timeout=300
-                    )
+                    chain_id = getattr(self.provider, 'chain_id', 56)
+                    # Resolve PCS V3 PM from config (provider may be V4)
+                    pcs_pm = None
+                    if chain_id in V3_DEXES and "pancakeswap" in V3_DEXES[chain_id]:
+                        pcs_pm = V3_DEXES[chain_id]["pancakeswap"].position_manager
+
+                    if pcs_pm:
+                        # Always use dedicated V3 provider with correct PCS PM
+                        # (provider may be V4 or V3 with wrong PM)
+                        already_correct = (isinstance(self.provider, LiquidityProvider)
+                                           and self.provider.position_manager_address.lower() == pcs_pm.lower())
+                        if already_correct:
+                            pcs_provider = self.provider
+                        else:
+                            self.progress.emit(f"Using PancakeSwap V3 PM: {pcs_pm[:20]}...")
+                            pcs_provider = LiquidityProvider(
+                                rpc_url=self.provider.w3.provider.endpoint_uri,
+                                private_key=self.provider.account.key.hex() if hasattr(self.provider.account, 'key') else None,
+                                position_manager_address=pcs_pm,
+                                chain_id=chain_id,
+                                proxy=getattr(self.provider, 'proxy', None)
+                            )
+                        tx_hash, success, gas_used = pcs_provider.close_positions(
+                            v3_pancake_ids, timeout=300
+                        )
+                    else:
+                        raise Exception("PancakeSwap V3 not configured for this chain")
                     results.append(('PancakeSwap V3', tx_hash, success, gas_used))
                 except Exception as e:
                     self.progress.emit(f"PancakeSwap V3 close failed: {e}")
@@ -1025,7 +1052,11 @@ class BatchCollectWorker(QThread):
             if v3_pancake_ids:
                 self.progress.emit(f"Collecting fees from {len(v3_pancake_ids)} PancakeSwap V3 positions...")
                 try:
-                    pm_addr = self.provider.position_manager_address
+                    # Resolve PCS V3 PM from config (provider may be V4)
+                    if self.chain_id in V3_DEXES and "pancakeswap" in V3_DEXES[self.chain_id]:
+                        pm_addr = V3_DEXES[self.chain_id]["pancakeswap"].position_manager
+                    else:
+                        pm_addr = self.provider.position_manager_address
                     batcher = Multicall3Batcher(w3, account=self.provider.account)
                     for tid in v3_pancake_ids:
                         batcher.add_collect_call(pm_addr, tid, wallet)
@@ -2321,6 +2352,51 @@ class ManageTab(QWidget):
             # Persist open positions to SQLite for dashboard recovery
             self._persist_open_positions()
 
+    def _remove_rows_by_token_ids(self, token_ids: list):
+        """Remove table rows by token IDs with correct row lookup.
+
+        _row_index can be stale after sorting, so verify token_id in the cell
+        before removing, and fall back to O(n) scan if needed.
+        """
+        self.positions_table.setSortingEnabled(False)
+        try:
+            for tid in token_ids:
+                row = self._row_index.pop(tid, -1)
+                # Verify row actually has this token_id (index may be stale after sort)
+                if 0 <= row < self.positions_table.rowCount():
+                    item = self.positions_table.item(row, 0)
+                    if item:
+                        try:
+                            txt = item.text()
+                            eid = int(txt.split(":")[1]) if ":" in txt else int(txt)
+                            if eid != tid:
+                                row = -1
+                        except ValueError:
+                            row = -1
+                    else:
+                        row = -1
+                else:
+                    row = -1
+                # Fallback: O(n) scan
+                if row == -1:
+                    for r in range(self.positions_table.rowCount()):
+                        item = self.positions_table.item(r, 0)
+                        if item:
+                            try:
+                                txt = item.text()
+                                eid = int(txt.split(":")[1]) if ":" in txt else int(txt)
+                                if eid == tid:
+                                    row = r
+                                    break
+                            except ValueError:
+                                continue
+                if 0 <= row < self.positions_table.rowCount():
+                    self.positions_table.removeRow(row)
+                    self._row_index = {k: (v if v < row else v - 1)
+                                       for k, v in self._row_index.items()}
+        finally:
+            self.positions_table.setSortingEnabled(True)
+
     def _auto_remove_closed_positions(self):
         """Remove positions with liquidity=0 that have no unclaimed fees.
 
@@ -2342,13 +2418,7 @@ class ManageTab(QWidget):
                     self.positions_data.pop(tid, None)
 
             # Remove from table
-            for tid in closed_ids:
-                row = self._row_index.pop(tid, -1)
-                if 0 <= row < self.positions_table.rowCount():
-                    self.positions_table.removeRow(row)
-                    # Shift row indices
-                    self._row_index = {k: (v if v < row else v - 1)
-                                       for k, v in self._row_index.items()}
+            self._remove_rows_by_token_ids(closed_ids)
 
             # Remove from input field
             current_ids = self._parse_token_ids()
@@ -3422,6 +3492,12 @@ class ManageTab(QWidget):
             received_from_swap = data.get('received_from_swap', 0)
             if received_from_swap > 0:
                 received = received_from_swap
+                # When swap used balanceOf fallback, stablecoin balances already include
+                # previously claimed fees → do NOT add them again (double-count).
+                # When swap used receipt-based amounts, only close TX proceeds are counted
+                # → previously_claimed must be added separately.
+                if not data.get('swap_used_balance_fallback', False):
+                    received += previously_claimed
             else:
                 # Try receipt-based PnL calculation (precise, from worker-fetched receipts)
                 receipts = data.get('receipts', [])
@@ -3431,8 +3507,8 @@ class ManageTab(QWidget):
                 if received <= 0:
                     received = self._calc_received_from_math(pos_dicts, previously_claimed)
 
-            # Add previously claimed fees (collected before close)
-            received += previously_claimed
+                # Add previously claimed fees (no swap → no risk of double-count)
+                received += previously_claimed
 
             # Fallback invested from DB if manual spinbox is 0
             invested = initial if initial > 0 else 0
@@ -3489,12 +3565,7 @@ class ManageTab(QWidget):
                 remaining_ids = [tid for tid in current_ids if tid not in closed_set]
                 self.token_ids_input.setText(", ".join(str(tid) for tid in remaining_ids))
                 # Remove closed rows from table
-                for tid in closed_ids:
-                    row = self._row_index.pop(tid, -1)
-                    if 0 <= row < self.positions_table.rowCount():
-                        self.positions_table.removeRow(row)
-                        self._row_index = {k: (v if v < row else v - 1)
-                                           for k, v in self._row_index.items()}
+                self._remove_rows_by_token_ids(closed_ids)
             # Update invested spinbox with remaining positions
             invested_map = getattr(self, '_invested_usd_map', {})
             if invested_map and closed_ids:
@@ -3752,7 +3823,11 @@ class ManageTab(QWidget):
                 self._log(f"Token amounts from receipts: {[(t['symbol'], t['amount']) for t in tokens_to_sell]}")
             else:
                 # Fallback: fetch balances (less precise — includes pre-existing balance)
+                # Mark that swap amounts came from balanceOf (includes previously claimed fees)
                 self._log("No receipts available, falling back to balanceOf...")
+                deferred = getattr(self, '_deferred_trade_data', None)
+                if deferred:
+                    deferred['swap_used_balance_fallback'] = True
                 self._close_data = close_data
                 self._balance_fetch_worker = BalanceFetchWorker(w3, wallet, tokens_to_sell)
                 self._balance_fetch_worker.result.connect(
@@ -3787,6 +3862,9 @@ class ManageTab(QWidget):
                 self._balance_fetch_worker = None
 
             close_data = getattr(self, '_close_data', {})
+            if not self.provider:
+                self._log("Provider is None — cannot sell tokens")
+                return
             chain_id = getattr(self.provider, 'chain_id', 56)
             w3 = self.provider.w3
 

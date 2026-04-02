@@ -3317,7 +3317,7 @@ class CreateTab(QWidget):
                 self.protocol_combo.setCurrentIndex(v3_idx)
                 self.fee_combo.setCurrentIndex(fee_map[fee])
             else:
-                self.protocol_combo.setCurrentIndex(1)
+                self.protocol_combo.setCurrentIndex(v3_idx)
                 self.custom_fee_spin.setValue(fee / 10000)
 
             # Set price

@@ -95,6 +95,7 @@ query GetV4Pool {
                     token1 = pool.get('token1') or {}
                     if not token0 or not token1:
                         logger.warning(f"[API] Pool missing token data: token0={pool.get('token0')}, token1={pool.get('token1')}")
+                        return None
                     else:
                         logger.info(f"[API] Pool tokens: {token0.get('symbol')}/{token1.get('symbol')}")
                     return V4PoolInfo(

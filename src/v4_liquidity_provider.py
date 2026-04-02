@@ -268,6 +268,11 @@ class V4LiquidityProvider:
             proxy=self.proxy
         )
 
+    @property
+    def position_manager_address(self) -> str:
+        """Expose PM address for compatibility with V3 provider interface."""
+        return self.position_manager.position_manager_address
+
     def disconnect(self):
         """Close Web3 HTTP provider session to free resources."""
         try:
@@ -557,6 +562,21 @@ class V4LiquidityProvider:
         logger.info(f"Initial Price: {initial_price}")
         logger.info(f"Invert Price: {invert_price}")
         logger.info("=" * 50)
+
+        # Verify decimals on-chain (same safety as create_pool/create_ladder)
+        try:
+            real_dec0 = self.decimals_cache.get_decimals(pool_key.currency0)
+            real_dec1 = self.decimals_cache.get_decimals(pool_key.currency1)
+            if pool_key.currency0.lower() == Web3.to_checksum_address(token0).lower():
+                if real_dec0 != token0_decimals or real_dec1 != token1_decimals:
+                    logger.warning(f"Decimals mismatch! Provided: ({token0_decimals},{token1_decimals}), on-chain: ({real_dec0},{real_dec1}). Using on-chain values.")
+                    token0_decimals, token1_decimals = real_dec0, real_dec1
+            else:
+                if real_dec0 != token1_decimals or real_dec1 != token0_decimals:
+                    logger.warning(f"Decimals mismatch! Provided: ({token0_decimals},{token1_decimals}), on-chain: ({real_dec1},{real_dec0}). Using on-chain values.")
+                    token0_decimals, token1_decimals = real_dec1, real_dec0
+        except Exception as e:
+            logger.warning(f"Could not verify decimals on-chain: {e}, using provided values")
 
         # Check if already exists
         if self.pool_manager.is_pool_initialized(pool_key):

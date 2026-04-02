@@ -410,7 +410,7 @@ class DashboardTab(QWidget):
         if not positions_data:
             return
         for tid, pos in positions_data.items():
-            if isinstance(pos, dict) and pos.get('liquidity', 0) > 0:
+            if isinstance(pos, dict) and int(pos.get('liquidity', 0) or 0) > 0:
                 self._positions_data[tid] = pos
             else:
                 self._positions_data.pop(tid, None)
@@ -476,7 +476,7 @@ class DashboardTab(QWidget):
         # Count unique pairs
         pairs_set = set()
         for pos in self._positions_data.values():
-            if isinstance(pos, dict) and pos.get('liquidity', 0) > 0:
+            if isinstance(pos, dict) and int(pos.get('liquidity', 0) or 0) > 0:
                 t0 = pos.get('token0', '')
                 t1 = pos.get('token1', '')
                 if t0 and t1:
