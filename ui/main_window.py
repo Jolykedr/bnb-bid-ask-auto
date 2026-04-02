@@ -285,9 +285,10 @@ class MainWindow(QMainWindow):
         """Push current manage_tab positions to dashboard."""
         if hasattr(self.manage_tab, 'positions_data'):
             # Enrich positions with ladder_group_id and invested_usd for dashboard grouping
-            data = dict(self.manage_tab.positions_data)
-            group_map = getattr(self.manage_tab, '_ladder_group_map', {})
-            invested_map = getattr(self.manage_tab, '_invested_usd_map', {})
+            with QMutexLocker(self.manage_tab._positions_mutex):
+                data = dict(self.manage_tab.positions_data)
+                group_map = dict(getattr(self.manage_tab, '_ladder_group_map', {}))
+                invested_map = dict(getattr(self.manage_tab, '_invested_usd_map', {}))
             for tid, pos in data.items():
                 if isinstance(pos, dict):
                     if tid in group_map:

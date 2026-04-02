@@ -2310,12 +2310,61 @@ class ManageTab(QWidget):
             if self._pending_updates:
                 self._flush_table_updates()
             self.progress_bar.hide()
+
+            # Auto-remove closed (Empty) positions — liq=0 with no open_positions record
+            self._auto_remove_closed_positions()
+
             self._save_positions()
             self._update_pnl_summary()
             self._log(f"All positions loaded ({len(self.positions_data)} total)")
             self.positions_updated.emit()
             # Persist open positions to SQLite for dashboard recovery
             self._persist_open_positions()
+
+    def _auto_remove_closed_positions(self):
+        """Remove positions with liquidity=0 that have no unclaimed fees.
+
+        These are fully closed on-chain — keeping them wastes UI space and
+        causes stale entries on refresh.
+        """
+        try:
+            with QMutexLocker(self._positions_mutex):
+                closed_ids = [
+                    tid for tid, pos in self.positions_data.items()
+                    if isinstance(pos, dict)
+                    and pos.get('liquidity', 0) == 0
+                    and pos.get('tokens_owed0', 0) == 0
+                    and pos.get('tokens_owed1', 0) == 0
+                ]
+                if not closed_ids:
+                    return
+                for tid in closed_ids:
+                    self.positions_data.pop(tid, None)
+
+            # Remove from table
+            for tid in closed_ids:
+                row = self._row_index.pop(tid, -1)
+                if 0 <= row < self.positions_table.rowCount():
+                    self.positions_table.removeRow(row)
+                    # Shift row indices
+                    self._row_index = {k: (v if v < row else v - 1)
+                                       for k, v in self._row_index.items()}
+
+            # Remove from input field
+            current_ids = self._parse_token_ids()
+            closed_set = set(closed_ids)
+            remaining_ids = [tid for tid in current_ids if tid not in closed_set]
+            self.token_ids_input.setText(", ".join(str(tid) for tid in remaining_ids))
+
+            # Clean up persistent storage and tracking maps
+            remove_open_positions(closed_ids)
+            invested_map = getattr(self, '_invested_usd_map', {})
+            for tid in closed_ids:
+                invested_map.pop(tid, None)
+
+            self._log(f"Auto-removed {len(closed_ids)} closed position(s): {closed_ids}")
+        except Exception as e:
+            logger.debug(f"Auto-remove closed positions failed: {e}")
 
     def _update_table_row(self, token_id: int, position: dict):
         """Update or add a table row for a position."""
@@ -2517,17 +2566,18 @@ class ManageTab(QWidget):
                 amount0_human = amounts.amount0 / (10 ** dec0) if amounts.amount0 > 0 else 0
                 amount1_human = amounts.amount1 / (10 ** dec1) if amounts.amount1 > 0 else 0
 
-                price = position.get('current_price', 0)
-                price_ok = price and price > 0
+                raw_price = position.get('current_price', 0)
+                price_ok = raw_price and raw_price > 0
 
                 if token0_is_stable and not token1_is_stable:
-                    # token0 = stablecoin (USD), token1 = volatile
-                    # current_price = USD per volatile (inverted)
-                    usd_value = amount0_human + (amount1_human * price if price_ok else 0)
+                    # token0 = stablecoin, token1 = volatile
+                    # raw pool price = token1/token0 (volatile per stable) → invert for USD per volatile
+                    human_price = (1 / raw_price) if price_ok else 0
+                    usd_value = amount0_human + (amount1_human * human_price if price_ok else 0)
                 elif token1_is_stable and not token0_is_stable:
-                    # token1 = stablecoin (USD), token0 = volatile
-                    # current_price = USD per volatile (raw)
-                    usd_value = amount1_human + (amount0_human * price if price_ok else 0)
+                    # token1 = stablecoin, token0 = volatile
+                    # raw pool price = token1/token0 = USD per volatile → use directly
+                    usd_value = amount1_human + (amount0_human * raw_price if price_ok else 0)
                 else:
                     # No stablecoin — show raw L as fallback
                     usd_value = -1
@@ -3116,14 +3166,15 @@ class ManageTab(QWidget):
 
         # Get selected or all positions
         selected_ids = self._get_selected_token_ids()
-        if selected_ids:
-            collect_ids = [
-                tid for tid in selected_ids
-                if tid in self.positions_data and self.positions_data[tid]
-            ]
-        else:
-            # No selection — collect from all loaded positions
-            collect_ids = [tid for tid, p in self.positions_data.items() if p]
+        with QMutexLocker(self._positions_mutex):
+            if selected_ids:
+                collect_ids = [
+                    tid for tid in selected_ids
+                    if tid in self.positions_data and self.positions_data[tid]
+                ]
+            else:
+                # No selection — collect from all loaded positions
+                collect_ids = [tid for tid, p in self.positions_data.items() if p]
 
         if not collect_ids:
             QMessageBox.warning(self, "No Positions", "No positions to collect fees from.")
@@ -3316,8 +3367,10 @@ class ManageTab(QWidget):
         # Get initial investment for PnL calculation
         initial_investment = self.initial_investment_spin.value()
 
+        with QMutexLocker(self._positions_mutex):
+            positions_snapshot = dict(self.positions_data)
         self.worker = ClosePositionsWorker(
-            self.provider, token_ids, dict(self.positions_data),
+            self.provider, token_ids, positions_snapshot,
             chain_id=chain_id,
             initial_investment=initial_investment,
         )
@@ -3430,6 +3483,11 @@ class ManageTab(QWidget):
                 with QMutexLocker(self._positions_mutex):
                     for tid in closed_ids:
                         self.positions_data.pop(tid, None)
+                # Remove closed IDs from input field so they don't reload
+                closed_set = set(closed_ids)
+                current_ids = self._parse_token_ids()
+                remaining_ids = [tid for tid in current_ids if tid not in closed_set]
+                self.token_ids_input.setText(", ".join(str(tid) for tid in remaining_ids))
             # Update invested spinbox with remaining positions
             invested_map = getattr(self, '_invested_usd_map', {})
             if invested_map and closed_ids:
@@ -3607,6 +3665,7 @@ class ManageTab(QWidget):
             seen = set()
 
             # From ClosePositionsWorker (has positions_data + token_ids)
+            # Include stablecoins too — SwapWorker skips them but counts their USD
             if positions_data and token_ids:
                 for tid in token_ids:
                     pos = positions_data.get(tid, {})
@@ -3618,8 +3677,6 @@ class ManageTab(QWidget):
                     ]:
                         addr = pos.get(key, '')
                         if not addr or addr.lower() in seen:
-                            continue
-                        if addr.lower() in STABLE_TOKENS:
                             continue
                         seen.add(addr.lower())
                         tokens_to_sell.append({
@@ -3638,8 +3695,6 @@ class ManageTab(QWidget):
                     ]:
                         addr = pos.get(key, '')
                         if not addr or addr.lower() in seen:
-                            continue
-                        if addr.lower() in STABLE_TOKENS:
                             continue
                         seen.add(addr.lower())
                         tokens_to_sell.append({

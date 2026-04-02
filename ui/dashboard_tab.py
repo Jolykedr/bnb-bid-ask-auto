@@ -24,7 +24,7 @@ import logging
 from src.storage.pnl_store import (
     get_dashboard_stats, get_cumulative_pnl, get_recent_trades,
     get_open_positions, remove_open_positions,
-    get_latest_snapshots_bulk,
+    get_latest_snapshots_bulk, get_claimed_fees_usd_for_tokens,
 )
 from src.math.apr import calc_aggregate_apr
 
@@ -594,6 +594,7 @@ class DashboardTab(QWidget):
                     'count': 0,
                     'usd': 0.0,
                     'invested': 0.0,
+                    'unclaimed_fees': 0.0,
                     'token_ids': [],
                 }
             pairs[key]['count'] += 1
@@ -607,12 +608,12 @@ class DashboardTab(QWidget):
             dec0 = pos.get('token0_decimals', 18)
             dec1 = pos.get('token1_decimals', 18)
             liq = pos.get('liquidity', 0)
+            raw_price = pos.get('current_price', 0)
+            t0_is_stable = t0 in STABLECOINS
 
             if tick_lower < tick_upper and liq > 0:
                 try:
-                    raw_price = pos.get('current_price', 0)
                     if raw_price and raw_price > 0:
-                        t0_is_stable = t0 in STABLECOINS
                         human_price = (1 / raw_price) if t0_is_stable else raw_price
                         usd = calc_usd_from_liquidity(
                             tick_lower, tick_upper, liq, human_price,
@@ -622,6 +623,17 @@ class DashboardTab(QWidget):
                             pairs[key]['usd'] += usd
                 except Exception:
                     pass
+
+            # Accumulate unclaimed fees USD per pair
+            fees0 = pos.get('tokens_owed0', 0)
+            fees1 = pos.get('tokens_owed1', 0)
+            if (fees0 > 0 or fees1 > 0) and raw_price and raw_price > 0:
+                f0_h = fees0 / (10 ** dec0) if fees0 > 0 else 0
+                f1_h = fees1 / (10 ** dec1) if fees1 > 0 else 0
+                if t0_is_stable:
+                    pairs[key]['unclaimed_fees'] += f0_h + (f1_h * (1 / raw_price) if raw_price > 0 else 0)
+                elif t1 in STABLECOINS:
+                    pairs[key]['unclaimed_fees'] += f1_h + (f0_h * raw_price if raw_price > 0 else 0)
 
         if not pairs:
             placeholder = QLabel("No open positions")
@@ -634,11 +646,18 @@ class DashboardTab(QWidget):
 
         self.pairs_title.setText(f"Active Ladders ({len(pairs)})")
 
-        # Fetch APR snapshots for all active token_ids
+        # Fetch APR snapshots and claimed fees for all active token_ids
         all_token_ids = []
         for info in pairs.values():
             all_token_ids.extend(info['token_ids'])
         all_snapshots = get_latest_snapshots_bulk(all_token_ids) if all_token_ids else {}
+
+        # Get previously claimed fees per ladder group
+        claimed_fees_by_pair = {}
+        for key, info in pairs.items():
+            claimed = get_claimed_fees_usd_for_tokens(info['token_ids'])
+            if claimed > 0:
+                claimed_fees_by_pair[key] = claimed
 
         for key, info in pairs.items():
             token_ids = info['token_ids']
@@ -705,10 +724,14 @@ class DashboardTab(QWidget):
             row_layout.addStretch()
 
             # Position count + USD + PnL + APR
+            # PnL = (current_value + unclaimed_fees + claimed_fees) - invested
+            unclaimed = info.get('unclaimed_fees', 0)
+            claimed = claimed_fees_by_pair.get(key, 0)
+            total_with_fees = info['usd'] + unclaimed + claimed
             right_text = f"{info['count']} pos  |  ${info['usd']:.2f}"
             invested = info.get('invested', 0)
             if invested > 0:
-                pnl_val = info['usd'] - invested
+                pnl_val = total_with_fees - invested
                 sign = "+" if pnl_val >= 0 else ""
                 right_text += f"  |  PnL: {sign}${pnl_val:.2f}"
             if pair_apr is not None:

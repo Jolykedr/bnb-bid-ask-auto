@@ -476,14 +476,18 @@ class TestRecordClosedTradeBatchFix:
         """When token_ids is empty (batch close), should extract from pos_dicts."""
         # We need to test the _record_closed_trade method in isolation.
         # Import ManageTab but avoid full construction.
-        with patch("ui.manage_tab.ManageTab.__init__", return_value=None):
-            from ui.manage_tab import ManageTab
+        from ui.manage_tab import ManageTab
+        from PyQt6.QtCore import QMutex
+        from PyQt6.QtWidgets import QWidget
+
+        with patch.object(ManageTab, "__init__", lambda self: QWidget.__init__(self)):
             tab = ManageTab()
             tab.provider = Mock()
             tab.provider.chain_id = 56
             tab.trade_recorded = Mock()
-
-            # Set up the _log method
+            tab._positions_mutex = QMutex()
+            tab.positions_data = {}
+            tab.initial_investment_spin = Mock()
             tab._log = Mock()
 
             data = {

@@ -3206,8 +3206,7 @@ class CreateTab(QWidget):
                     self._set_combo_symbol(self.token0_combo, subgraph.token0_symbol)
                     self._set_combo_symbol(self.token1_combo, subgraph.token1_symbol)
                     self.tick_spacing_spin.setValue(subgraph.tick_spacing)
-                    self.tick_spacing_auto_cb.setChecked(False)
-                    self.tick_spacing_spin.setEnabled(True)
+                    # Keep Auto checked — user can still override manually
                     self._token0_decimals = subgraph.token0_decimals
                     self._token1_decimals = subgraph.token1_decimals
                 else:
