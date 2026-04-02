@@ -143,10 +143,8 @@ def _create_ssl_context() -> ssl.SSLContext:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 
     if PINNED_CERT and "PASTE_SERVER" not in PINNED_CERT:
-        # Write pinned cert to temp file for loading
-        cert_path = Path(tempfile.gettempdir()) / "ll_license_cert.pem"
-        cert_path.write_text(PINNED_CERT)
-        ctx.load_verify_locations(str(cert_path))
+        # Load pinned cert directly from string — avoids TOCTOU via temp file
+        ctx.load_verify_locations(cadata=PINNED_CERT)
         ctx.check_hostname = False  # Self-signed cert uses IP, not hostname
         ctx.verify_mode = ssl.CERT_REQUIRED
     else:

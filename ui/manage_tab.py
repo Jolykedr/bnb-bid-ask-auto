@@ -2021,6 +2021,12 @@ class ManageTab(QWidget):
         updates = dict(self._pending_updates)
         self._pending_updates.clear()
 
+        # Bulk-read invested_usd once for all rows (avoid per-row SQLite I/O)
+        try:
+            self._open_positions_cache = get_open_positions()
+        except Exception:
+            self._open_positions_cache = {}
+
         # Disable sorting ONCE for the entire batch
         self.positions_table.setSortingEnabled(False)
         try:
@@ -2031,6 +2037,7 @@ class ManageTab(QWidget):
                     logger.error(f"Error updating table row for {token_id}: {e}", exc_info=True)
         finally:
             self.positions_table.setSortingEnabled(True)
+            self._open_positions_cache = None
         self._update_buttons()
 
     def _on_position_error(self, token_id: int, error: str):
@@ -2560,7 +2567,7 @@ class ManageTab(QWidget):
         # PnL = (current value + fees) - invested
         invested = 0.0
         try:
-            open_pos = get_open_positions()
+            open_pos = getattr(self, '_open_positions_cache', None) or get_open_positions()
             invested = open_pos.get(token_id, {}).get('invested_usd', 0)
         except Exception:
             pass
@@ -3324,6 +3331,12 @@ class ManageTab(QWidget):
             pair = f"{sym0}/{sym1}"
             protocol = first.get('protocol', 'v3')
 
+            # Fetch previously claimed fees early — needed to avoid double-count
+            closed_token_ids = [p.get('token_id') for p in pos_dicts if p.get('token_id')]
+            if not closed_token_ids:
+                closed_token_ids = token_ids
+            previously_claimed = get_claimed_fees_usd_for_tokens(closed_token_ids)
+
             # If swap was performed, use swap total_usd as received
             received_from_swap = data.get('received_from_swap', 0)
             if received_from_swap > 0:
@@ -3335,13 +3348,9 @@ class ManageTab(QWidget):
 
                 # Fallback to liquidity math if receipt parsing failed
                 if received <= 0:
-                    received = self._calc_received_from_math(pos_dicts)
+                    received = self._calc_received_from_math(pos_dicts, previously_claimed)
 
             # Add previously claimed fees (collected before close)
-            closed_token_ids = [p.get('token_id') for p in pos_dicts if p.get('token_id')]
-            if not closed_token_ids:
-                closed_token_ids = token_ids
-            previously_claimed = get_claimed_fees_usd_for_tokens(closed_token_ids)
             received += previously_claimed
 
             # Fallback invested from DB if manual spinbox is 0
@@ -3464,8 +3473,14 @@ class ManageTab(QWidget):
             logger.debug(f"Receipt parsing failed, will use math fallback: {e}")
             return 0.0
 
-    def _calc_received_from_math(self, pos_dicts: list) -> float:
-        """Calculate received USD using liquidity math (approximate fallback)."""
+    def _calc_received_from_math(self, pos_dicts: list, previously_claimed: float = 0.0) -> float:
+        """Calculate received USD using liquidity math (approximate fallback).
+
+        Args:
+            previously_claimed: fees already collected and recorded in DB.
+                When >0, unclaimed fees from snapshot are excluded to avoid
+                double-counting with stale position data.
+        """
         received = 0.0
         for pos in pos_dicts:
             tick_lower = pos.get('tick_lower', 0)
@@ -3499,15 +3514,18 @@ class ManageTab(QWidget):
                 except Exception:
                     pass
 
-            # Add unclaimed fees (both sides)
-            fees0 = pos.get('tokens_owed0', 0)
-            fees1 = pos.get('tokens_owed1', 0)
-            f0_h = fees0 / (10 ** dec0) if fees0 > 0 else 0
-            f1_h = fees1 / (10 ** dec1) if fees1 > 0 else 0
-            if t0_stable:
-                received += f0_h + (f1_h * (1 / raw_price) if raw_price > 0 else 0)
-            elif t1_stable:
-                received += f1_h + (f0_h * raw_price if raw_price > 0 else 0)
+            # Add unclaimed fees only if no previously_claimed fees exist —
+            # otherwise the snapshot tokens_owed may be stale (pre-collect)
+            # and adding both would double-count.
+            if previously_claimed <= 0:
+                fees0 = pos.get('tokens_owed0', 0)
+                fees1 = pos.get('tokens_owed1', 0)
+                f0_h = fees0 / (10 ** dec0) if fees0 > 0 else 0
+                f1_h = fees1 / (10 ** dec1) if fees1 > 0 else 0
+                if t0_stable:
+                    received += f0_h + (f1_h * (1 / raw_price) if raw_price > 0 else 0)
+                elif t1_stable:
+                    received += f1_h + (f0_h * raw_price if raw_price > 0 else 0)
 
         return received
 

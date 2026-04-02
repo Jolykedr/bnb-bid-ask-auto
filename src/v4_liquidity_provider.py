@@ -1949,6 +1949,7 @@ class V4LiquidityProvider:
             recipient = self.account.address
 
         positions_to_close = []
+        errored_ids = []
         deadline = int(time.time()) + 3600
 
         for token_id in token_ids:
@@ -1967,8 +1968,13 @@ class V4LiquidityProvider:
                     logger.warning(f"Position {token_id} has zero liquidity, skipping")
             except Exception as e:
                 logger.error(f"Error processing position {token_id}: {e}")
+                errored_ids.append(token_id)
 
         if not positions_to_close:
+            if errored_ids:
+                error_msg = f"Failed to process {len(errored_ids)} position(s): {errored_ids}"
+                logger.error(error_msg)
+                return None, False, None
             logger.info("No positions to close (all have zero liquidity or already closed)")
             return None, True, None
 

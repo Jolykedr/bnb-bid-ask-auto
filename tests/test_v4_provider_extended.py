@@ -1704,7 +1704,7 @@ class TestClosePositions:
         assert gas_used is None
 
     def test_close_positions_position_error_skipped(self, provider):
-        """Positions that raise errors are skipped; empty result is success."""
+        """Positions that raise errors return success=False (not silently ignored)."""
         provider.position_manager.get_position = Mock(
             side_effect=Exception("Position not found")
         )
@@ -1716,7 +1716,7 @@ class TestClosePositions:
         )
 
         assert tx_hash is None
-        assert success is True  # nothing to close is not an error
+        assert success is False  # errored positions must be reported
         assert gas_used is None
 
     def test_close_positions_address_sorting(self, provider):
