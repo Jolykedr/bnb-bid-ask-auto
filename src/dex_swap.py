@@ -530,35 +530,53 @@ class DexSwap:
             return None  # Не блокируем свап если не удалось получить цену
 
         try:
-            # spot_price = (sqrtPriceX96 / 2^96)^2 = token1 / token0
+            # Определить порядок токенов в пуле
+            t0_int = int(from_token, 16)
+            t1_int = int(to_token, 16)
+            from_is_token0 = t0_int < t1_int
+
+            # spot_price = (sqrtPriceX96 / 2^96)^2 — raw pool price (token1_wei / token0_wei)
             Q96 = 2 ** 96
             spot_price = (sqrt_price_x96 / Q96) ** 2
 
             if spot_price == 0:
                 return None
 
-            # Определить порядок токенов в пуле
-            t0_int = int(from_token, 16)
-            t1_int = int(to_token, 16)
-            from_is_token0 = t0_int < t1_int
-
-            # exec_price = соотношение исполнения
+            # Нормализуем spot_price с учётом decimals:
+            # raw spot = token1_wei / token0_wei, нужно token1_human / token0_human
+            # token_human = token_wei / 10^decimals
+            # spot_human = spot_raw * 10^(dec0 - dec1)
             if from_is_token0:
-                # Продаём token0, получаем token1: exec_price = out / in (в единицах token1/token0)
-                exec_price = expected_out / amount_in
+                dec0 = self.get_token_decimals(from_token)
+                dec1 = self.get_token_decimals(to_token)
             else:
-                # Продаём token1, получаем token0: exec_price = in / out (в единицах token1/token0)
-                if expected_out == 0:
-                    return f"Price impact check: expected_out is 0"
-                exec_price = amount_in / expected_out
+                dec0 = self.get_token_decimals(to_token)
+                dec1 = self.get_token_decimals(from_token)
+            spot_price_human = spot_price * (10 ** (dec0 - dec1))
 
-            # price_impact = |1 - exec_price / spot_price| * 100%
-            if spot_price > 0:
-                price_impact = abs(1 - exec_price / spot_price) * 100
+            # exec_price = соотношение исполнения (в human-readable единицах token1/token0)
+            if from_is_token0:
+                # Продаём token0, получаем token1
+                amount_in_human = amount_in / (10 ** dec0)
+                expected_out_human = expected_out / (10 ** dec1)
+                if amount_in_human == 0:
+                    return None
+                exec_price = expected_out_human / amount_in_human
+            else:
+                # Продаём token1, получаем token0
+                amount_in_human = amount_in / (10 ** dec1)
+                expected_out_human = expected_out / (10 ** dec0)
+                if expected_out_human == 0:
+                    return f"Price impact check: expected_out is 0"
+                exec_price = amount_in_human / expected_out_human
+
+            # price_impact = |1 - exec_price / spot_price_human| * 100%
+            if spot_price_human > 0:
+                price_impact = abs(1 - exec_price / spot_price_human) * 100
             else:
                 return None
 
-            logger.info(f"Price impact: {price_impact:.2f}% (spot={spot_price:.8e}, exec={exec_price:.8e})")
+            logger.info(f"Price impact: {price_impact:.2f}% (spot={spot_price_human:.8e}, exec={exec_price:.8e})")
 
             if price_impact > self.max_price_impact:
                 return (

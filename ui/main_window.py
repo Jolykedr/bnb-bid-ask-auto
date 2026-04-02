@@ -284,9 +284,19 @@ class MainWindow(QMainWindow):
     def _sync_dashboard_positions(self):
         """Push current manage_tab positions to dashboard."""
         if hasattr(self.manage_tab, 'positions_data'):
-            self.dashboard_tab.update_positions_data(self.manage_tab.positions_data)
+            # Enrich positions with ladder_group_id and invested_usd for dashboard grouping
+            data = dict(self.manage_tab.positions_data)
+            group_map = getattr(self.manage_tab, '_ladder_group_map', {})
+            invested_map = getattr(self.manage_tab, '_invested_usd_map', {})
+            for tid, pos in data.items():
+                if isinstance(pos, dict):
+                    if tid in group_map:
+                        pos['ladder_group_id'] = group_map[tid]
+                    if tid in invested_map:
+                        pos['invested_usd'] = invested_map[tid]
+            self.dashboard_tab.update_positions_data(data)
 
-    def _on_positions_created(self, token_ids: list, invested_usd: float = 0):
+    def _on_positions_created(self, token_ids: list, invested_usd: float = 0, ladder_group_id: str = ""):
         """Handle new positions created in Create tab."""
         # Add positions to Manage tab
         if token_ids:
@@ -295,8 +305,8 @@ class MainWindow(QMainWindow):
             if self.create_tab.provider:
                 self.manage_tab.set_provider(self.create_tab.provider)
 
-            # Add the new positions with invested amount
-            self.manage_tab.add_positions(token_ids, invested_usd)
+            # Add the new positions with invested amount and ladder group
+            self.manage_tab.add_positions(token_ids, invested_usd, ladder_group_id)
 
             # Show notification in status bar
             self.status_bar.showMessage(

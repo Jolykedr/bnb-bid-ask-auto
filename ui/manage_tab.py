@@ -1635,13 +1635,14 @@ class ManageTab(QWidget):
             self.status_label.setText("Connect wallet in Create tab to manage positions")
             self.pool_factory = None
 
-    def add_positions(self, token_ids: list, invested_usd: float = 0):
+    def add_positions(self, token_ids: list, invested_usd: float = 0, ladder_group_id: str = ""):
         """
         Add positions to the list (called externally when new positions are created).
 
         Args:
             token_ids: List of new token IDs to add
             invested_usd: Total USD invested for this ladder (distributed per position)
+            ladder_group_id: UUID grouping these positions as one ladder
         """
         # Add to input field
         current_text = self.token_ids_input.text().strip()
@@ -1664,6 +1665,11 @@ class ManageTab(QWidget):
                 if not hasattr(self, '_invested_usd_map'):
                     self._invested_usd_map = {}
                 self._invested_usd_map[token_id] = per_position_usd
+                # Store ladder_group_id mapping
+                if ladder_group_id:
+                    if not hasattr(self, '_ladder_group_map'):
+                        self._ladder_group_map = {}
+                    self._ladder_group_map[token_id] = ladder_group_id
 
         # Auto-fill initial investment spinbox
         if invested_usd > 0:
@@ -1752,7 +1758,8 @@ class ManageTab(QWidget):
                 continue
 
             deviation = abs(new_usd - old_usd) / old_usd
-            if deviation > 0.30:
+            if deviation > 5.0:
+                # Only skip extreme outliers (>500%) — likely a calculation error
                 logger.warning(
                     f"[Recalc] #{tid}: SKIP — deviation {deviation:.0%} "
                     f"(preview=${old_usd:.2f} → on-chain=${new_usd:.2f})"
@@ -1789,14 +1796,17 @@ class ManageTab(QWidget):
             # Snapshot under mutex
             with QMutexLocker(self._positions_mutex):
                 snapshot = dict(self.positions_data)
-            # Inject chain_id and invested_usd into position dicts before saving
+            # Inject chain_id, invested_usd, ladder_group_id into position dicts before saving
             invested_map = getattr(self, '_invested_usd_map', {})
+            group_map = getattr(self, '_ladder_group_map', {})
             enriched = {}
             for tid, pos in snapshot.items():
                 if isinstance(pos, dict) and pos.get('liquidity', 0) > 0:
                     pos_enriched = dict(pos, chain_id=chain_id)
                     if tid in invested_map:
                         pos_enriched['invested_usd'] = invested_map[tid]
+                    if tid in group_map:
+                        pos_enriched['ladder_group_id'] = group_map[tid]
                     enriched[tid] = pos_enriched
             save_open_positions_bulk(wallet, enriched)
         except Exception as e:
@@ -1825,15 +1835,19 @@ class ManageTab(QWidget):
         except Exception as e:
             self._log(f"Error loading saved positions: {e}")
 
-        # Restore invested_usd from SQLite
+        # Restore invested_usd and ladder_group_id from SQLite
         try:
             open_pos = get_open_positions()
             if open_pos:
                 self._invested_usd_map = {}
+                self._ladder_group_map = {}
                 for tid, pos in open_pos.items():
                     inv = pos.get('invested_usd', 0)
                     if inv > 0:
                         self._invested_usd_map[tid] = inv
+                    gid = pos.get('ladder_group_id')
+                    if gid:
+                        self._ladder_group_map[tid] = gid
                 total = sum(self._invested_usd_map.values())
                 if total > 0:
                     self.initial_investment_spin.setValue(total)
@@ -2386,15 +2400,16 @@ class ManageTab(QWidget):
                 raw_price_lower = 0
                 raw_price_upper = float('inf')
 
-        # Adjust for decimals: human_price = raw_price / 10^(decimals0 - decimals1)
+        # Adjust for decimals: human_price = raw_price * 10^(decimals0 - decimals1)
+        # raw_price is token1_wei/token0_wei; multiply by 10^(dec0-dec1) to get human units
         dec0 = position.get('token0_decimals', 18)
         dec1 = position.get('token1_decimals', 18)
         decimals_diff = dec0 - dec1
         if decimals_diff != 0:
             try:
                 adjustment = 10 ** decimals_diff
-                raw_price_lower /= adjustment
-                raw_price_upper /= adjustment
+                raw_price_lower *= adjustment
+                raw_price_upper *= adjustment
             except (OverflowError, ZeroDivisionError):
                 pass  # Keep raw prices if adjustment fails
 
@@ -2556,9 +2571,10 @@ class ManageTab(QWidget):
                 pnl = total_pos_value - invested
                 pnl_pct = (pnl / invested * 100)
                 sign = "+" if pnl >= 0 else ""
-                pnl_str = f"{sign}${pnl:.2f}"
                 if abs(pnl_pct) >= 0.1:
-                    pnl_str += f"\n{sign}{pnl_pct:.1f}%"
+                    pnl_str = f"{sign}${pnl:.2f} ({sign}{pnl_pct:.0f}%)"
+                else:
+                    pnl_str = f"{sign}${pnl:.2f}"
                 pnl_item = NumericTableWidgetItem(pnl_str, pnl)
                 pnl_item.setForeground(QColor("#00b894") if pnl >= 0 else QColor("#ff6b6b"))
             else:
@@ -3342,6 +3358,14 @@ class ManageTab(QWidget):
             pnl = received - invested if invested > 0 else 0
             pnl_pct = (pnl / invested * 100) if invested > 0 else 0
 
+            # Get ladder_group_id from first closed position
+            group_map = getattr(self, '_ladder_group_map', {})
+            ladder_gid = None
+            for tid in closed_token_ids:
+                if tid in group_map:
+                    ladder_gid = group_map[tid]
+                    break
+
             record = TradeRecord(
                 id=None,
                 pair=pair,
@@ -3354,6 +3378,7 @@ class ManageTab(QWidget):
                 pnl_percent=round(pnl_pct, 1),
                 tx_hash=tx_hash,
                 closed_at=time.time(),
+                ladder_group_id=ladder_gid,
             )
             save_trade(record)
             self._log(f"Trade recorded: {pair} | PnL: ${pnl:+.2f} ({pnl_pct:+.1f}%)")
@@ -3769,21 +3794,39 @@ class ManageTab(QWidget):
 
             total_usd = results.get('total_usd', 0)
             swaps = results.get('swaps', [])
-            pnl = results.get('pnl')
-            pnl_percent = results.get('pnl_percent')
             initial = results.get('initial_investment', 0)
+
+            # Include previously claimed fees in PnL (same as _record_closed_trade)
+            previously_claimed = 0.0
+            deferred = getattr(self, '_deferred_trade_data', None)
+            if deferred:
+                token_ids = deferred.get('token_ids', [])
+                pos_dicts = deferred.get('positions', [])
+                closed_tids = [p.get('token_id') for p in pos_dicts if p.get('token_id')] or token_ids
+                if closed_tids:
+                    previously_claimed = get_claimed_fees_usd_for_tokens(closed_tids)
+
+            total_with_fees = total_usd + previously_claimed
+            if initial > 0:
+                pnl = total_with_fees - initial
+                pnl_percent = (pnl / initial) * 100
+            else:
+                pnl = None
+                pnl_percent = None
 
             result_msg = f"Positions closed & tokens sold!\n\nClose TX: {tx_hash}\n"
             result_msg += f"\n{'='*40}\n"
             result_msg += f"SWAP RESULTS\n"
             result_msg += f"{'='*40}\n"
             result_msg += f"\nTotal received: ${total_usd:.2f}\n"
+            if previously_claimed > 0:
+                result_msg += f"Previously claimed fees: ${previously_claimed:.2f}\n"
 
             if initial > 0 and pnl is not None:
                 pnl_sign = "+" if pnl >= 0 else ""
                 result_msg += f"\nPnL SUMMARY:\n"
                 result_msg += f"  Initial investment: ${initial:.2f}\n"
-                result_msg += f"  Final amount: ${total_usd:.2f}\n"
+                result_msg += f"  Final amount: ${total_with_fees:.2f}\n"
                 result_msg += f"  Profit/Loss: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_percent:.1f}%)\n"
                 self._log(f"PnL: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_percent:.1f}%)")
 

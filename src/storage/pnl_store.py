@@ -31,6 +31,7 @@ class TradeRecord:
     pnl_percent: float
     tx_hash: str
     closed_at: float         # unix timestamp
+    ladder_group_id: Optional[str] = None  # UUID grouping positions created together
 
 
 @dataclass
@@ -128,6 +129,20 @@ def _get_conn() -> sqlite3.Connection:
     except sqlite3.OperationalError:
         pass  # Column already exists
 
+    # Migration: add ladder_group_id column to open_positions
+    try:
+        conn.execute("ALTER TABLE open_positions ADD COLUMN ladder_group_id TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Migration: add ladder_group_id column to trades
+    try:
+        conn.execute("ALTER TABLE trades ADD COLUMN ladder_group_id TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
     conn.commit()
     return conn
 
@@ -140,12 +155,12 @@ def save_trade(record: TradeRecord) -> int:
             """INSERT INTO trades
                (pair, chain_id, protocol, n_positions,
                 invested_usd, received_usd, pnl_usd, pnl_percent,
-                tx_hash, closed_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                tx_hash, closed_at, ladder_group_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (record.pair, record.chain_id, record.protocol,
              record.n_positions, record.invested_usd, record.received_usd,
              record.pnl_usd, record.pnl_percent,
-             record.tx_hash, record.closed_at),
+             record.tx_hash, record.closed_at, record.ladder_group_id),
         )
         conn.commit()
         return cur.lastrowid
@@ -160,7 +175,7 @@ def get_all_trades() -> List[TradeRecord]:
         rows = conn.execute(
             "SELECT id, pair, chain_id, protocol, n_positions, "
             "invested_usd, received_usd, pnl_usd, pnl_percent, "
-            "tx_hash, closed_at "
+            "tx_hash, closed_at, ladder_group_id "
             "FROM trades ORDER BY closed_at DESC"
         ).fetchall()
         return [TradeRecord(*r) for r in rows]
@@ -175,7 +190,7 @@ def get_recent_trades(limit: int = 5) -> List[TradeRecord]:
         rows = conn.execute(
             "SELECT id, pair, chain_id, protocol, n_positions, "
             "invested_usd, received_usd, pnl_usd, pnl_percent, "
-            "tx_hash, closed_at "
+            "tx_hash, closed_at, ladder_group_id "
             "FROM trades ORDER BY closed_at DESC LIMIT ?",
             (limit,)
         ).fetchall()
@@ -354,8 +369,8 @@ def save_open_position(wallet: str, pos: dict):
                 token0, token1, token0_symbol, token1_symbol,
                 token0_decimals, token1_decimals,
                 fee, tick_lower, tick_upper, liquidity, created_at,
-                invested_usd)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                invested_usd, ladder_group_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 pos.get('token_id'),
                 wallet.lower(),
@@ -373,6 +388,7 @@ def save_open_position(wallet: str, pos: dict):
                 str(pos.get('liquidity', 0)),
                 time.time(),
                 pos.get('invested_usd', 0),
+                pos.get('ladder_group_id'),
             ),
         )
         conn.commit()
@@ -394,8 +410,8 @@ def save_open_positions_bulk(wallet: str, positions: dict):
                     token0, token1, token0_symbol, token1_symbol,
                     token0_decimals, token1_decimals,
                     fee, tick_lower, tick_upper, liquidity, created_at,
-                    invested_usd)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    invested_usd, ladder_group_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     tid,
                     wallet.lower(),
@@ -413,6 +429,7 @@ def save_open_positions_bulk(wallet: str, positions: dict):
                     str(pos.get('liquidity', 0)),
                     time.time(),
                     pos.get('invested_usd', 0),
+                    pos.get('ladder_group_id'),
                 ),
             )
         conn.commit()
@@ -449,7 +466,7 @@ def get_open_positions(wallet: str = None) -> dict:
                 "token0, token1, token0_symbol, token1_symbol, "
                 "token0_decimals, token1_decimals, "
                 "fee, tick_lower, tick_upper, liquidity, created_at, "
-                "invested_usd "
+                "invested_usd, ladder_group_id "
                 "FROM open_positions WHERE wallet = ?",
                 (wallet.lower(),)
             ).fetchall()
@@ -459,7 +476,7 @@ def get_open_positions(wallet: str = None) -> dict:
                 "token0, token1, token0_symbol, token1_symbol, "
                 "token0_decimals, token1_decimals, "
                 "fee, tick_lower, tick_upper, liquidity, created_at, "
-                "invested_usd "
+                "invested_usd, ladder_group_id "
                 "FROM open_positions"
             ).fetchall()
 
@@ -483,6 +500,7 @@ def get_open_positions(wallet: str = None) -> dict:
                 'liquidity': int(r[13]) if r[13] else 0,
                 'created_at': r[14],
                 'invested_usd': r[15] if len(r) > 15 else 0,
+                'ladder_group_id': r[16] if len(r) > 16 else None,
             }
         return result
     finally:

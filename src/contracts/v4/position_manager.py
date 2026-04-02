@@ -109,7 +109,7 @@ class V4PositionManager:
             info = result[1]
             tick_spacing = pool_key_tuple[3]
 
-            logger.debug(f"V4 getPoolAndPositionInfo #{token_id}: info type={type(info).__name__}")
+            logger.debug(f"V4 getPoolAndPositionInfo #{token_id}: info type={type(info).__name__}, value={info}, tick_spacing={tick_spacing}")
 
             # Decode PositionInfo — deterministic extraction
             tick_lower, tick_upper = self._extract_ticks(info, tick_spacing)

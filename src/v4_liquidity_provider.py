@@ -725,9 +725,11 @@ class V4LiquidityProvider:
             return tx_hash.hex()
 
         except Exception as e:
-            # release только если TX не была отправлена в сеть
-            if self.nonce_manager and not tx_sent:
-                self.nonce_manager.release_nonce(nonce)
+            if self.nonce_manager:
+                if tx_sent:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
             raise
 
     def approve_on_permit2(
@@ -849,9 +851,11 @@ class V4LiquidityProvider:
             return tx_hash.hex()
 
         except Exception as e:
-            # release только если TX не была отправлена в сеть
-            if self.nonce_manager and not tx_sent:
-                self.nonce_manager.release_nonce(nonce)
+            if self.nonce_manager:
+                if tx_sent:
+                    self.nonce_manager.confirm_transaction(nonce)
+                else:
+                    self.nonce_manager.release_nonce(nonce)
             raise
 
     def get_token_balance(self, token_address: str) -> int:

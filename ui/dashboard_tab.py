@@ -570,14 +570,20 @@ class DashboardTab(QWidget):
             if widget:
                 widget.deleteLater()
 
-        # Group positions by pair
-        pairs = {}  # (t0, t1) -> {count, invested, sym0, sym1, protocol, token_ids}
+        # Group positions by ladder_group_id (or pair as fallback)
+        pairs = {}
         for tid, pos in self._positions_data.items():
             if not isinstance(pos, dict) or pos.get('liquidity', 0) <= 0:
                 continue
             t0 = pos.get('token0', '').lower()
             t1 = pos.get('token1', '').lower()
-            key = (t0, t1)
+
+            # Use ladder_group_id as primary grouping key
+            group_id = pos.get('ladder_group_id')
+            if group_id:
+                key = ('ladder', group_id)
+            else:
+                key = ('pair', t0, t1)
 
             if key not in pairs:
                 pairs[key] = {
@@ -587,10 +593,12 @@ class DashboardTab(QWidget):
                     'chain_id': pos.get('chain_id', 56),
                     'count': 0,
                     'usd': 0.0,
+                    'invested': 0.0,
                     'token_ids': [],
                 }
             pairs[key]['count'] += 1
             pairs[key]['token_ids'].append(tid)
+            pairs[key]['invested'] += pos.get('invested_usd', 0)
 
             # Approximate USD
             tick_lower = pos.get('tick_lower', 0)
@@ -621,10 +629,10 @@ class DashboardTab(QWidget):
             placeholder.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px; padding: 30px; border: none;")
             self.pairs_container.addWidget(placeholder)
             self.pairs_container.addStretch()
-            self.pairs_title.setText("Active Pairs")
+            self.pairs_title.setText("Active Ladders")
             return
 
-        self.pairs_title.setText(f"Active Pairs ({len(pairs)})")
+        self.pairs_title.setText(f"Active Ladders ({len(pairs)})")
 
         # Fetch APR snapshots for all active token_ids
         all_token_ids = []
@@ -632,7 +640,7 @@ class DashboardTab(QWidget):
             all_token_ids.extend(info['token_ids'])
         all_snapshots = get_latest_snapshots_bulk(all_token_ids) if all_token_ids else {}
 
-        for (t0, t1), info in pairs.items():
+        for key, info in pairs.items():
             token_ids = info['token_ids']
             protocol = info['protocol']
             chain_id = info['chain_id']
@@ -696,8 +704,13 @@ class DashboardTab(QWidget):
 
             row_layout.addStretch()
 
-            # Position count + USD + APR
+            # Position count + USD + PnL + APR
             right_text = f"{info['count']} pos  |  ${info['usd']:.2f}"
+            invested = info.get('invested', 0)
+            if invested > 0:
+                pnl_val = info['usd'] - invested
+                sign = "+" if pnl_val >= 0 else ""
+                right_text += f"  |  PnL: {sign}${pnl_val:.2f}"
             if pair_apr is not None:
                 right_text += f"  |  APR: {pair_apr:.1f}%/d"
             right_lbl = QLabel(right_text)

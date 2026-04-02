@@ -289,12 +289,12 @@ class LoadPoolWorker(QThread):
         decimals0 = results2[2]
         decimals1 = results2[3]
         if decimals0 is None or decimals1 is None:
-            self.result.emit({
-                'error': f"Failed to read token decimals on-chain. "
-                         f"dec0={'OK' if decimals0 is not None else 'FAILED'}, "
-                         f"dec1={'OK' if decimals1 is not None else 'FAILED'}. "
-                         f"Check RPC connection."
-            })
+            self.error.emit(
+                f"Failed to read token decimals on-chain. "
+                f"dec0={'OK' if decimals0 is not None else 'FAILED'}, "
+                f"dec1={'OK' if decimals1 is not None else 'FAILED'}. "
+                f"Check RPC connection."
+            )
             return
 
         # Calculate pool price
@@ -1053,8 +1053,8 @@ class CreateTab(QWidget):
     - Transaction execution
     """
 
-    # Signal emitted when new positions are created (token_ids, invested_usd)
-    positions_created = pyqtSignal(list, float)
+    # Signal emitted when new positions are created (token_ids, invested_usd, ladder_group_id)
+    positions_created = pyqtSignal(list, float, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1387,7 +1387,7 @@ class CreateTab(QWidget):
         params_row = QHBoxLayout()
         params_row.addWidget(QLabel("Positions:"))
         self.positions_spin = QSpinBox()
-        self.positions_spin.setRange(1, 20)
+        self.positions_spin.setRange(1, 50)
         self.positions_spin.setValue(7)
         params_row.addWidget(self.positions_spin)
 
@@ -2422,17 +2422,20 @@ class CreateTab(QWidget):
             if data.get('pool_created'):
                 pool_info = "\n(New pool was created)"
 
+            # Emit signal with new token IDs + invested amount + ladder group ID
+            # (emit BEFORE popup — QMessageBox blocks the event loop)
+            import uuid
+            token_ids = data.get('token_ids', [])
+            if token_ids:
+                ladder_group_id = str(uuid.uuid4())
+                self.positions_created.emit(token_ids, self.total_usd_spin.value(), ladder_group_id)
+
             QMessageBox.information(
                 self, "Success",
                 f"Ladder created successfully!{pool_info}\n\n"
                 f"TX: {data.get('tx_hash', 'N/A')}\n"
                 f"Token IDs: {data.get('token_ids', [])}"
             )
-
-            # Emit signal with new token IDs + invested amount for manage tab
-            token_ids = data.get('token_ids', [])
-            if token_ids:
-                self.positions_created.emit(token_ids, self.total_usd_spin.value())
 
             # Refresh balances
             self._update_balances()
