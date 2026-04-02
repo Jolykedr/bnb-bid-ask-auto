@@ -3488,6 +3488,13 @@ class ManageTab(QWidget):
                 current_ids = self._parse_token_ids()
                 remaining_ids = [tid for tid in current_ids if tid not in closed_set]
                 self.token_ids_input.setText(", ".join(str(tid) for tid in remaining_ids))
+                # Remove closed rows from table
+                for tid in closed_ids:
+                    row = self._row_index.pop(tid, -1)
+                    if 0 <= row < self.positions_table.rowCount():
+                        self.positions_table.removeRow(row)
+                        self._row_index = {k: (v if v < row else v - 1)
+                                           for k, v in self._row_index.items()}
             # Update invested spinbox with remaining positions
             invested_map = getattr(self, '_invested_usd_map', {})
             if invested_map and closed_ids:
@@ -3719,21 +3726,47 @@ class ManageTab(QWidget):
                 self._refresh_all_positions()
                 return
 
-            # Save close_data for continuation after balance fetch
-            self._close_data = close_data
-
-            # Fetch balances in background worker (avoids UI freeze)
+            # Get token amounts from close TX receipts (precise, not balanceOf)
+            # balanceOf reads ENTIRE wallet balance — receipts give only amounts from close
+            receipts = close_data.get('receipts', [])
             wallet = self.provider.account.address
-            self._log("Fetching token balances...")
+            first_pos = (list(positions_data.values()) or positions or [{}])[0] if (positions_data or positions) else {}
+            t0 = first_pos.get('token0', '')
+            t1 = first_pos.get('token1', '')
 
-            self._balance_fetch_worker = BalanceFetchWorker(w3, wallet, tokens_to_sell)
-            self._balance_fetch_worker.result.connect(
-                self._on_balances_fetched, Qt.ConnectionType.QueuedConnection
-            )
-            self._balance_fetch_worker.error.connect(
-                lambda e: self._on_balance_fetch_error(e), Qt.ConnectionType.QueuedConnection
-            )
-            self._balance_fetch_worker.start()
+            if receipts and t0 and t1:
+                from src.receipt_parser import parse_close_receipt
+                total_received = {}
+                for receipt_dict in receipts:
+                    try:
+                        received = parse_close_receipt(receipt_dict, wallet, t0, t1)
+                        for addr, amt in received.items():
+                            total_received[addr] = total_received.get(addr, 0) + amt
+                    except Exception as e:
+                        logger.debug(f"Receipt parse for swap amounts failed: {e}")
+
+                # Fill token amounts from receipts
+                for token in tokens_to_sell:
+                    addr_lower = token['address'].lower()
+                    token['amount'] = total_received.get(addr_lower, 0)
+                self._log(f"Token amounts from receipts: {[(t['symbol'], t['amount']) for t in tokens_to_sell]}")
+            else:
+                # Fallback: fetch balances (less precise — includes pre-existing balance)
+                self._log("No receipts available, falling back to balanceOf...")
+                self._close_data = close_data
+                self._balance_fetch_worker = BalanceFetchWorker(w3, wallet, tokens_to_sell)
+                self._balance_fetch_worker.result.connect(
+                    self._on_balances_fetched, Qt.ConnectionType.QueuedConnection
+                )
+                self._balance_fetch_worker.error.connect(
+                    lambda e: self._on_balance_fetch_error(e), Qt.ConnectionType.QueuedConnection
+                )
+                self._balance_fetch_worker.start()
+                return
+
+            # Save close_data and proceed directly (no async balance fetch needed)
+            self._close_data = close_data
+            self._on_balances_fetched(tokens_to_sell)
 
         except Exception as e:
             logger.exception(f"Error showing swap preview: {e}")
