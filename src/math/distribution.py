@@ -20,7 +20,7 @@ import math
 from dataclasses import dataclass
 from typing import List, Literal
 from .ticks import price_to_tick, tick_to_price, align_tick_to_spacing, get_tick_spacing
-from .liquidity import calculate_liquidity_from_usd
+from .liquidity import calculate_liquidity_from_usd, calculate_amounts, decimal_sqrt
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,9 @@ class BidAskPosition:
     usd_amount: float             # Сумма в USD
     percentage: float             # Процент от общей суммы
     liquidity: int                # Расчётная liquidity
+    amount0: int = 0              # Token0 amount в wei (pool order)
+    amount1: int = 0              # Token1 amount в wei (pool order)
+    side: str = "bid"             # "bid" (стейбл вниз) / "ask" (volatile вверх)
 
 
 DistributionType = Literal["linear", "quadratic", "exponential", "fibonacci"]
@@ -76,6 +79,49 @@ def _fibonacci_weights(n: int) -> List[float]:
     for i in range(2, n):
         weights.append(weights[-1] + weights[-2])
     return weights[:n]
+
+
+def solve_distribution(a: int, b: int) -> tuple:
+    """
+    Distribute `a` total spacings across `b` positions as uniformly as possible.
+
+    Returns (widths_in_spacings, b_actual) where widths is a list of length
+    b_actual giving each position's width in spacings (1 spacing = tick_spacing).
+
+    Constraint: first (b-1) positions have equal width `x`, last position
+    has width `y`. The "wider" direction is bounded — last cannot exceed
+    1.35×x — but the "narrower" direction is unbounded (last can be 1).
+
+    Solver:
+        (b-1)·x + y = a
+        1 ≤ y ≤ 1.35·x  (wider capped, narrower free since y can drop to 1)
+        x, y integers ≥ 1
+
+    Picks the smallest valid x, which yields the largest valid y — i.e. the
+    solution closest to fully uniform when one exists.
+
+    If no integer solution exists for the requested b, decrements b until one
+    is found. b can also be clamped if a < b (every position needs ≥ 1 spacing).
+    Method B (width-aware USD) handles the resulting USD asymmetry.
+    """
+    if b < 1:
+        b = 1
+    if a < 1:
+        return ([1], 1)
+    if b > a:
+        b = a
+    while b >= 2:
+        # y = a - (b-1)·x
+        #   y ≤ 1.35·x  =>  x ≥ a / (b - 1 + 1.35) = a / (b + 0.35)
+        #   y ≥ 1       =>  x ≤ (a - 1) / (b - 1)
+        x_min = max(1, math.ceil(a / (b + 0.35)))
+        x_max = (a - 1) // (b - 1)
+        if x_min <= x_max:
+            x = x_min
+            y = a - (b - 1) * x
+            return ([x] * (b - 1) + [y], b)
+        b -= 1
+    return ([a], 1)
 
 
 def get_distribution_weights(n: int, distribution_type: DistributionType) -> List[float]:
@@ -220,20 +266,35 @@ def calculate_bid_ask_distribution(
         )
         n_positions = max_positions
 
-    # Рассчитываем ширину каждой позиции
-    # Делим total_ticks на n_positions и округляем к tick_spacing
-    # Используем floor division чтобы позиции не выходили за указанный диапазон
-    raw_ticks_per_position = total_ticks / n_positions
-    ticks_per_position = int(raw_ticks_per_position // tick_spacing) * tick_spacing
+    # Solve uniform-width distribution: first (n-1) positions have equal width
+    # `x` spacings, last position has width `y` constrained to 1 ≤ y ≤ 1.35·x
+    # (wider direction capped, narrower direction unbounded). If no integer
+    # solution exists for the requested n, solve_distribution decrements n.
+    total_spacings = total_ticks // tick_spacing  # >= 1
+    widths_spacings, n_actual = solve_distribution(total_spacings, n_positions)
+    if n_actual < n_positions:
+        logger.warning(
+            f"n_positions={n_positions} exceeds available spacings "
+            f"(a={total_spacings}). Reduced to {n_actual}."
+        )
+        n_positions = n_actual
 
-    if ticks_per_position < tick_spacing:
-        ticks_per_position = tick_spacing
+    widths_ticks = [w * tick_spacing for w in widths_spacings]
 
-    # Получаем веса распределения
-    weights = get_distribution_weights(n_positions, distribution_type)
-    total_weight = sum(weights)
+    # Width-aware USD distribution: weight scaled by (width / avg_width).
+    # When all widths equal, avg_width == widths[i] and adjusted_weights == weights
+    # (existing flow unchanged). When last is narrower → less USD; wider → more USD.
+    # Density (USD/tick) follows the bid-ask shape smoothly.
+    raw_weights = get_distribution_weights(n_positions, distribution_type)
+    avg_width = sum(widths_ticks) / n_positions
+    adjusted_weights = [
+        raw_weights[i] * (widths_ticks[i] / avg_width)
+        for i in range(n_positions)
+    ]
+    total_adjusted = sum(adjusted_weights)
 
     positions = []
+    cumulative_ticks = 0
 
     # Определяем направление: от текущей цены (tick_current) к целевой (tick_limit)
     positions_go_down = tick_current > tick_limit  # True = позиции ниже текущего тика
@@ -246,24 +307,19 @@ def calculate_bid_ask_distribution(
         aligned_offset = 0
 
     for i in range(n_positions):
-        # Позиции 0..N-2 имеют ширину ticks_per_position (floor-aligned).
-        # Последняя позиция (N-1) расширяется до границы диапазона,
-        # чтобы покрыть весь запрошенный ценовой диапазон без пропусков.
-        # Порядок: позиция 0 ближе к текущей цене, позиция N-1 дальше
+        # Position 0 is closest to current price; position N-1 is farthest.
+        # widths_ticks[i] gives this position's width; last position carries
+        # the leftover (variable) width — sum of widths fully covers the range.
+        w = widths_ticks[i]
         if positions_go_down:
-            # Позиции идут ВНИЗ от tick_upper_aligned к tick_lower_aligned
-            pos_tick_upper = tick_upper_aligned - i * ticks_per_position
-            if i == n_positions - 1:
-                pos_tick_lower = tick_lower_aligned
-            else:
-                pos_tick_lower = tick_upper_aligned - (i + 1) * ticks_per_position
+            # Positions extend DOWN from tick_upper_aligned toward tick_lower_aligned
+            pos_tick_upper = tick_upper_aligned - cumulative_ticks
+            pos_tick_lower = pos_tick_upper - w
         else:
-            # Позиции идут ВВЕРХ от tick_lower_aligned к tick_upper_aligned
-            pos_tick_lower = tick_lower_aligned + i * ticks_per_position
-            if i == n_positions - 1:
-                pos_tick_upper = tick_upper_aligned
-            else:
-                pos_tick_upper = tick_lower_aligned + (i + 1) * ticks_per_position
+            # Positions extend UP from tick_lower_aligned toward tick_upper_aligned
+            pos_tick_lower = tick_lower_aligned + cumulative_ticks
+            pos_tick_upper = pos_tick_lower + w
+        cumulative_ticks += w
 
         # Цены для позиции (инвертируем обратно если нужно, для отображения пользователю)
         # These are HUMAN-READABLE prices (no decimal adjustment)
@@ -274,9 +330,9 @@ def calculate_bid_ask_distribution(
         if invert_price:
             pos_price_lower, pos_price_upper = pos_price_upper, pos_price_lower
 
-        # Сумма для этой позиции (вес растёт с индексом = больше ликвидности внизу)
-        weight = weights[i]
-        percentage = weight / total_weight
+        # USD for this position uses width-aware weight (preserves bid-ask
+        # density shape regardless of variable last-position width).
+        percentage = adjusted_weights[i] / total_adjusted
         usd_amount = total_usd * percentage
 
         # Apply aligned decimal tick offset for pool-space ticks
@@ -287,7 +343,7 @@ def calculate_bid_ask_distribution(
         # The V4 contract computes amounts from sqrtPrice = sqrt(1.0001^tick).
         # Using invert=True would give 1/raw_price, causing wrong liquidity for
         # pairs where stablecoin has the lower address (invert_price=True).
-        # Human-readable prices (lines 262-267) are only for display.
+        # Human-readable prices are only for display.
         #
         # CRITICAL: Raw prices follow POOL order (currency0/currency1), but
         # calculate_liquidity_from_usd expects decimals in pool order.
@@ -312,36 +368,41 @@ def calculate_bid_ask_distribution(
 
         if decimal_tick_offset != 0:
             # Pool-space raw prices for correct liquidity computation
-            pool_price_lower = tick_to_price(pool_tick_lower, invert=False)
-            pool_price_upper = tick_to_price(pool_tick_upper, invert=False)
+            raw_price_lower = tick_to_price(pool_tick_lower, invert=False)
+            raw_price_upper = tick_to_price(pool_tick_upper, invert=False)
 
             pool_current_tick = price_to_tick(current_price, invert=invert_price) + aligned_offset
-            pool_current_price = tick_to_price(pool_current_tick, invert=False)
-
-            liquidity = calculate_liquidity_from_usd(
-                usd_amount=usd_amount,
-                price_lower=pool_price_lower,
-                price_upper=pool_price_upper,
-                current_price=pool_current_price,
-                token0_decimals=liq_t0_dec,
-                token1_decimals=liq_t1_dec,
-                token1_is_stable=liq_t1_stable
-            )
+            raw_current_price = tick_to_price(pool_current_tick, invert=False)
         else:
             # Same decimals (e.g. BNB chain 18/18) — still use raw prices from ticks
             raw_price_lower = tick_to_price(pos_tick_lower, invert=False)
             raw_price_upper = tick_to_price(pos_tick_upper, invert=False)
             raw_current_price = tick_to_price(tick_current, invert=False)
 
-            liquidity = calculate_liquidity_from_usd(
-                usd_amount=usd_amount,
-                price_lower=raw_price_lower,
-                price_upper=raw_price_upper,
-                current_price=raw_current_price,
-                token0_decimals=liq_t0_dec,
-                token1_decimals=liq_t1_dec,
-                token1_is_stable=liq_t1_stable
-            )
+        liquidity = calculate_liquidity_from_usd(
+            usd_amount=usd_amount,
+            price_lower=raw_price_lower,
+            price_upper=raw_price_upper,
+            current_price=raw_current_price,
+            token0_decimals=liq_t0_dec,
+            token1_decimals=liq_t1_dec,
+            token1_is_stable=liq_t1_stable
+        )
+
+        # Calculate token amounts (amount0, amount1) and determine side
+        sqrt_c = float(decimal_sqrt(raw_current_price))
+        sqrt_l = float(decimal_sqrt(raw_price_lower))
+        sqrt_u = float(decimal_sqrt(raw_price_upper))
+        amounts = calculate_amounts(sqrt_c, sqrt_l, sqrt_u, liquidity)
+
+        # Determine side based on position relative to current price (human-readable)
+        # In pool space the relationship is inverted when invert_price=True
+        if sqrt_c >= sqrt_u:
+            pos_side = "ask" if invert_price else "bid"
+        elif sqrt_c <= sqrt_l:
+            pos_side = "bid" if invert_price else "ask"
+        else:
+            pos_side = "bid"  # in-range defaults to bid (stablecoin side)
 
         positions.append(BidAskPosition(
             index=i,
@@ -351,7 +412,10 @@ def calculate_bid_ask_distribution(
             price_upper=pos_price_upper,  # Human-readable prices for display
             usd_amount=usd_amount,
             percentage=percentage * 100,
-            liquidity=liquidity
+            liquidity=liquidity,
+            amount0=amounts.amount0,
+            amount1=amounts.amount1,
+            side=pos_side,
         ))
 
     return positions

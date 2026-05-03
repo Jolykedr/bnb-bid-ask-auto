@@ -325,13 +325,17 @@ class TestCalculateBidAskDistribution:
     # --- Equal width positions ---
 
     def test_all_positions_same_tick_width(self):
-        """All positions must have the same tick width."""
+        """Solver guarantees first (n-1) positions equal width; last ≤ 1.35×."""
         positions = calculate_bid_ask_distribution(
             current_price=10.0, lower_price=5.0,
             total_usd=1000, n_positions=5, fee_tier=2500
         )
         widths = [p.tick_upper - p.tick_lower for p in positions]
-        assert len(set(widths)) == 1, f"Tick widths not equal: {widths}"
+        # First (n-1) positions must be exactly equal
+        assert len(set(widths[:-1])) == 1, f"First (n-1) widths not equal: {widths}"
+        # Last position constrained to [1, 1.35] × first
+        ratio = widths[-1] / widths[0]
+        assert (1 / widths[0]) <= ratio <= 1.35, f"Last/first ratio {ratio} outside solver bound, widths={widths}"
 
     # --- Tick alignment ---
 
@@ -569,12 +573,16 @@ class TestCalculateBidAskDistribution:
     # --- Large number of positions ---
 
     def test_many_positions(self):
-        """Verify that a large number of positions does not break anything."""
+        """Verify that a large number of positions does not break anything.
+
+        Solver may clamp to fewer positions when uniform-width with 1.35× cap
+        can't satisfy the requested count. n_positions is treated as upper bound.
+        """
         positions = calculate_bid_ask_distribution(
             current_price=1000.0, lower_price=100.0,
             total_usd=50000, n_positions=50, fee_tier=2500
         )
-        assert len(positions) == 50
+        assert 1 <= len(positions) <= 50
         total = sum(p.usd_amount for p in positions)
         assert abs(total - 50000) < 0.01
 
@@ -764,7 +772,7 @@ class TestCalculateTwoSidedDistribution:
     # --- Position count splitting ---
 
     def test_position_count_matches_requested(self):
-        """Total positions should always match n_positions."""
+        """Total positions ≤ n_positions (solver may clamp under 1.35× cap)."""
         for n in [2, 5, 10, 20]:
             positions = calculate_two_sided_distribution(
                 current_price=100.0,
@@ -774,7 +782,7 @@ class TestCalculateTwoSidedDistribution:
                 n_positions=n,
                 fee_tier=2500
             )
-            assert len(positions) == n, f"Expected {n} positions, got {len(positions)}"
+            assert 1 <= len(positions) <= n, f"Expected ≤{n} positions, got {len(positions)}"
 
     # --- With decimal_tick_offset ---
 

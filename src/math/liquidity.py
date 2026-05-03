@@ -242,15 +242,18 @@ def calculate_amounts(
     amount0 = 0
     amount1 = 0
 
-    # Случай 1: текущая цена ниже диапазона
-    if sqrt_price_current < sqrt_price_lower:
+    # Случай 1: текущая цена на или ниже диапазона → 100% token0
+    # Включает граничный случай sqrt_current == sqrt_lower (иначе Case 3
+    # передаст sqrt_upper==sqrt_lower в calculate_amount1 → ValueError)
+    if sqrt_price_current <= sqrt_price_lower:
         amount0 = calculate_amount0_for_liquidity(sqrt_price_lower, sqrt_price_upper, liquidity)
 
-    # Случай 2: текущая цена выше диапазона
-    elif sqrt_price_current > sqrt_price_upper:
+    # Случай 2: текущая цена на или выше диапазона → 100% token1
+    # Включает граничный случай sqrt_current == sqrt_upper
+    elif sqrt_price_current >= sqrt_price_upper:
         amount1 = calculate_amount1_for_liquidity(sqrt_price_lower, sqrt_price_upper, liquidity)
 
-    # Случай 3: текущая цена в диапазоне
+    # Случай 3: текущая цена строго в диапазоне
     else:
         amount0 = calculate_amount0_for_liquidity(sqrt_price_current, sqrt_price_upper, liquidity)
         amount1 = calculate_amount1_for_liquidity(sqrt_price_lower, sqrt_price_current, liquidity)
@@ -298,10 +301,15 @@ def calculate_liquidity_from_usd(
     position_below = sqrt_price_current >= sqrt_price_upper
     position_above = sqrt_price_current <= sqrt_price_lower
 
+    # Decimal factor for converting raw pool price to USD-based price.
+    # raw_price = token1_wei / token0_wei = 1.0001^tick
+    # For same-decimal pairs (18/18) the factor is 1 (no-op).
+    decimal_factor = 10 ** (token0_decimals - token1_decimals)
+
     if token1_is_stable:
         # token1 = стейблкоин, token0 = volatile
-        if position_below or (not position_above):
-            # Позиция НИЖЕ или В ДИАПАЗОНЕ: используем stablecoin (token1)
+        if position_below:
+            # Позиция НИЖЕ: только stablecoin (token1)
             amount1 = usd_to_wei(usd_amount, token1_decimals)
             return calculate_liquidity(
                 sqrt_price_current=sqrt_price_current,
@@ -309,11 +317,13 @@ def calculate_liquidity_from_usd(
                 sqrt_price_upper=sqrt_price_upper,
                 amount1=amount1
             )
-        else:
-            # Позиция ВЫШЕ: используем volatile (token0)
-            # Конвертируем USD в token0: amount = usd / price
-            avg_price = (price_lower + price_upper) / 2
-            amount0_in_tokens = usd_amount / avg_price
+        elif position_above:
+            # Позиция ВЫШЕ: только volatile (token0)
+            # volatile_usd = raw_price * 10^(t0_dec - t1_dec)
+            # For 18/18: volatile_usd = raw_price (no change)
+            # For WETH(18)/USDC(6): volatile_usd = raw * 10^12 (e.g. 10^-9 * 10^12 = $1000)
+            volatile_usd = current_price * decimal_factor
+            amount0_in_tokens = usd_amount / volatile_usd if volatile_usd > 0 else 0
             amount0 = usd_to_wei(amount0_in_tokens, token0_decimals)
             return calculate_liquidity(
                 sqrt_price_current=sqrt_price_current,
@@ -321,10 +331,20 @@ def calculate_liquidity_from_usd(
                 sqrt_price_upper=sqrt_price_upper,
                 amount0=amount0
             )
+        else:
+            # В ДИАПАЗОНЕ: нужны оба токена, считаем L напрямую
+            # L = total_usd / (usd_per_L_stable + usd_per_L_volatile)
+            # amount1_wei = L * (sqrt_c - sqrt_l), USD = amount1_wei / 10^t1_dec
+            # amount0_wei = L * (1/sqrt_c - 1/sqrt_u), USD = amount0_wei * P_raw / 10^t1_dec
+            # (P_raw converts token0_wei to token1_wei, then /10^t1_dec gives USD)
+            usd_per_L_stable = (sqrt_price_current - sqrt_price_lower) / (10 ** token1_decimals)
+            usd_per_L_volatile = (1 / sqrt_price_current - 1 / sqrt_price_upper) * current_price / (10 ** token1_decimals)
+            usd_per_L = usd_per_L_stable + usd_per_L_volatile
+            return int(usd_amount / usd_per_L) if usd_per_L > 0 else 0
     else:
         # token0 = стейблкоин, token1 = volatile
-        if position_above or (not position_below):
-            # Позиция ВЫШЕ или В ДИАПАЗОНЕ: используем stablecoin (token0)
+        if position_above:
+            # Позиция ВЫШЕ: только stablecoin (token0)
             amount0 = usd_to_wei(usd_amount, token0_decimals)
             return calculate_liquidity(
                 sqrt_price_current=sqrt_price_current,
@@ -332,12 +352,12 @@ def calculate_liquidity_from_usd(
                 sqrt_price_upper=sqrt_price_upper,
                 amount0=amount0
             )
-        else:
-            # Позиция НИЖЕ: используем volatile (token1)
-            # Pool price = token1/token0 = volatile/stablecoin,
-            # so USD * pool_price = volatile tokens
-            avg_price = (price_lower + price_upper) / 2
-            amount1_in_tokens = usd_amount * avg_price
+        elif position_below:
+            # Позиция НИЖЕ: только volatile (token1)
+            # volatile_tokens_per_usd = raw_price * 10^(t0_dec - t1_dec)
+            # For 18/18: = raw_price (no change)
+            # For USDC(6)/volatile(18): = raw * 10^-12 (e.g. 10^15 * 10^-12 = 1000 tokens/$)
+            amount1_in_tokens = usd_amount * current_price * decimal_factor
             amount1 = usd_to_wei(amount1_in_tokens, token1_decimals)
             return calculate_liquidity(
                 sqrt_price_current=sqrt_price_current,
@@ -345,6 +365,16 @@ def calculate_liquidity_from_usd(
                 sqrt_price_upper=sqrt_price_upper,
                 amount1=amount1
             )
+        else:
+            # В ДИАПАЗОНЕ: нужны оба токена, считаем L напрямую
+            # raw pool price P = token1(volatile)/token0(stable) in wei
+            # amount0_wei = L * (1/sqrt_c - 1/sqrt_u), USD = amount0_wei / 10^t0_dec
+            # amount1_wei = L * (sqrt_c - sqrt_l), USD = amount1_wei / (10^t0_dec * P_raw)
+            # (dividing by P_raw converts token1_wei to token0_wei, then /10^t0_dec gives USD)
+            usd_per_L_stable = (1 / sqrt_price_current - 1 / sqrt_price_upper) / (10 ** token0_decimals)
+            usd_per_L_volatile = (sqrt_price_current - sqrt_price_lower) / (10 ** token0_decimals * current_price) if current_price > 0 else 0
+            usd_per_L = usd_per_L_stable + usd_per_L_volatile
+            return int(usd_amount / usd_per_L) if usd_per_L > 0 else 0
 
 
 def calc_usd_from_liquidity(
