@@ -1377,7 +1377,8 @@ class ManageTab(QWidget):
         self.refresh_btn.clicked.connect(self._refresh_all_positions)
         ids_layout.addWidget(self.refresh_btn)
 
-        # Protocol selector for scanning
+        # Protocol selector for scanning (hidden — wallet scan disabled 2026-05-03,
+        # token_ids are auto-saved to dashboard via positions_created signal + SQLite)
         self.scan_protocol_combo = QComboBox()
         self.scan_protocol_combo.addItem("V4 Uniswap", "v4")
         self.scan_protocol_combo.addItem("V4 PancakeSwap", "v4_pancake")
@@ -1385,12 +1386,14 @@ class ManageTab(QWidget):
         self.scan_protocol_combo.addItem("V3 PancakeSwap", "v3")
         self.scan_protocol_combo.setToolTip("Select which protocol to scan")
         self.scan_protocol_combo.setMinimumWidth(150)
+        self.scan_protocol_combo.hide()
         ids_layout.addWidget(self.scan_protocol_combo)
 
         self.scan_btn = QPushButton("🔍 Scan Wallet")
         self.scan_btn.setToolTip("Scan blockchain for all positions owned by this wallet")
         self.scan_btn.clicked.connect(self._scan_wallet)
         self.scan_btn.setObjectName("primaryButton")
+        self.scan_btn.hide()
         ids_layout.addWidget(self.scan_btn)
 
         top_layout.addLayout(ids_layout)

@@ -205,7 +205,7 @@ worker.start()
 | Ethereum | 1 | Uniswap V3, PancakeSwap V3 | Uniswap V4 |
 | BNB Testnet | 97 | PancakeSwap V3 | — |
 
-> **Примечание:** `get_tokens_for_chain(1)` возвращает `TOKENS_BNB` — для Ethereum нет отдельного набора токенов.
+> **Примечание:** `get_tokens_for_chain(1)` возвращает `TOKENS_ETH` (WETH/USDC/USDT/DAI/WBTC) — добавлено 2026-05-03 (port из web v9060f21).
 
 **Два реестра стабильных токенов:**
 
@@ -704,6 +704,27 @@ except:
 - [x] **V3 decimals on-chain** — create_ladder теперь верифицирует decimals on-chain (как V4)
 - [x] **LoadPoolWorker hard fail** — ошибка вместо default 18 при сбое RPC decimals
 - [x] **LoadPositionWorker hard fail** — skip позиции вместо default 18
+
+### Исправлено 2026-05-03 — UX: Wallet Scan disabled, PCS V4 chain-restricted
+- [x] **Wallet scan UI hidden** — кнопка "Scan Wallet" + protocol selector скрыты (`hide()`). Token_ids трекаются автоматически через `positions_created` signal + SQLite. Убирает Transfer event scan fallback (20k блоков, ~67h на ETH) который мог не находить старые позиции.
+- [x] **PCS V4 disabled на ETH/Base** — `_update_protocol_options()` в `create_tab.py` через Qt `model().item().setFlags()` отключает "PancakeSwap V4" для chain_id != 56. Авто-switch на Uniswap V4 при смене сети.
+- [x] **`_set_protocol_safe(idx, fallback)`** — helper для программных `setCurrentIndex(1)` (PCS V4) с fallback на Uniswap V4 если PCS V4 disabled.
+
+### Исправлено 2026-05-03 — Ethereum chain support (port from web 9060f21)
+- [x] **V4 `state_view` для ETH** — `0x7fFE42C4a5DEeA5b0feC41C94C136Cf115597227` (Uniswap V4 StateView). Без него `V4PoolManager.get_pool_state()` для ETH падал (PoolManager не экспонирует `getSlot0`).
+- [x] **`TOKENS_ETH` dict** — WETH (18), USDC (6), USDT (6), DAI (18), WBTC (8). Все checksummed адреса.
+- [x] **`get_tokens_for_chain(1)` → `TOKENS_ETH`** (раньше fallback на TOKENS_BNB).
+- [x] **`get_token(symbol, chain_id=1)`** — добавлена ветка ETH.
+- [x] **UI dropdown** — `_get_current_tokens()` и `_rebuild_token_combos()` для ETH дают defaults `WETH/USDT` и token1 список `[USDT, USDC, DAI, WETH]`.
+
+### Исправлено 2026-05-03 — math parity с web (port from web v59 + F239)
+- [x] **H3: decimal_factor в `calculate_liquidity_from_usd`** — компенсация `10^(t0_dec - t1_dec)` для USD↔volatile конверсии. Mixed-decimal (USDC/volatile) на BASE/ETH теперь корректны (раньше ошибка ~10^12× для ASK позиций). 18/18 не затронуты.
+- [x] **`avg_price` → `current_price`** для volatile конверсии (фикс F238 из web)
+- [x] **In-range branch** — прямой расчёт L через `usd_per_L_stable + usd_per_L_volatile` (раньше использовался stablecoin only — недосчёт L для mixed-decimal in-range)
+- [x] **`solve_distribution()` solver** — первые (n-1) позиций равной ширины `x`, последняя `y` ∈ [1, 1.35x]. Раньше floor-div: последняя могла быть 2x+ шире остатком.
+- [x] **Method B (width-aware USD)** — веса × (width/avg_width) → плотность USD/tick сохраняет bid-ask shape. No-op при равных ширинах.
+- [x] **`BidAskPosition` расширена** полями `amount0/amount1/side` (default-значения, обратная совместимость).
+- [x] **`calculate_amounts` boundary** `<`/`>` → `<=`/`>=` — sqrt_c == sqrt_l/u теперь идёт в single-token ветку (раньше ValueError при solver layout).
 
 ---
 

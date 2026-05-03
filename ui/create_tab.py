@@ -32,7 +32,7 @@ from src.math.distribution import calculate_bid_ask_from_percent
 from src.v4_liquidity_provider import V4LiquidityProvider, V4LadderConfig
 from src.contracts.v4.constants import V4Protocol
 from src.contracts.v4.subgraph import try_all_sources_with_web3 as query_v4_subgraph
-from config import BNB_CHAIN, ETHEREUM, BASE, TOKENS_BNB, TOKENS_BASE, STABLECOINS, is_stablecoin
+from config import BNB_CHAIN, ETHEREUM, BASE, TOKENS_BNB, TOKENS_BASE, TOKENS_ETH, STABLECOINS, is_stablecoin
 
 
 def _format_price(price: float) -> str:
@@ -1556,6 +1556,8 @@ class CreateTab(QWidget):
 
         # Default to Uniswap V4 (triggers _on_protocol_changed to show correct fee UI)
         self.protocol_combo.setCurrentIndex(3)
+        # Apply chain-specific protocol restrictions (PCS V4 = BSC only)
+        self._update_protocol_options()
 
     def _toggle_key_visibility(self):
         """Toggle private key visibility."""
@@ -1569,9 +1571,10 @@ class CreateTab(QWidget):
     def _get_current_tokens(self) -> dict:
         """Get token dict for the currently selected network."""
         index = self.network_combo.currentIndex()
+        if index == 1:  # Ethereum Mainnet
+            return TOKENS_ETH
         if index == 2:  # Base Mainnet
             return TOKENS_BASE
-        # BNB Mainnet, Ethereum — all use BNB tokens
         return TOKENS_BNB
 
     def _rebuild_token_combos(self):
@@ -1581,11 +1584,15 @@ class CreateTab(QWidget):
 
         # Determine default selections and token1 list per network
         index = self.network_combo.currentIndex()
-        if index == 2:  # Base
+        if index == 1:  # Ethereum
+            default_token0 = "WETH"
+            default_token1 = "USDT"
+            token1_symbols = [s for s in symbols if s in ("USDT", "USDC", "DAI", "WETH")]
+        elif index == 2:  # Base
             default_token0 = "WETH"
             default_token1 = "USDC"
             token1_symbols = [s for s in symbols if s in ("USDC", "USDbC", "DAI", "WETH")]
-        else:  # BNB / ETH
+        else:  # BNB
             default_token0 = "WBNB"
             default_token1 = "USDT"
             token1_symbols = [s for s in symbols if s in ("USDT", "USDC", "BUSD", "WBNB")]
@@ -1644,6 +1651,48 @@ class CreateTab(QWidget):
 
         # Rebuild token combos for the new network
         self._rebuild_token_combos()
+        # PancakeSwap V4 is BSC-only — disable on ETH/Base
+        self._update_protocol_options()
+
+    def _set_protocol_safe(self, idx: int, fallback: int = 3):
+        """setCurrentIndex with fallback if target item is disabled.
+
+        Used when code programmatically switches to a protocol that may be
+        disabled on the current chain (e.g. PCS V4 on ETH).
+        """
+        model = self.protocol_combo.model()
+        item = model.item(idx) if model else None
+        if item is not None and not item.isEnabled():
+            idx = fallback
+        self.protocol_combo.setCurrentIndex(idx)
+
+    def _update_protocol_options(self):
+        """Disable PCS V4 in protocol dropdown for non-BSC chains.
+
+        PCS V4 (Infinity) is only deployed on BNB Chain. For ETH/Base,
+        the dropdown item is greyed out and clicking it switches to Uniswap V4.
+        """
+        network_idx = self.network_combo.currentIndex()
+        is_bsc = (network_idx == 0)
+        pcs_v4_idx = self.protocol_combo.findText("PancakeSwap V4")
+        if pcs_v4_idx < 0:
+            return
+        model = self.protocol_combo.model()
+        item = model.item(pcs_v4_idx)
+        if item is None:
+            return
+        # Toggle enabled state via Qt::ItemIsEnabled flag
+        from PyQt6.QtCore import Qt
+        flags = item.flags()
+        if is_bsc:
+            item.setFlags(flags | Qt.ItemFlag.ItemIsEnabled)
+        else:
+            item.setFlags(flags & ~Qt.ItemFlag.ItemIsEnabled)
+            # If currently selected → switch to Uniswap V4
+            if self.protocol_combo.currentIndex() == pcs_v4_idx:
+                uni_v4_idx = self.protocol_combo.findText("Uniswap V4")
+                if uni_v4_idx >= 0:
+                    self.protocol_combo.setCurrentIndex(uni_v4_idx)
 
     def _get_current_network(self):
         """Get current network config based on dropdown selection."""
@@ -3233,7 +3282,7 @@ class CreateTab(QWidget):
                 if v4_protocol == V4Protocol.UNISWAP:
                     self.protocol_combo.setCurrentIndex(3)
                 else:
-                    self.protocol_combo.setCurrentIndex(1)
+                    self._set_protocol_safe(1, fallback=3)
 
                 # Build info label
                 if subgraph:
@@ -3276,7 +3325,7 @@ class CreateTab(QWidget):
                 # Switch to V4 mode
                 idx = self.protocol_combo.currentIndex()
                 if idx == 0:
-                    self.protocol_combo.setCurrentIndex(1)
+                    self._set_protocol_safe(1, fallback=3)
                 elif idx == 2:
                     self.protocol_combo.setCurrentIndex(3)
 

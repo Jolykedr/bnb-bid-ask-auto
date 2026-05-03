@@ -123,11 +123,12 @@ class TestGetV4Addresses:
         assert addr.position_manager is not None
         assert addr.state_view is not None
 
-    def test_uniswap_ethereum_no_state_view(self):
-        """Uniswap Ethereum (chain 1) has no state_view configured."""
+    def test_uniswap_ethereum_has_state_view(self):
+        """Uniswap Ethereum (chain 1) has state_view (added 2026-05-03)."""
         addr = get_v4_addresses(1, V4Protocol.UNISWAP)
         assert addr is not None
-        assert addr.state_view is None
+        assert addr.state_view is not None
+        assert addr.state_view.lower() == "0x7ffe42c4a5deea5b0fec41c94c136cf115597227"
 
     def test_uniswap_unknown_chain_returns_none(self):
         """Uniswap + unsupported chain returns None."""
@@ -384,9 +385,10 @@ class TestAddressRegistries:
         """Uniswap Base (8453) has a state_view address."""
         assert UNISWAP_V4_ADDRESSES[8453].state_view is not None
 
-    def test_uniswap_ethereum_no_state_view(self):
-        """Uniswap Ethereum (1) does not have state_view."""
-        assert UNISWAP_V4_ADDRESSES[1].state_view is None
+    def test_uniswap_ethereum_has_state_view(self):
+        """Uniswap Ethereum (1) has state_view (added 2026-05-03)."""
+        assert UNISWAP_V4_ADDRESSES[1].state_view is not None
+        assert UNISWAP_V4_ADDRESSES[1].state_view.lower() == "0x7ffe42c4a5deea5b0fec41c94c136cf115597227"
 
     def test_pancakeswap_bnb_has_vault(self):
         """PancakeSwap BNB (56) has a vault address."""

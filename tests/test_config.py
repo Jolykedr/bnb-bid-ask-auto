@@ -579,9 +579,18 @@ class TestGetToken:
         token = get_token("WBNB")
         assert isinstance(token, TokenConfig)
 
-    def test_chain_id_1_raises(self):
-        """Ethereum chain_id=1 has no token dict configured."""
-        with pytest.raises(ValueError, match="Tokens not configured for chain_id"):
+    def test_chain_id_1_returns_eth_token(self):
+        """Ethereum chain_id=1 uses TOKENS_ETH (WETH/USDC/USDT/DAI/WBTC)."""
+        token = get_token("WETH", chain_id=1)
+        assert token.symbol == "WETH"
+        assert token.decimals == 18
+        # USDC on ETH has 6 decimals (not 18 like BSC)
+        usdc = get_token("USDC", chain_id=1)
+        assert usdc.decimals == 6
+
+    def test_chain_id_1_unknown_token_raises(self):
+        """Token not in TOKENS_ETH raises Unknown token (e.g. 'ETH' as symbol — use 'WETH')."""
+        with pytest.raises(ValueError, match="Unknown token"):
             get_token("ETH", chain_id=1)
 
 

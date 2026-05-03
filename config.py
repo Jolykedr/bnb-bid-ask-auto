@@ -235,6 +235,38 @@ TOKENS_BASE: Dict[str, TokenConfig] = {
 }
 
 # ============================================================
+# TOKEN CONFIGURATIONS (Ethereum)
+# ============================================================
+
+TOKENS_ETH: Dict[str, TokenConfig] = {
+    "WETH": TokenConfig(
+        address="0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+        symbol="WETH",
+        decimals=18
+    ),
+    "USDC": TokenConfig(
+        address="0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+        symbol="USDC",
+        decimals=6
+    ),
+    "USDT": TokenConfig(
+        address="0xdAC17F958D2ee523a2206206994597C13D831ec7",
+        symbol="USDT",
+        decimals=6
+    ),
+    "DAI": TokenConfig(
+        address="0x6B175474E89094C44Da98b954EedeAC495271d0F",
+        symbol="DAI",
+        decimals=18
+    ),
+    "WBTC": TokenConfig(
+        address="0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
+        symbol="WBTC",
+        decimals=8
+    ),
+}
+
+# ============================================================
 # FEE TIERS
 # ============================================================
 
@@ -362,7 +394,7 @@ def get_tokens_for_chain(chain_id: int) -> Dict[str, TokenConfig]:
     tokens_map = {
         56: TOKENS_BNB,
         97: TOKENS_BNB,
-        1: TOKENS_BNB,   # Ethereum — используем BNB tokens пока нет TOKENS_ETH
+        1: TOKENS_ETH,
         8453: TOKENS_BASE,
     }
     return tokens_map.get(chain_id, TOKENS_BNB)
@@ -374,6 +406,10 @@ def get_token(symbol: str, chain_id: int = 56) -> TokenConfig:
         if symbol not in TOKENS_BNB:
             raise ValueError(f"Unknown token: {symbol}")
         return TOKENS_BNB[symbol]
+    elif chain_id == 1:
+        if symbol not in TOKENS_ETH:
+            raise ValueError(f"Unknown token: {symbol}")
+        return TOKENS_ETH[symbol]
     elif chain_id == 8453:
         if symbol not in TOKENS_BASE:
             raise ValueError(f"Unknown token: {symbol}")
