@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from web3 import Web3
 from eth_account import Account
-from .utils import NonceManager
+from .utils import NonceManager, eip1559_gas_fields
 
 logger = logging.getLogger(__name__)
 
@@ -899,7 +899,7 @@ class DexSwap:
                     'from': wallet_address,
                     'nonce': nonce,
                     'gas': 500000 if is_multi_hop else 350000,
-                    'gasPrice': self.w3.eth.gas_price,
+                    **eip1559_gas_fields(self.w3),
                     'value': 0
                 })
 
@@ -1008,7 +1008,7 @@ class DexSwap:
                     'from': wallet_address,
                     'nonce': nonce,
                     'gas': 100000,
-                    'gasPrice': self.w3.eth.gas_price
+                    **eip1559_gas_fields(self.w3)
                 })
 
                 signed_tx = account.sign_transaction(tx)
@@ -1077,7 +1077,7 @@ class DexSwap:
                     'from': wallet_address,
                     'nonce': nonce,
                     'gas': 100000,
-                    'gasPrice': self.w3.eth.gas_price
+                    **eip1559_gas_fields(self.w3)
                 })
 
                 signed_tx = account.sign_transaction(tx)
@@ -1168,7 +1168,7 @@ class DexSwap:
                     'from': wallet_address,
                     'nonce': nonce,
                     'gas': 100000,
-                    'gasPrice': self.w3.eth.gas_price
+                    **eip1559_gas_fields(self.w3)
                 })
 
                 signed_tx = account.sign_transaction(tx)
@@ -1290,9 +1290,9 @@ class DexSwap:
                 'data': encoded_data_bytes,
                 'value': 0,
                 'gas': gas_estimate,
-                'gasPrice': self.w3.eth.gas_price,
                 'nonce': nonce,
                 'chainId': self.chain_id,
+                **eip1559_gas_fields(self.w3),
             }
 
             tx_sent = False
@@ -1616,7 +1616,7 @@ class DexSwap:
                         'from': wallet_address,
                         'nonce': nonce,
                         'gas': 300000,
-                        'gasPrice': self.w3.eth.gas_price
+                        **eip1559_gas_fields(self.w3)
                     })
                 else:
                     tx = self.router.functions.swapExactTokensForTokens(
@@ -1629,7 +1629,7 @@ class DexSwap:
                         'from': wallet_address,
                         'nonce': nonce,
                         'gas': 300000,
-                        'gasPrice': self.w3.eth.gas_price
+                        **eip1559_gas_fields(self.w3)
                     })
 
                 # Подписать и отправить (используем account объект, не сырой ключ)

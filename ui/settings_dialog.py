@@ -155,6 +155,24 @@ class SettingsDialog(QDialog):
         gas_limit_row.addStretch()
         tx_group_layout.addLayout(gas_limit_row)
 
+        # Gas price cap (gwei) — safety net against gas spikes
+        gas_cap_row = QHBoxLayout()
+        gas_cap_row.addWidget(QLabel("Gas Price Cap:"))
+        self.gas_price_cap_spin = QDoubleSpinBox()
+        self.gas_price_cap_spin.setRange(0, 1000)
+        self.gas_price_cap_spin.setValue(0)
+        self.gas_price_cap_spin.setDecimals(1)
+        self.gas_price_cap_spin.setSingleStep(1)
+        self.gas_price_cap_spin.setSuffix(" Gwei")
+        self.gas_price_cap_spin.setSpecialValueText("Disabled")
+        self.gas_price_cap_spin.setToolTip(
+            "Block any TX if current gas price exceeds this cap.\n"
+            "0 = disabled. Recommended: 5 Gwei (BSC), 50 Gwei (Ethereum), 0.5 Gwei (Base)."
+        )
+        gas_cap_row.addWidget(self.gas_price_cap_spin)
+        gas_cap_row.addStretch()
+        tx_group_layout.addLayout(gas_cap_row)
+
         # Transaction timeout
         timeout_row = QHBoxLayout()
         timeout_row.addWidget(QLabel("Transaction Timeout:"))
@@ -404,6 +422,9 @@ class SettingsDialog(QDialog):
         self.gas_limit_spin.setValue(
             self.settings.value("tx/gas_limit_override", 0, type=float)
         )
+        self.gas_price_cap_spin.setValue(
+            self.settings.value("tx/gas_price_cap_gwei", 0.0, type=float)
+        )
         self.timeout_spin.setValue(
             self.settings.value("tx/timeout", 600, type=float)
         )
@@ -469,6 +490,13 @@ class SettingsDialog(QDialog):
         self.settings.setValue("tx/slippage", self.slippage_spin.value())
         self.settings.setValue("tx/gas_multiplier", self.gas_multiplier_spin.value())
         self.settings.setValue("tx/gas_limit_override", int(self.gas_limit_spin.value()))
+        self.settings.setValue("tx/gas_price_cap_gwei", self.gas_price_cap_spin.value())
+        # Apply cap immediately so newly-sent TXs respect the change without app restart.
+        try:
+            from src.utils import set_gas_price_cap
+            set_gas_price_cap(self.gas_price_cap_spin.value())
+        except Exception:
+            pass
         self.settings.setValue("tx/timeout", self.timeout_spin.value())
         self.settings.setValue("tx/simulate_first", self.simulate_check.isChecked())
         self.settings.setValue("tx/max_price_impact", self.price_impact_spin.value())

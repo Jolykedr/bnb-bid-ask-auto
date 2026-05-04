@@ -14,7 +14,7 @@ import time
 
 from .abis import POSITION_MANAGER_ABI, ERC20_ABI, ERC721_ENUMERABLE_ABI
 from ..math.distribution import BidAskPosition
-from ..utils import NonceManager
+from ..utils import NonceManager, eip1559_gas_fields
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +141,7 @@ class UniswapV3PositionManager:
                 'from': self.account.address,
                 'nonce': nonce,
                 'gas': 100000,
-                'gasPrice': self.w3.eth.gas_price
+                **eip1559_gas_fields(self.w3),
             })
 
             signed = self.account.sign_transaction(tx)
@@ -338,7 +338,7 @@ class UniswapV3PositionManager:
                 'from': self.account.address,
                 'nonce': nonce,
                 'gas': gas_limit,
-                'gasPrice': self.w3.eth.gas_price
+                **eip1559_gas_fields(self.w3),
             })
 
             signed = self.account.sign_transaction(tx)

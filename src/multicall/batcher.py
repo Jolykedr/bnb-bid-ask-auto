@@ -524,12 +524,13 @@ class Multicall3Batcher:
                 'gas': gas_limit,
             }
 
-            # EIP-1559 или legacy
-            if max_priority_fee:
-                tx_params['maxPriorityFeePerGas'] = max_priority_fee
-                tx_params['maxFeePerGas'] = self.w3.eth.gas_price * 2
+            # EIP-1559 with priority fee override, or fully auto via helper.
+            # Explicit gas_price (legacy) still wins if caller passes it.
+            if gas_price is not None:
+                tx_params['gasPrice'] = gas_price
             else:
-                tx_params['gasPrice'] = gas_price or self.w3.eth.gas_price
+                from ..utils import eip1559_gas_fields
+                tx_params.update(eip1559_gas_fields(self.w3, priority_fee_override=max_priority_fee))
 
             # Используем multicall Position Manager'а
             tx = pm_contract.functions.multicall(call_data_list).build_transaction(tx_params)

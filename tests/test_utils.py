@@ -17,6 +17,10 @@ from src.utils import (
     BatchResult,
     get_token_info_batch,
     MULTICALL3_ADDRESS,
+    eip1559_gas_fields,
+    check_gas_price,
+    set_gas_price_cap,
+    get_gas_price_cap,
 )
 
 
@@ -638,6 +642,186 @@ class TestDataclasses:
         result = BatchResult(success=True, return_data=b'\x01')
         assert result.success is True
         assert result.return_data == b'\x01'
+
+
+# ============================================================
+# eip1559_gas_fields + check_gas_price
+# ============================================================
+
+class TestGasHelpers:
+    """Тесты EIP-1559 хелпера и gas-price cap."""
+
+    def setup_method(self):
+        # Reset cap to disabled before each test (module-level state).
+        set_gas_price_cap(0)
+
+    def teardown_method(self):
+        set_gas_price_cap(0)
+
+    def _w3_with_eip1559(self, base_fee: int = 1_000_000_000, priority: int = 100_000_000, gas_price: int = 5_000_000_000, batched: bool = True):
+        """Build a Mock w3 that supports EIP-1559.
+
+        Args:
+            batched: True → batch_requests().execute() returns the 3 values.
+                     False → batch_requests raises (forces sequential fallback).
+        """
+        w3 = MagicMock()
+        w3.eth.get_block.return_value = {"baseFeePerGas": base_fee}
+        w3.eth.max_priority_fee = priority
+        w3.eth.gas_price = gas_price
+        if batched:
+            mock_batch = MagicMock()
+            mock_batch.__enter__ = Mock(return_value=mock_batch)
+            mock_batch.__exit__ = Mock(return_value=False)
+            mock_batch.execute = Mock(return_value=[
+                gas_price,
+                {"baseFeePerGas": base_fee},
+                priority,
+            ])
+            w3.batch_requests = Mock(return_value=mock_batch)
+        else:
+            # Force sequential fallback by raising on batch
+            w3.batch_requests = Mock(side_effect=Exception("provider does not support batching"))
+        return w3
+
+    def _w3_legacy(self, gas_price: int = 5_000_000_000, batched: bool = True):
+        """Build a Mock w3 without baseFeePerGas (legacy chain)."""
+        w3 = MagicMock()
+        w3.eth.get_block.return_value = {}  # no baseFeePerGas
+        w3.eth.gas_price = gas_price
+        if batched:
+            mock_batch = MagicMock()
+            mock_batch.__enter__ = Mock(return_value=mock_batch)
+            mock_batch.__exit__ = Mock(return_value=False)
+            # Sequential mocks return only the first 3, but for legacy with no
+            # base_fee + needs priority — match real behavior: gas_price + block (no baseFee) + priority.
+            mock_batch.execute = Mock(return_value=[
+                gas_price,
+                {},
+                0,  # priority — won't be used since base_fee is None
+            ])
+            w3.batch_requests = Mock(return_value=mock_batch)
+        else:
+            w3.batch_requests = Mock(side_effect=Exception("not supported"))
+        return w3
+
+    def test_eip1559_returns_type2_fields(self):
+        w3 = self._w3_with_eip1559(base_fee=2_000_000_000, priority=100_000_000)
+        fields = eip1559_gas_fields(w3)
+        assert fields["type"] == 2
+        assert fields["maxPriorityFeePerGas"] == 100_000_000
+        assert fields["maxFeePerGas"] == 2_000_000_000 * 2 + 100_000_000
+
+    def test_eip1559_priority_fee_override(self):
+        w3 = self._w3_with_eip1559(base_fee=1_000_000_000, priority=999)
+        # node says 999, override says 5_000_000
+        fields = eip1559_gas_fields(w3, priority_fee_override=5_000_000)
+        assert fields["maxPriorityFeePerGas"] == 5_000_000
+        assert fields["maxFeePerGas"] == 1_000_000_000 * 2 + 5_000_000
+
+    def test_eip1559_falls_back_to_legacy_when_no_base_fee(self):
+        w3 = self._w3_legacy(gas_price=3_000_000_000)
+        fields = eip1559_gas_fields(w3)
+        assert fields == {"gasPrice": 3_000_000_000}
+
+    def test_check_gas_price_under_cap_passes(self):
+        w3 = MagicMock()
+        w3.eth.gas_price = 4_000_000_000  # 4 gwei
+        check_gas_price(w3, cap_gwei=10)  # cap=10, gas=4 → ok
+
+    def test_check_gas_price_over_cap_raises(self):
+        w3 = MagicMock()
+        w3.eth.gas_price = 50_000_000_000  # 50 gwei
+        with pytest.raises(RuntimeError, match="exceeds cap"):
+            check_gas_price(w3, cap_gwei=10)
+
+    def test_check_gas_price_zero_cap_disabled(self):
+        w3 = MagicMock()
+        w3.eth.gas_price = 1_000_000_000_000  # 1000 gwei
+        check_gas_price(w3, cap_gwei=0)  # cap=0 → disabled, no raise
+        check_gas_price(w3, cap_gwei=-1)  # negative → also disabled
+
+    def test_set_gas_price_cap_global(self):
+        set_gas_price_cap(15.5)
+        assert get_gas_price_cap() == 15.5
+        set_gas_price_cap(0)
+        assert get_gas_price_cap() == 0
+        set_gas_price_cap(-5)  # negative clamped to 0
+        assert get_gas_price_cap() == 0
+
+    def test_eip1559_enforces_global_cap(self):
+        """eip1559_gas_fields must raise if global cap is exceeded — protects all
+        TX-sending sites without per-site changes."""
+        set_gas_price_cap(5)  # 5 gwei cap
+        w3 = self._w3_with_eip1559(gas_price=20_000_000_000)  # 20 gwei
+        with pytest.raises(RuntimeError, match="exceeds cap"):
+            eip1559_gas_fields(w3)
+
+    def test_eip1559_no_cap_does_not_raise(self):
+        # cap disabled by default in setup_method
+        w3 = self._w3_with_eip1559(gas_price=999_000_000_000)  # 999 gwei
+        fields = eip1559_gas_fields(w3)
+        assert fields["type"] == 2  # builds normally
+
+    # ── batch_requests optimization tests ─────────────────────────────────
+
+    def test_eip1559_uses_batch_requests_when_available(self):
+        """Single batched HTTP POST instead of 3 sequential RPCs.
+
+        Note: in real web3.py, `batch.add(w.eth.get_block(...))` defers the call —
+        no actual RPC is made until batch.execute(). With Mock w3, the call is
+        still recorded as a method invocation, so we can't assert "not called".
+        Instead we assert that batch_requests was used AND results came from
+        the batch (not from the sequential fallback's separate RPC dispatch).
+        """
+        w3 = self._w3_with_eip1559(base_fee=2_000_000_000, priority=100_000_000, batched=True)
+        fields = eip1559_gas_fields(w3)
+        # Primary evidence: batch_requests was called (one HTTP POST under the hood)
+        w3.batch_requests.assert_called_once()
+        # Result must be correct (verifies values came from batch.execute())
+        assert fields["type"] == 2
+        assert fields["maxFeePerGas"] == 2_000_000_000 * 2 + 100_000_000
+        assert fields["maxPriorityFeePerGas"] == 100_000_000
+
+    def test_eip1559_falls_back_to_sequential_when_batch_unsupported(self):
+        """If batch_requests raises (old provider), helper falls back to 3 sequential calls."""
+        w3 = self._w3_with_eip1559(base_fee=1_000_000_000, priority=50_000_000, batched=False)
+        fields = eip1559_gas_fields(w3)
+        # batch_requests was attempted
+        w3.batch_requests.assert_called_once()
+        # Sequential calls happened
+        w3.eth.get_block.assert_called_once_with("latest")
+        # Result still correct
+        assert fields["type"] == 2
+        assert fields["maxFeePerGas"] == 1_000_000_000 * 2 + 50_000_000
+
+    def test_eip1559_batch_skips_priority_when_override_provided(self):
+        """priority_fee_override → batch should NOT include max_priority_fee."""
+        w3 = self._w3_with_eip1559(base_fee=1_000_000_000, priority=999, batched=True)
+        # Override the batch.execute to return only 2 items (gas_price + block, no priority)
+        gas_price = 5_000_000_000
+        mock_batch = MagicMock()
+        mock_batch.__enter__ = Mock(return_value=mock_batch)
+        mock_batch.__exit__ = Mock(return_value=False)
+        mock_batch.execute = Mock(return_value=[
+            gas_price,
+            {"baseFeePerGas": 1_000_000_000},
+            # Note: only 2 entries — priority_fee_override means we don't queue max_priority_fee
+        ])
+        w3.batch_requests = Mock(return_value=mock_batch)
+
+        fields = eip1559_gas_fields(w3, priority_fee_override=7_000_000)
+        assert fields["maxPriorityFeePerGas"] == 7_000_000
+        assert fields["maxFeePerGas"] == 1_000_000_000 * 2 + 7_000_000
+
+    def test_eip1559_cap_uses_batched_gas_price_no_extra_rpc(self):
+        """Cap check uses gas_price from the batch — no separate w3.eth.gas_price call."""
+        set_gas_price_cap(5)  # 5 gwei
+        w3 = self._w3_with_eip1559(gas_price=20_000_000_000, batched=True)  # 20 gwei
+        with pytest.raises(RuntimeError, match="exceeds cap"):
+            eip1559_gas_fields(w3)
+        # Cap raised — but the batch was the only RPC. No extra gas_price read.
+        w3.batch_requests.assert_called_once()
 
 
 if __name__ == "__main__":

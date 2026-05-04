@@ -357,16 +357,16 @@ class PoolFactory:
         )
 
     def _get_gas_params(self) -> dict:
-        """Получение параметров газа: EIP-1559 если поддерживается, иначе legacy."""
-        try:
-            max_priority_fee = self.w3.eth.max_priority_fee
-            base_fee = self.w3.eth.get_block('latest')['baseFeePerGas']
-            return {
-                'maxPriorityFeePerGas': max_priority_fee,
-                'maxFeePerGas': base_fee * 2 + max_priority_fee,
-            }
-        except Exception:
-            return {'gasPrice': self.w3.eth.gas_price}
+        """Получение параметров газа: EIP-1559 если поддерживается, иначе legacy.
+
+        Delegates to shared `eip1559_gas_fields` helper so the formula stays in one place.
+        """
+        from ..utils import eip1559_gas_fields
+        fields = eip1559_gas_fields(self.w3)
+        # Caller (build_transaction) ignores 'type' key when building manually,
+        # so strip it for backwards compatibility with this helper's old signature.
+        fields.pop('type', None)
+        return fields
 
     def _get_tick_spacing(self, fee: int) -> int:
         """Получение tick spacing для fee tier."""

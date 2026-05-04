@@ -38,6 +38,15 @@ class MainWindow(QMainWindow):
         self.settings = QSettings("BNBLiquidityLadder", "Settings")
         self._provider_mutex = QMutex()
 
+        # Apply user's gas-price cap (gwei) before any TX-sending code runs.
+        try:
+            from src.utils import set_gas_price_cap
+            set_gas_price_cap(
+                self.settings.value("tx/gas_price_cap_gwei", 0.0, type=float)
+            )
+        except Exception:
+            pass
+
         self.setup_ui()
         self.load_stylesheet()
         self.restore_geometry()

@@ -18,7 +18,7 @@ from urllib.parse import urlparse, unquote
 import requests
 from requests.adapters import HTTPAdapter
 from web3 import Web3
-from .utils import NonceManager
+from .utils import NonceManager, eip1559_gas_fields
 
 logger = logging.getLogger(__name__)
 
@@ -399,7 +399,7 @@ class OKXDexSwap:
                     'from': Web3.to_checksum_address(wallet_address),
                     'nonce': nonce,
                     'gas': 100000,
-                    'gasPrice': w3.eth.gas_price
+                    **eip1559_gas_fields(w3),
                 })
 
                 signed_tx = w3.eth.account.sign_transaction(tx, private_key)
@@ -549,7 +549,7 @@ class OKXDexSwap:
                     'value': swap_data['value'] if is_native else 0,
                     'nonce': nonce,
                     'gas': swap_data['gas'],
-                    'gasPrice': w3.eth.gas_price
+                    **eip1559_gas_fields(w3),
                 }
 
                 # Подписать и отправить
