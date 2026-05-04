@@ -1918,3 +1918,118 @@ class TestGetQuoteToken:
 
         assert token == config.token1
         assert decimals == 8
+
+
+# ============================================================
+# TestPrefetchV4PoolData — _prefetch_v4_pool_data
+# ============================================================
+
+class TestPrefetchV4PoolData:
+    """Tests for V4LiquidityProvider._prefetch_v4_pool_data — batch slot0+liquidity+decimals."""
+
+    @pytest.fixture
+    def provider(self):
+        p = _build_provider()
+        p.pool_manager.state_view_address = "0xd13dd3d6e93f276fafc9db9e6bb47c1180aee0c4"
+        p.pool_manager.pool_manager_address = "0x28e2ea090877bf75740558f6bfb36a5ffee9e9df"
+        return p
+
+    def test_prefetch_returns_pool_state_and_decimals(self, provider):
+        """Successful batch returns V4PoolState + base_decimals."""
+        from src.contracts.v4.pool_manager import V4PoolState
+
+        mock_batch = Mock()
+        mock_batch.execute = Mock(return_value=[
+            {'sqrtPriceX96': 79228162514264337593543950336, 'tick': 0,
+             'protocol_fee': 0, 'lp_fee': 3000},   # slot0
+            12345678,                                # liquidity
+            18,                                      # base decimals
+        ])
+        with patch('src.v4_liquidity_provider.BatchRPC', return_value=mock_batch):
+            result = provider._prefetch_v4_pool_data(b'\xab' * 32, "0xVolatile")
+
+        assert result is not None
+        assert isinstance(result['pool_state'], V4PoolState)
+        assert result['pool_state'].sqrt_price_x96 == 79228162514264337593543950336
+        assert result['pool_state'].liquidity == 12345678
+        assert result['pool_state'].initialized is True
+        assert result['base_decimals'] == 18
+
+    def test_prefetch_uses_state_view_when_available(self, provider):
+        """Uniswap V4 path: target = state_view_address (not pool_manager)."""
+        captured = {}
+        def fake_batch_factory(w3):
+            mock = Mock()
+            def add_v4_slot0(target, pool_id):
+                captured['target'] = target
+            mock.add_v4_slot0 = Mock(side_effect=add_v4_slot0)
+            mock.add_v4_liquidity = Mock()
+            mock.add_decimals = Mock()
+            mock.execute = Mock(return_value=[
+                {'sqrtPriceX96': 1, 'tick': 0, 'protocol_fee': 0, 'lp_fee': 0},
+                0, 18,
+            ])
+            return mock
+
+        with patch('src.v4_liquidity_provider.BatchRPC', side_effect=fake_batch_factory):
+            provider._prefetch_v4_pool_data(b'\x01' * 32, "0xToken")
+
+        assert captured['target'] == provider.pool_manager.state_view_address
+
+    def test_prefetch_falls_back_to_pool_manager_when_no_state_view(self, provider):
+        """PancakeSwap V4: state_view is None → use pool_manager_address."""
+        provider.pool_manager.state_view_address = None
+        captured = {}
+        def fake_batch_factory(w3):
+            mock = Mock()
+            def add_v4_slot0(target, pool_id):
+                captured['target'] = target
+            mock.add_v4_slot0 = Mock(side_effect=add_v4_slot0)
+            mock.add_v4_liquidity = Mock()
+            mock.add_decimals = Mock()
+            mock.execute = Mock(return_value=[
+                {'sqrtPriceX96': 1, 'tick': 0, 'protocol_fee': 0, 'lp_fee': 0},
+                0, 18,
+            ])
+            return mock
+
+        with patch('src.v4_liquidity_provider.BatchRPC', side_effect=fake_batch_factory):
+            provider._prefetch_v4_pool_data(b'\x01' * 32, "0xToken")
+
+        assert captured['target'] == provider.pool_manager.pool_manager_address
+
+    def test_prefetch_returns_none_when_both_targets_missing(self, provider):
+        """No state_view AND no pool_manager → return None (caller falls back)."""
+        provider.pool_manager.state_view_address = None
+        provider.pool_manager.pool_manager_address = None
+
+        result = provider._prefetch_v4_pool_data(b'\x01' * 32, "0xToken")
+        assert result is None
+
+    def test_prefetch_returns_none_when_slot0_missing(self, provider):
+        """slot0=None (uninitialized pool) → return None signals caller to fallback."""
+        mock_batch = Mock()
+        mock_batch.execute = Mock(return_value=[None, 0, 18])
+        with patch('src.v4_liquidity_provider.BatchRPC', return_value=mock_batch):
+            result = provider._prefetch_v4_pool_data(b'\xab' * 32, "0xVolatile")
+        assert result is None
+
+    def test_prefetch_returns_none_on_batch_exception(self, provider):
+        """Any exception in batch.execute → return None (graceful degradation)."""
+        mock_batch = Mock()
+        mock_batch.execute = Mock(side_effect=RuntimeError("RPC down"))
+        with patch('src.v4_liquidity_provider.BatchRPC', return_value=mock_batch):
+            result = provider._prefetch_v4_pool_data(b'\xab' * 32, "0xVolatile")
+        assert result is None
+
+    def test_prefetch_marks_initialized_false_when_sqrt_zero(self, provider):
+        """sqrt_price_x96=0 → pool_state.initialized=False."""
+        mock_batch = Mock()
+        mock_batch.execute = Mock(return_value=[
+            {'sqrtPriceX96': 0, 'tick': 0, 'protocol_fee': 0, 'lp_fee': 0},
+            0, 18,
+        ])
+        with patch('src.v4_liquidity_provider.BatchRPC', return_value=mock_batch):
+            result = provider._prefetch_v4_pool_data(b'\xab' * 32, "0xVolatile")
+        assert result is not None
+        assert result['pool_state'].initialized is False

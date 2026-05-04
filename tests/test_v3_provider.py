@@ -854,3 +854,144 @@ class TestLiquidityProvider:
         provider.position_manager_address = None
         result = provider._get_factory_address()
         assert result is None
+
+    # ------------------------------------------------------------------
+    # _prefetch_ladder_data — batch RPC optimization
+    # ------------------------------------------------------------------
+
+    def test_prefetch_returns_full_dict_when_pool_exists(self, provider):
+        """Successful 2-batch prefetch returns balance/allowance/pool/slot0/liquidity."""
+        mock_batch1 = Mock()
+        mock_batch1.execute = Mock(return_value=[
+            10**24,                                       # balance
+            5_000_000_000,                                # allowance
+            "0xPoolAddress0000000000000000000000000000",  # pool address
+        ])
+        mock_batch2 = Mock()
+        mock_batch2.execute = Mock(return_value=[
+            {'sqrtPriceX96': 79228162514264337593543950336, 'tick': 100},
+            12_000_000_000,                               # liquidity
+        ])
+        # Two BatchRPC instances created in sequence
+        with patch('src.liquidity_provider.BatchRPC',
+                   side_effect=[mock_batch1, mock_batch2]):
+            result = provider._prefetch_ladder_data(
+                stablecoin="0x" + "A" * 40,
+                account_address="0x" + "B" * 40,
+                spender_address="0x" + "C" * 40,
+                factory_address="0x" + "D" * 40,
+                sorted_token0="0x" + "1" * 40,
+                sorted_token1="0x" + "2" * 40,
+                fee=3000,
+            )
+        assert result is not None
+        assert result['balance'] == 10**24
+        assert result['allowance'] == 5_000_000_000
+        assert result['pool_address'] == "0xPoolAddress0000000000000000000000000000"
+        assert result['slot0']['tick'] == 100
+        assert result['liquidity'] == 12_000_000_000
+        assert result['pool_initialized'] is True
+
+    def test_prefetch_returns_none_factory_when_factory_missing(self, provider):
+        """No factory address → return None (caller falls back)."""
+        result = provider._prefetch_ladder_data(
+            stablecoin="0x" + "A" * 40,
+            account_address="0x" + "B" * 40,
+            spender_address="0x" + "C" * 40,
+            factory_address="",                  # empty
+            sorted_token0="0x" + "1" * 40,
+            sorted_token1="0x" + "2" * 40,
+            fee=3000,
+        )
+        assert result is None
+
+    def test_prefetch_skips_batch2_when_pool_does_not_exist(self, provider):
+        """Pool address None → skip second batch, return placeholder dict."""
+        mock_batch1 = Mock()
+        mock_batch1.execute = Mock(return_value=[
+            10**24,
+            5_000_000_000,
+            None,                                # no pool address
+        ])
+        with patch('src.liquidity_provider.BatchRPC',
+                   side_effect=[mock_batch1]) as patched:
+            result = provider._prefetch_ladder_data(
+                stablecoin="0x" + "A" * 40,
+                account_address="0x" + "B" * 40,
+                spender_address="0x" + "C" * 40,
+                factory_address="0x" + "D" * 40,
+                sorted_token0="0x" + "1" * 40,
+                sorted_token1="0x" + "2" * 40,
+                fee=3000,
+            )
+        assert result is not None
+        assert result['pool_address'] is None
+        assert result['pool_initialized'] is False
+        assert result['slot0'] is None
+        assert result['liquidity'] is None
+        # Only ONE BatchRPC was constructed (no batch2)
+        assert patched.call_count == 1
+
+    def test_prefetch_returns_none_on_batch_exception(self, provider):
+        """Any exception → return None for graceful fallback to sequential path."""
+        mock_batch = Mock()
+        mock_batch.execute = Mock(side_effect=RuntimeError("RPC down"))
+        with patch('src.liquidity_provider.BatchRPC', return_value=mock_batch):
+            result = provider._prefetch_ladder_data(
+                stablecoin="0x" + "A" * 40,
+                account_address="0x" + "B" * 40,
+                spender_address="0x" + "C" * 40,
+                factory_address="0x" + "D" * 40,
+                sorted_token0="0x" + "1" * 40,
+                sorted_token1="0x" + "2" * 40,
+                fee=3000,
+            )
+        assert result is None
+
+    def test_prefetch_marks_initialized_false_when_sqrt_zero(self, provider):
+        """Pool exists but sqrtPriceX96=0 → not initialized."""
+        mock_batch1 = Mock()
+        mock_batch1.execute = Mock(return_value=[10**24, 0, "0xPool"])
+        mock_batch2 = Mock()
+        mock_batch2.execute = Mock(return_value=[
+            {'sqrtPriceX96': 0, 'tick': 0},
+            0,
+        ])
+        with patch('src.liquidity_provider.BatchRPC',
+                   side_effect=[mock_batch1, mock_batch2]):
+            result = provider._prefetch_ladder_data(
+                stablecoin="0x" + "A" * 40,
+                account_address="0x" + "B" * 40,
+                spender_address="0x" + "C" * 40,
+                factory_address="0x" + "D" * 40,
+                sorted_token0="0x" + "1" * 40,
+                sorted_token1="0x" + "2" * 40,
+                fee=3000,
+            )
+        assert result is not None
+        assert result['pool_initialized'] is False
+
+    # ------------------------------------------------------------------
+    # check_and_approve_tokens — known_allowance fast path
+    # ------------------------------------------------------------------
+
+    def test_check_and_approve_skips_rpc_when_known_allowance_sufficient(self, provider):
+        """known_allowance >= amount → no on-chain allowance() RPC, returns None (no approve TX)."""
+        token_addr = "0x" + "F" * 40
+        mock_token = Mock()
+        # If allowance() is called, this would record the call
+        mock_token.functions.allowance = Mock(
+            return_value=Mock(call=Mock(return_value=10**30))
+        )
+        provider.w3.eth.contract = Mock(return_value=mock_token)
+
+        result = provider.check_and_approve_tokens(
+            token_address=token_addr,
+            amount=10**18,
+            spender="0x" + "C" * 40,
+            known_allowance=10**24,   # already > amount
+        )
+
+        assert result is None  # no approve needed
+        # Critical: on-chain allowance() must NOT be called when known_allowance is set
+        mock_token.functions.allowance.assert_not_called()

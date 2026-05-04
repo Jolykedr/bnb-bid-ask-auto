@@ -28,7 +28,7 @@ from .math.liquidity import (
 )
 from .math.ticks import tick_to_price, price_to_tick, compute_decimal_tick_offset
 from .contracts.v4 import V4PoolManager, V4PositionManager, V4Protocol
-from .contracts.v4.pool_manager import PoolKey
+from .contracts.v4.pool_manager import PoolKey, V4PoolState
 from .contracts.v4.constants import (
     get_v4_addresses,
     fee_percent_to_v4,
@@ -36,7 +36,7 @@ from .contracts.v4.constants import (
     MAX_V4_FEE
 )
 from .contracts.abis import ERC20_ABI
-from .utils import NonceManager, DecimalsCache, GasEstimator, BatchRPC, get_token_info_batch
+from .utils import NonceManager, DecimalsCache, GasEstimator, BatchRPC, get_token_info_batch, eip1559_gas_fields
 
 # Permit2 addresses - different for each protocol!
 PERMIT2_UNISWAP = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
@@ -350,6 +350,62 @@ class V4LiquidityProvider:
         pool_key = self.get_pool_key(config)
         return self.pool_manager.is_pool_initialized(pool_key)
 
+    def _prefetch_v4_pool_data(self, pool_id: bytes, base_token: str) -> Optional[dict]:
+        """
+        Batch-fetch slot0 + liquidity + decimals via Multicall3 in 1 RPC.
+
+        Mirrors web's `_prefetch_v4_pool_data`. Reduces 3 sequential RPC calls
+        (typical pool-state read sequence) to 1 batch.
+
+        Args:
+            pool_id: 32-byte V4 pool id (from `_compute_pool_id`)
+            base_token: Token address whose decimals we need (volatile token typically)
+
+        Returns:
+            dict with `pool_state` (V4PoolState) and `base_decimals` (int) on success.
+            None if batch fails (caller should fall back to sequential reads).
+        """
+        # StateView for Uniswap V4, PoolManager for PancakeSwap V4 (no StateView).
+        target = (
+            self.pool_manager.state_view_address
+            or self.pool_manager.pool_manager_address
+        )
+        if not target:
+            return None
+
+        try:
+            batch = BatchRPC(self.w3)
+            batch.add_v4_slot0(target, pool_id)
+            batch.add_v4_liquidity(target, pool_id)
+            batch.add_decimals(base_token)
+            results = batch.execute()
+
+            slot0_data = results[0]   # dict | None
+            liquidity = results[1]    # int | None
+            base_decimals = results[2]  # int | None
+
+            if slot0_data is None:
+                return None
+
+            sqrt_x96 = slot0_data.get('sqrtPriceX96', 0)
+            pool_state = V4PoolState(
+                pool_id=pool_id,
+                sqrt_price_x96=sqrt_x96,
+                tick=slot0_data.get('tick', 0),
+                liquidity=liquidity or 0,
+                protocol_fee=slot0_data.get('protocol_fee', 0),
+                lp_fee=slot0_data.get('lp_fee', 0),
+                initialized=sqrt_x96 > 0,
+            )
+
+            return {
+                'pool_state': pool_state,
+                'base_decimals': base_decimals,
+            }
+        except Exception as e:
+            logger.warning(f"V4 prefetch batch failed: {e}, fallback to sequential")
+            return None
+
     def _compute_sqrt_price_x96(
         self,
         config: V4LadderConfig,
@@ -482,7 +538,7 @@ class V4LiquidityProvider:
                 'from': self.account.address,
                 'nonce': nonce,
                 'gas': 500000,
-                'gasPrice': self.w3.eth.gas_price
+                **eip1559_gas_fields(self.w3)
             })
 
             signed = self.account.sign_transaction(tx)
@@ -635,7 +691,7 @@ class V4LiquidityProvider:
                 'from': self.account.address,
                 'nonce': nonce,
                 'gas': 500000,
-                'gasPrice': self.w3.eth.gas_price
+                **eip1559_gas_fields(self.w3)
             })
 
             signed = self.account.sign_transaction(tx)
@@ -744,7 +800,7 @@ class V4LiquidityProvider:
                 'from': self.account.address,
                 'nonce': nonce,
                 'gas': gas_limit,
-                'gasPrice': self.w3.eth.gas_price
+                **eip1559_gas_fields(self.w3)
             })
 
             signed = self.account.sign_transaction(tx)
@@ -846,7 +902,7 @@ class V4LiquidityProvider:
                 'from': self.account.address,
                 'nonce': nonce,
                 'gas': gas_limit,
-                'gasPrice': self.w3.eth.gas_price
+                **eip1559_gas_fields(self.w3)
             })
 
             signed = self.account.sign_transaction(tx)

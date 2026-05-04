@@ -26,7 +26,7 @@ from .contracts.position_manager import UniswapV3PositionManager, MintParams
 from .contracts.pool_factory import PoolFactory
 from .contracts.abis import ERC20_ABI
 from .multicall.batcher import Multicall3Batcher
-from .utils import NonceManager, DecimalsCache, GasEstimator
+from .utils import NonceManager, DecimalsCache, GasEstimator, BatchRPC, eip1559_gas_fields
 
 
 # Mapping Position Manager address -> Factory address (BSC chain)
@@ -368,6 +368,77 @@ class LiquidityProvider:
             logger.warning(f"Failed to get pool info: {e}")
             return True, pool_address, None  # Pool exists but couldn't get info
 
+    def _prefetch_ladder_data(
+        self,
+        stablecoin: str,
+        account_address: str,
+        spender_address: str,
+        factory_address: str,
+        sorted_token0: str,
+        sorted_token1: str,
+        fee: int,
+    ) -> Optional[dict]:
+        """
+        Batch-fetch balance + allowance + pool address + slot0 + liquidity in 2 Multicall3 batches.
+
+        Mirrors web's `_prefetch_ladder_data`. Reduces ~6 sequential RPC calls to 2 batched calls,
+        which is ~2-3 seconds saved on public BSC RPC endpoints.
+
+        Returns dict with keys:
+            balance (int), allowance (int), pool_address (str|None),
+            slot0 (dict|None), liquidity (int|None), pool_initialized (bool)
+        Returns None if factory_address is empty (caller falls back to old sequential path).
+        """
+        if not factory_address:
+            return None
+
+        try:
+            # ── Batch 1: balance + allowance + getPool ──
+            batch1 = BatchRPC(self.w3)
+            batch1.add_balance_of(stablecoin, account_address)
+            batch1.add_allowance(stablecoin, account_address, spender_address)
+            batch1.add_pool_address(factory_address, sorted_token0, sorted_token1, fee)
+            results1 = batch1.execute()
+
+            balance = results1[0] if results1[0] is not None else 0
+            allowance = results1[1] if results1[1] is not None else 0
+            pool_address = results1[2]   # None if pool doesn't exist
+
+            if not pool_address:
+                return {
+                    'balance': balance,
+                    'allowance': allowance,
+                    'pool_address': None,
+                    'slot0': None,
+                    'liquidity': None,
+                    'pool_initialized': False,
+                }
+
+            # ── Batch 2: slot0 + liquidity (only if pool exists) ──
+            batch2 = BatchRPC(self.w3)
+            batch2.add_pool_slot0(pool_address)
+            batch2.add_pool_liquidity(pool_address)
+            results2 = batch2.execute()
+
+            slot0 = results2[0]   # dict with sqrtPriceX96/tick/... or None
+            liquidity = results2[1] if results2[1] is not None else 0
+
+            pool_initialized = (
+                slot0 is not None and slot0.get('sqrtPriceX96', 0) > 0
+            )
+
+            return {
+                'balance': balance,
+                'allowance': allowance,
+                'pool_address': pool_address,
+                'slot0': slot0,
+                'liquidity': liquidity,
+                'pool_initialized': pool_initialized,
+            }
+        except Exception as e:
+            logger.warning(f"V3 prefetch batch failed: {e}, fallback to sequential")
+            return None
+
     def check_balance(
         self,
         token_address: str,
@@ -437,7 +508,8 @@ class LiquidityProvider:
         token_address: str,
         amount: int,
         spender: str = None,
-        timeout: int = 120
+        timeout: int = 120,
+        known_allowance: Optional[int] = None,
     ) -> Optional[str]:
         """
         Проверка и approve токенов.
@@ -447,6 +519,8 @@ class LiquidityProvider:
             amount: Необходимая сумма
             spender: Адрес spender (по умолчанию position_manager)
             timeout: Таймаут ожидания подтверждения в секундах
+            known_allowance: Pre-fetched allowance (skips the on-chain read).
+                Pass when caller already batched it via `_prefetch_ladder_data`.
 
         Returns:
             tx_hash если был approve, None если уже approved
@@ -459,10 +533,13 @@ class LiquidityProvider:
             abi=ERC20_ABI
         )
 
-        current_allowance = token.functions.allowance(
-            self.account.address,
-            Web3.to_checksum_address(spender)
-        ).call()
+        if known_allowance is not None:
+            current_allowance = known_allowance
+        else:
+            current_allowance = token.functions.allowance(
+                self.account.address,
+                Web3.to_checksum_address(spender)
+            ).call()
 
         if current_allowance >= amount:
             logger.info(f"Token {token_address[:10]}... already approved")
@@ -492,7 +569,7 @@ class LiquidityProvider:
                 'from': self.account.address,
                 'nonce': nonce,
                 'gas': gas_limit,
-                'gasPrice': self.w3.eth.gas_price
+                **eip1559_gas_fields(self.w3),
             })
 
             signed = self.account.sign_transaction(tx)
@@ -614,80 +691,127 @@ class LiquidityProvider:
 
         total_stablecoin_amount = int(config.total_usd * (10 ** stablecoin_decimals))
 
+        # ── Prefetch: batch balance + allowance + pool address + slot0 + liquidity ──
+        # Reduces ~6 sequential RPC calls to 2 Multicall3 batches.
+        # Falls back to old sequential path if factory unknown or batch fails.
+        prefetched_allowance: Optional[int] = None
+        if not validated_pool_address:
+            factory_address = self._get_factory_address()
+            prefetch = None
+            if factory_address:
+                prefetch = self._prefetch_ladder_data(
+                    stablecoin=stablecoin,
+                    account_address=self.account.address,
+                    spender_address=self.position_manager_address,
+                    factory_address=factory_address,
+                    sorted_token0=token0,
+                    sorted_token1=token1,
+                    fee=config.fee_tier,
+                )
+
+            if prefetch is not None:
+                prefetched_allowance = prefetch['allowance']
+                pool_address = prefetch['pool_address']
+                pool_exists = prefetch['pool_initialized']
+                if pool_address and prefetch['slot0']:
+                    pool_info = {
+                        'initialized': prefetch['pool_initialized'],
+                        'tick': prefetch['slot0'].get('tick'),
+                        'sqrtPriceX96': prefetch['slot0'].get('sqrtPriceX96'),
+                        'liquidity': prefetch['liquidity'],
+                    }
+                else:
+                    pool_info = None
+                logger.info(
+                    f"Prefetch: balance={prefetch['balance']}, allowance={prefetched_allowance}, "
+                    f"pool={pool_address}, initialized={pool_exists}"
+                )
+                # Fall through to existing pool_exists handling below — same dict shape.
+                # Skip the sequential validate_pool_exists call.
+                _skip_validate = True
+            else:
+                _skip_validate = False
+        else:
+            _skip_validate = True
+
         # Проверка существования пула
-        # Пропускаем если пул уже проверен вызывающим кодом
+        # Пропускаем если пул уже проверен вызывающим кодом или собран prefetch'ем.
         if validated_pool_address:
             logger.info(f"Using pre-validated pool: {validated_pool_address}")
             pool_address = validated_pool_address
+        elif _skip_validate:
+            # pool_address / pool_exists / pool_info уже выставлены prefetch'ем
+            logger.info(f"Using prefetched pool data: {pool_address} (initialized={pool_exists})")
         else:
             logger.info(f"Checking if pool exists for {token0[:10]}.../{token1[:10]}... fee={config.fee_tier}")
             pool_exists, pool_address, pool_info = self.validate_pool_exists(
                 config.token0, config.token1, config.fee_tier
             )
 
-            if not pool_exists:
-                if not auto_create_pool:
-                    if pool_address:
-                        error_msg = (
-                            f"Pool exists at {pool_address} but is NOT INITIALIZED. "
-                            f"Enable 'Auto-create pool' to initialize it automatically."
-                        )
-                    else:
-                        error_msg = (
-                            f"Pool does NOT EXIST for tokens {config.token0[:10]}.../{config.token1[:10]}... "
-                            f"with fee tier {config.fee_tier}. "
-                            f"Enable 'Auto-create pool' to create it automatically."
-                        )
-                    logger.error(error_msg)
-                    return LadderResult(
-                        positions=positions,
-                        tx_hash=None,
-                        gas_used=None,
-                        token_ids=[],
-                        success=False,
-                        error=error_msg
+        # Pool-existence handling — runs for BOTH prefetch and sequential paths
+        # (но не для validated_pool_address — там caller уже всё проверил).
+        if not validated_pool_address and not pool_exists:
+            if not auto_create_pool:
+                if pool_address:
+                    error_msg = (
+                        f"Pool exists at {pool_address} but is NOT INITIALIZED. "
+                        f"Enable 'Auto-create pool' to initialize it automatically."
                     )
-
-                # Will batch createAndInitializePoolIfNecessary with mint calls
-                logger.info("Pool does not exist — will batch createAndInitializePoolIfNecessary + mint in one TX")
-                try:
-                    import math
-                    # current_price is user price (USD/volatile)
-                    # Pool price = token1/token0 (sorted by address)
-                    # Use dynamically detected `stablecoin` (line 592) and sorted `token0` (line 579)
-                    stablecoin_is_sorted_token0 = stablecoin.lower() == token0.lower()
-                    if stablecoin_is_sorted_token0:
-                        pool_price = 1.0 / config.current_price
-                    else:
-                        pool_price = config.current_price
-
-                    # Map sorted pool token0/token1 to on-chain-verified decimals
-                    if token0.lower() == config.token0.lower():
-                        t0_dec = config.token0_decimals
-                        t1_dec = config.token1_decimals
-                    else:
-                        t0_dec = config.token1_decimals
-                        t1_dec = config.token0_decimals
-
-                    adjusted_price = pool_price * (10 ** (t1_dec - t0_dec))
-                    if adjusted_price <= 0:
-                        raise ValueError(f"Invalid pool price: {pool_price}")
-                    sqrt_price = math.sqrt(adjusted_price)
-                    pool_create_sqrt_price = int(sqrt_price * (2 ** 96))
-                    logger.info(f"Computed sqrtPriceX96 for pool init: {pool_create_sqrt_price}")
-                except Exception as e:
-                    return LadderResult(
-                        positions=positions,
-                        tx_hash=None,
-                        gas_used=None,
-                        token_ids=[],
-                        success=False,
-                        error=f"Failed to compute pool init price: {e}"
+                else:
+                    error_msg = (
+                        f"Pool does NOT EXIST for tokens {config.token0[:10]}.../{config.token1[:10]}... "
+                        f"with fee tier {config.fee_tier}. "
+                        f"Enable 'Auto-create pool' to create it automatically."
                     )
+                logger.error(error_msg)
+                return LadderResult(
+                    positions=positions,
+                    tx_hash=None,
+                    gas_used=None,
+                    token_ids=[],
+                    success=False,
+                    error=error_msg
+                )
 
-            if pool_info:
-                logger.info(f"Pool found at {pool_address}")
-                logger.info(f"Pool current tick: {pool_info.get('tick')}, liquidity: {pool_info.get('liquidity')}")
+            # Will batch createAndInitializePoolIfNecessary with mint calls
+            logger.info("Pool does not exist — will batch createAndInitializePoolIfNecessary + mint in one TX")
+            try:
+                import math
+                # current_price is user price (USD/volatile)
+                # Pool price = token1/token0 (sorted by address)
+                stablecoin_is_sorted_token0 = stablecoin.lower() == token0.lower()
+                if stablecoin_is_sorted_token0:
+                    pool_price = 1.0 / config.current_price
+                else:
+                    pool_price = config.current_price
+
+                # Map sorted pool token0/token1 to on-chain-verified decimals
+                if token0.lower() == config.token0.lower():
+                    t0_dec = config.token0_decimals
+                    t1_dec = config.token1_decimals
+                else:
+                    t0_dec = config.token1_decimals
+                    t1_dec = config.token0_decimals
+
+                adjusted_price = pool_price * (10 ** (t1_dec - t0_dec))
+                if adjusted_price <= 0:
+                    raise ValueError(f"Invalid pool price: {pool_price}")
+                sqrt_price = math.sqrt(adjusted_price)
+                pool_create_sqrt_price = int(sqrt_price * (2 ** 96))
+                logger.info(f"Computed sqrtPriceX96 for pool init: {pool_create_sqrt_price}")
+            except Exception as e:
+                return LadderResult(
+                    positions=positions,
+                    tx_hash=None,
+                    gas_used=None,
+                    token_ids=[],
+                    success=False,
+                    error=f"Failed to compute pool init price: {e}"
+                )
+
+        if not validated_pool_address and pool_info:
+            logger.info(f"Pool found at {pool_address}")
+            logger.info(f"Pool current tick: {pool_info.get('tick')}, liquidity: {pool_info.get('liquidity')}")
 
         # Get current pool tick to filter out in-range positions
         # (we only provide one token, but in-range positions need both)
@@ -757,7 +881,11 @@ class LiquidityProvider:
         # Approve стейблкоин unlimited (standard DeFi practice for NonfungiblePositionManager)
         unlimited = 2**256 - 1
         logger.info(f"Approving stablecoin {stablecoin[:15]}... unlimited to PM={self.position_manager_address[:15]}...")
-        self.check_and_approve_tokens(stablecoin, unlimited, timeout=timeout)
+        # `prefetched_allowance` may be None — check_and_approve_tokens handles both.
+        self.check_and_approve_tokens(
+            stablecoin, unlimited, timeout=timeout,
+            known_allowance=prefetched_allowance,
+        )
 
         # Очищаем батчер
         self.batcher.clear()
