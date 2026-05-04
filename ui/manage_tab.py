@@ -3491,27 +3491,22 @@ class ManageTab(QWidget):
                 closed_token_ids = token_ids
             previously_claimed = get_claimed_fees_usd_for_tokens(closed_token_ids)
 
-            # If swap was performed, use swap total_usd as received
-            received_from_swap = data.get('received_from_swap', 0)
-            if received_from_swap > 0:
-                received = received_from_swap
-                # When swap used balanceOf fallback, stablecoin balances already include
-                # previously claimed fees → do NOT add them again (double-count).
-                # When swap used receipt-based amounts, only close TX proceeds are counted
-                # → previously_claimed must be added separately.
-                if not data.get('swap_used_balance_fallback', False):
-                    received += previously_claimed
-            else:
-                # Try receipt-based PnL calculation (precise, from worker-fetched receipts)
-                receipts = data.get('receipts', [])
-                received = self._calc_received_from_receipts(receipts, pos_dicts)
+            # PnL is ALWAYS derived from close TX receipts — even when a swap happens.
+            # Reason: the swap is intentionally on the full wallet balance (which can
+            # include previously-accumulated tokens unrelated to this close), so
+            # `received_from_swap` is not a reliable per-position figure.
+            # Receipts give us the EXACT amount that left the position(s) being closed,
+            # converted to USD at close-time price.
+            receipts = data.get('receipts', [])
+            received = self._calc_received_from_receipts(receipts, pos_dicts)
 
-                # Fallback to liquidity math if receipt parsing failed
-                if received <= 0:
-                    received = self._calc_received_from_math(pos_dicts, previously_claimed)
+            # Fallback to liquidity math if receipt parsing failed (e.g. receipts missing)
+            if received <= 0:
+                received = self._calc_received_from_math(pos_dicts, previously_claimed)
 
-                # Add previously claimed fees (no swap → no risk of double-count)
-                received += previously_claimed
+            # Add previously claimed fees (collected via /collect before close).
+            # These are NOT in the close-TX receipts.
+            received += previously_claimed
 
             # Fallback invested from DB if manual spinbox is 0
             invested = initial if initial > 0 else 0
@@ -3800,51 +3795,20 @@ class ManageTab(QWidget):
                 self._refresh_all_positions()
                 return
 
-            # Get token amounts from close TX receipts (precise, not balanceOf)
-            # balanceOf reads ENTIRE wallet balance — receipts give only amounts from close
-            receipts = close_data.get('receipts', [])
+            # Always swap the FULL wallet balance of each token (intentional choice).
+            # PnL accuracy per-position is preserved separately by `_record_closed_trade`,
+            # which derives received_usd from close TX receipts (not from swap proceeds).
+            # See _record_closed_trade for the receipt-based PnL path.
             wallet = self.provider.account.address
-            first_pos = (list(positions_data.values()) or positions or [{}])[0] if (positions_data or positions) else {}
-            t0 = first_pos.get('token0', '')
-            t1 = first_pos.get('token1', '')
-
-            if receipts and t0 and t1:
-                from src.receipt_parser import parse_close_receipt
-                total_received = {}
-                for receipt_dict in receipts:
-                    try:
-                        received = parse_close_receipt(receipt_dict, wallet, t0, t1)
-                        for addr, amt in received.items():
-                            total_received[addr] = total_received.get(addr, 0) + amt
-                    except Exception as e:
-                        logger.debug(f"Receipt parse for swap amounts failed: {e}")
-
-                # Fill token amounts from receipts
-                for token in tokens_to_sell:
-                    addr_lower = token['address'].lower()
-                    token['amount'] = total_received.get(addr_lower, 0)
-                self._log(f"Token amounts from receipts: {[(t['symbol'], t['amount']) for t in tokens_to_sell]}")
-            else:
-                # Fallback: fetch balances (less precise — includes pre-existing balance)
-                # Mark that swap amounts came from balanceOf (includes previously claimed fees)
-                self._log("No receipts available, falling back to balanceOf...")
-                deferred = getattr(self, '_deferred_trade_data', None)
-                if deferred:
-                    deferred['swap_used_balance_fallback'] = True
-                self._close_data = close_data
-                self._balance_fetch_worker = BalanceFetchWorker(w3, wallet, tokens_to_sell)
-                self._balance_fetch_worker.result.connect(
-                    self._on_balances_fetched, Qt.ConnectionType.QueuedConnection
-                )
-                self._balance_fetch_worker.error.connect(
-                    lambda e: self._on_balance_fetch_error(e), Qt.ConnectionType.QueuedConnection
-                )
-                self._balance_fetch_worker.start()
-                return
-
-            # Save close_data and proceed directly (no async balance fetch needed)
             self._close_data = close_data
-            self._on_balances_fetched(tokens_to_sell)
+            self._balance_fetch_worker = BalanceFetchWorker(w3, wallet, tokens_to_sell)
+            self._balance_fetch_worker.result.connect(
+                self._on_balances_fetched, Qt.ConnectionType.QueuedConnection
+            )
+            self._balance_fetch_worker.error.connect(
+                lambda e: self._on_balance_fetch_error(e), Qt.ConnectionType.QueuedConnection
+            )
+            self._balance_fetch_worker.start()
 
         except Exception as e:
             logger.exception(f"Error showing swap preview: {e}")
