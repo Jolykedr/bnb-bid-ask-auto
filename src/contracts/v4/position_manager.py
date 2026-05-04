@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 from .abis import V4_POSITION_MANAGER_ABI, PANCAKE_V4_POSITION_MANAGER_ABI, V4Actions, PancakeV4Actions
 from .constants import V4Protocol, get_v4_addresses
 from .pool_manager import PoolKey, get_v4_unclaimed_fees
-from ...utils import NonceManager
+from ...utils import NonceManager, eip1559_gas_fields
 
 
 @dataclass
@@ -67,13 +67,19 @@ class V4PositionManager:
         self.proxy = proxy
 
         # Get addresses
+        addresses = get_v4_addresses(chain_id, protocol)
         if position_manager_address:
             self.position_manager_address = Web3.to_checksum_address(position_manager_address)
         else:
-            addresses = get_v4_addresses(chain_id, protocol)
             if not addresses:
                 raise ValueError(f"No V4 addresses found for chain {chain_id} and protocol {protocol}")
             self.position_manager_address = Web3.to_checksum_address(addresses.position_manager)
+
+        # PoolManager address is required for PancakeSwap V4 PoolKey encoding
+        # (PCS V4 PoolKey includes poolManager as a field; Uniswap V4 doesn't).
+        self.pool_manager_address = None
+        if addresses and addresses.pool_manager:
+            self.pool_manager_address = Web3.to_checksum_address(addresses.pool_manager)
 
         # Choose ABI based on protocol
         abi = PANCAKE_V4_POSITION_MANAGER_ABI if protocol == V4Protocol.PANCAKESWAP else V4_POSITION_MANAGER_ABI
@@ -442,30 +448,61 @@ class V4PositionManager:
         logger.debug(f"[V4 MINT] amount0_max={amount0_max}, amount1_max={amount1_max}")
         logger.debug(f"[V4 MINT] recipient={recipient}")
 
-        # Encode parameters
-        # V4 MINT_POSITION expects PositionConfig as first param:
-        # PositionConfig = (PoolKey poolKey, int24 tickLower, int24 tickUpper)
-        # PoolKey = (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks)
-        position_config = (pool_key.to_tuple(), tick_lower, tick_upper)
-
-        params = encode(
-            [
-                '((address,address,uint24,int24,address),int24,int24)',  # PositionConfig
-                'uint256',    # liquidity
-                'uint128',    # amount0Max
-                'uint128',    # amount1Max
-                'address',    # owner
-                'bytes'       # hookData
-            ],
-            [
-                position_config,
-                liquidity,
-                amount0_max,
-                amount1_max,
-                Web3.to_checksum_address(recipient),
-                hook_data
-            ]
-        )
+        # Encode parameters — format differs between Uniswap V4 and PancakeSwap V4
+        if self.protocol == V4Protocol.PANCAKESWAP:
+            # PancakeSwap V4: FLAT params with PancakeSwap PoolKey (6 fields)
+            # abi.encode(PoolKey, int24, int24, uint256, uint128, uint128, address, bytes)
+            # PoolKey = (currency0, currency1, hooks, poolManager, fee, parameters)
+            if not self.pool_manager_address:
+                raise ValueError(
+                    "pool_manager_address is required for PancakeSwap V4 mint encoding"
+                )
+            pcs_pool_key = pool_key.to_pancake_tuple(self.pool_manager_address)
+            params = encode(
+                [
+                    '(address,address,address,address,uint24,bytes32)',  # PancakeSwap PoolKey
+                    'int24',      # tickLower
+                    'int24',      # tickUpper
+                    'uint256',    # liquidity
+                    'uint128',    # amount0Max
+                    'uint128',    # amount1Max
+                    'address',    # owner
+                    'bytes'       # hookData
+                ],
+                [
+                    pcs_pool_key,
+                    tick_lower,
+                    tick_upper,
+                    liquidity,
+                    amount0_max,
+                    amount1_max,
+                    Web3.to_checksum_address(recipient),
+                    hook_data
+                ]
+            )
+        else:
+            # Uniswap V4: wrapped in PositionConfig struct
+            # PositionConfig = (PoolKey poolKey, int24 tickLower, int24 tickUpper)
+            # PoolKey = (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks)
+            position_config = (pool_key.to_tuple(), tick_lower, tick_upper)
+            params = encode(
+                [
+                    '((address,address,uint24,int24,address),int24,int24)',  # PositionConfig
+                    'uint256',    # liquidity
+                    'uint128',    # amount0Max
+                    'uint128',    # amount1Max
+                    'address',    # owner
+                    'bytes'       # hookData
+                ],
+                [
+                    position_config,
+                    liquidity,
+                    amount0_max,
+                    amount1_max,
+                    Web3.to_checksum_address(recipient),
+                    hook_data
+                ]
+            )
 
         # Return action + params
         return bytes([action]) + params
@@ -831,7 +868,7 @@ class V4PositionManager:
                 'from': self.account.address,
                 'nonce': nonce,
                 'gas': gas_limit,
-                'gasPrice': self.w3.eth.gas_price,
+                **eip1559_gas_fields(self.w3),
                 'value': 0  # For native ETH wrapping if needed
             })
 
@@ -946,7 +983,7 @@ class V4PositionManager:
                 'from': self.account.address,
                 'nonce': nonce,
                 'gas': gas_limit,
-                'gasPrice': self.w3.eth.gas_price
+                **eip1559_gas_fields(self.w3)
             })
 
             # Sign and send
@@ -1043,7 +1080,7 @@ class V4PositionManager:
                 'from': self.account.address,
                 'nonce': nonce,
                 'gas': gas_limit,
-                'gasPrice': self.w3.eth.gas_price
+                **eip1559_gas_fields(self.w3)
             })
 
             # Sign and send
@@ -1150,7 +1187,7 @@ class V4PositionManager:
                 'from': self.account.address,
                 'nonce': nonce,
                 'gas': gas_limit,
-                'gasPrice': self.w3.eth.gas_price
+                **eip1559_gas_fields(self.w3)
             })
 
             logger.debug(f"[V4] Sending batch close TX, gas limit: {gas_limit}")
@@ -1256,7 +1293,7 @@ class V4PositionManager:
                 'from': self.account.address,
                 'nonce': nonce,
                 'gas': gas_limit,
-                'gasPrice': self.w3.eth.gas_price,
+                **eip1559_gas_fields(self.w3),
                 'value': 0
             })
 
@@ -1356,7 +1393,7 @@ class V4PositionManager:
                 'from': self.account.address,
                 'nonce': nonce,
                 'gas': gas_limit,
-                'gasPrice': self.w3.eth.gas_price,
+                **eip1559_gas_fields(self.w3),
                 'value': 0
             })
 
@@ -1462,7 +1499,7 @@ class V4PositionManager:
                 'from': self.account.address,
                 'nonce': nonce,
                 'gas': gas_limit,
-                'gasPrice': self.w3.eth.gas_price,
+                **eip1559_gas_fields(self.w3),
                 'value': 0
             })
 

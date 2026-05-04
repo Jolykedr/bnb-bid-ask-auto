@@ -79,6 +79,8 @@ def _make_pm(mock_w3, mock_account=None, protocol=V4Protocol.PANCAKESWAP):
         pm.protocol = protocol
         pm.chain_id = 56
         pm.position_manager_address = "0x55f4c8abA71A1e923edC303eb4fEfF14608cC226"
+        # PoolManager address — used by PancakeSwap V4 PoolKey encoding (CLPoolManager on BNB)
+        pm.pool_manager_address = "0xa0FfB9c1CE1Fe56963B0321B32E7A0302114058b"
 
         if protocol == V4Protocol.PANCAKESWAP:
             pm.actions = PancakeV4Actions
@@ -1212,3 +1214,34 @@ class TestV4PositionManager:
         assert action_ids[0] == PancakeV4Actions.DECREASE_LIQUIDITY
         assert action_ids[1] == PancakeV4Actions.BURN_POSITION
         assert action_ids[2] == PancakeV4Actions.TAKE_PAIR
+
+    def test_mint_payload_differs_between_uniswap_and_pancakeswap(self, mock_w3, pool_key):
+        """PCS V4 PoolKey (6 fields + poolManager) and Uniswap V4 PoolKey (5 fields)
+        produce different ABI-encoded mint payloads. If they were identical, the PCS V4
+        contract would revert (wrong selector / wrong PoolKey layout).
+        """
+        pm_uni = _make_pm(mock_w3, protocol=V4Protocol.UNISWAP)
+        pm_pcs = _make_pm(mock_w3, protocol=V4Protocol.PANCAKESWAP)
+
+        kwargs = dict(
+            pool_key=pool_key,
+            tick_lower=-600,
+            tick_upper=600,
+            liquidity=10**18,
+            amount0_max=10**18,
+            amount1_max=300 * 10**18,
+            recipient=WALLET_ADDR,
+        )
+        uni_payload = pm_uni.encode_mint_position(**kwargs)
+        pcs_payload = pm_pcs.encode_mint_position(**kwargs)
+
+        # Action codes happen to match (both use 0x02 for MINT_POSITION),
+        # but the encoded params must differ — PCS includes pool_manager_address,
+        # Uniswap doesn't.
+        assert uni_payload != pcs_payload, (
+            "PCS V4 mint encoding must differ from Uniswap V4 — otherwise C1 fix didn't apply"
+        )
+        # PCS payload includes the CLPoolManager address as a field
+        pcs_pm_addr_lower = "a0ffb9c1ce1fe56963b0321b32e7a0302114058b"
+        assert pcs_pm_addr_lower in pcs_payload.hex().lower()
+        assert pcs_pm_addr_lower not in uni_payload.hex().lower()
