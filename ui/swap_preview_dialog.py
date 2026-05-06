@@ -354,13 +354,28 @@ class SwapPreviewDialog(QDialog):
         self.reject()
 
     def _cleanup_quote_worker(self):
-        """Stop and clean up the quote worker if running."""
-        if self.quote_worker and self.quote_worker.isRunning():
-            self.quote_worker.quit()
-            self.quote_worker.wait(5000)
-        if self.quote_worker:
-            self.quote_worker.deleteLater()
-            self.quote_worker = None
+        """Stop and clean up the quote worker if running.
+
+        H6-safe: never deleteLater() while the thread is still executing.
+        For long-running quote chains (3-5 sequential HTTP calls, 8-15s
+        on slow proxies) wait(5000) often times out — defer destruction
+        to the `finished` signal in that case.
+        """
+        w = self.quote_worker
+        if w is None:
+            return
+        self.quote_worker = None
+        try:
+            if w.isRunning():
+                w.quit()
+                w.wait(5000)
+            if w.isRunning():
+                # Still alive — defer destruction until run() returns.
+                w.finished.connect(w.deleteLater)
+            else:
+                w.deleteLater()
+        except RuntimeError:
+            pass
 
     def closeEvent(self, event):
         """Очистка при закрытии."""

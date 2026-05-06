@@ -63,6 +63,11 @@ def _get_conn() -> sqlite3.Connection:
     os.makedirs(DB_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL")
+    # Wait up to 2s when another writer holds the lock instead of failing
+    # immediately. Typical write completes in <50ms, so 2s is a 40x buffer
+    # for normal contention (dashboard refresh racing against save_trade).
+    # Persistent failures still surface as OperationalError.
+    conn.execute("PRAGMA busy_timeout=2000")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -148,24 +153,42 @@ def _get_conn() -> sqlite3.Connection:
 
 
 def save_trade(record: TradeRecord) -> int:
-    """Insert a closed trade record. Returns the row id."""
-    conn = _get_conn()
-    try:
-        cur = conn.execute(
-            """INSERT INTO trades
-               (pair, chain_id, protocol, n_positions,
-                invested_usd, received_usd, pnl_usd, pnl_percent,
-                tx_hash, closed_at, ladder_group_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (record.pair, record.chain_id, record.protocol,
-             record.n_positions, record.invested_usd, record.received_usd,
-             record.pnl_usd, record.pnl_percent,
-             record.tx_hash, record.closed_at, record.ladder_group_id),
-        )
-        conn.commit()
-        return cur.lastrowid
-    finally:
-        conn.close()
+    """Insert a closed trade record. Returns the row id.
+
+    Retry up to 3 times on `database is locked` (rare with busy_timeout=2s,
+    but possible if AV/backup briefly holds the file). PnL history is
+    user-visible and worth retrying for; other writers tolerate failure.
+    Other OperationalErrors (constraint violations, etc.) propagate
+    immediately so real bugs aren't masked.
+    """
+    last_err: Optional[Exception] = None
+    for attempt in range(3):
+        conn = _get_conn()
+        try:
+            cur = conn.execute(
+                """INSERT INTO trades
+                   (pair, chain_id, protocol, n_positions,
+                    invested_usd, received_usd, pnl_usd, pnl_percent,
+                    tx_hash, closed_at, ladder_group_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (record.pair, record.chain_id, record.protocol,
+                 record.n_positions, record.invested_usd, record.received_usd,
+                 record.pnl_usd, record.pnl_percent,
+                 record.tx_hash, record.closed_at, record.ladder_group_id),
+            )
+            conn.commit()
+            return cur.lastrowid
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e).lower():
+                raise
+            last_err = e
+            logger.warning(f"save_trade locked (attempt {attempt+1}/3): {e}")
+            time.sleep(0.5 * (attempt + 1))
+        finally:
+            conn.close()
+    # All 3 attempts exhausted — surface the lock failure to the caller
+    # so the UI can warn the user that PnL history wasn't recorded.
+    raise last_err  # type: ignore[misc]
 
 
 def get_all_trades() -> List[TradeRecord]:

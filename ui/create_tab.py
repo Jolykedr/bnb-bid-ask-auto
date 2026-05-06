@@ -347,7 +347,8 @@ class LoadPoolWorker(QThread):
 
         pool_found = False
         errors = []
-        for protocol, protocol_name in [(V4Protocol.UNISWAP, "Uniswap V4"), (V4Protocol.PANCAKESWAP, "PancakeSwap V4")]:
+        # PCS V4 removed — CreateTab supports Uniswap V4 only.
+        for protocol, protocol_name in [(V4Protocol.UNISWAP, "Uniswap V4")]:
             try:
                 pool_manager = V4PoolManager(w3, protocol=protocol, chain_id=self.chain_id)
                 self.progress.emit(f"Checking {protocol_name}...")
@@ -1083,6 +1084,7 @@ class CreateTab(QWidget):
         self.setup_ui()
         self._load_saved_wallet()
         self._load_proxy_from_settings()
+        self._load_rpc_from_settings()
 
     def _reset_pool_state(self):
         """Reset all pool-related state variables. Call when switching tokens/protocols."""
@@ -1150,14 +1152,12 @@ class CreateTab(QWidget):
         network_row.addWidget(self.network_combo)
         wallet_layout.addLayout(network_row)
 
-        # RPC URL
-        rpc_row = QHBoxLayout()
-        rpc_row.addWidget(QLabel("RPC URL:"))
+        # RPC URL — hidden (managed in Settings dialog → Network tab).
+        # Field kept as in-memory holder so the rest of the tab can still
+        # read self.rpc_input.text() unchanged.
         self.rpc_input = QLineEdit()
         self.rpc_input.setText(BNB_CHAIN.rpc_url)
-        self.rpc_input.setPlaceholderText("https://...")
-        rpc_row.addWidget(self.rpc_input)
-        wallet_layout.addLayout(rpc_row)
+        self.rpc_input.hide()
 
         # Private key
         key_row = QHBoxLayout()
@@ -1199,40 +1199,21 @@ class CreateTab(QWidget):
         self.balance_label.setWordWrap(True)
         wallet_layout.addWidget(self.balance_label)
 
-        # --- Proxy Settings ---
-        proxy_label = QLabel("Proxy (optional):")
-        wallet_layout.addWidget(proxy_label)
-
-        proxy_row = QHBoxLayout()
+        # --- Proxy: hidden — managed in Settings dialog → Network tab.
+        # Hidden fields kept as in-memory holders so existing call sites
+        # (_get_proxy_config, etc.) keep working without changes.
         self.proxy_type_combo = QComboBox()
         self.proxy_type_combo.addItems(["None", "SOCKS5", "HTTP"])
-        self.proxy_type_combo.setMaximumWidth(80)
         self.proxy_type_combo.currentIndexChanged.connect(self._on_proxy_type_changed)
-        proxy_row.addWidget(self.proxy_type_combo)
+        self.proxy_type_combo.hide()
 
         self.proxy_input = QLineEdit()
-        self.proxy_input.setPlaceholderText("host:port (e.g. 127.0.0.1:1080)")
-        self.proxy_input.setEnabled(False)
-        proxy_row.addWidget(self.proxy_input)
-        wallet_layout.addLayout(proxy_row)
-
-        # Proxy auth (optional)
-        proxy_auth_row = QHBoxLayout()
-        proxy_auth_row.addWidget(QLabel("Auth:"))
+        self.proxy_input.hide()
         self.proxy_user_input = QLineEdit()
-        self.proxy_user_input.setPlaceholderText("username")
-        self.proxy_user_input.setEnabled(False)
-        self.proxy_user_input.setMaximumWidth(100)
-        proxy_auth_row.addWidget(self.proxy_user_input)
-
+        self.proxy_user_input.hide()
         self.proxy_pass_input = QLineEdit()
-        self.proxy_pass_input.setPlaceholderText("password")
         self.proxy_pass_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.proxy_pass_input.setEnabled(False)
-        self.proxy_pass_input.setMaximumWidth(100)
-        proxy_auth_row.addWidget(self.proxy_pass_input)
-        proxy_auth_row.addStretch()
-        wallet_layout.addLayout(proxy_auth_row)
+        self.proxy_pass_input.hide()
 
         left_layout.addWidget(wallet_group)
 
@@ -1339,9 +1320,14 @@ class CreateTab(QWidget):
         protocol_row = QHBoxLayout()
         protocol_row.addWidget(QLabel("Protocol:"))
         self.protocol_combo = QComboBox()
+        # PancakeSwap V4 (Infinity) is not exposed here:
+        #   - PCS V4 PoolKey encoding still has known gaps (C1 init half,
+        #     hooks_registration_bitmap), so `initializePool` and any pool
+        #     with non-zero hooks bitmap can revert.
+        #   - Read-only inspection (load-pool) of an existing PCS V4 pool is
+        #     still possible via ManageTab; CreateTab only creates new ladders.
         self.protocol_combo.addItems([
             "PancakeSwap V3",
-            "PancakeSwap V4",
             "Uniswap V3",
             "Uniswap V4"
         ])
@@ -1555,9 +1541,7 @@ class CreateTab(QWidget):
         self._on_token1_combo_changed(0)
 
         # Default to Uniswap V4 (triggers _on_protocol_changed to show correct fee UI)
-        self.protocol_combo.setCurrentIndex(3)
-        # Apply chain-specific protocol restrictions (PCS V4 = BSC only)
-        self._update_protocol_options()
+        self.protocol_combo.setCurrentIndex(2)
 
     def _toggle_key_visibility(self):
         """Toggle private key visibility."""
@@ -1649,50 +1633,11 @@ class CreateTab(QWidget):
         elif index == 2:
             self.rpc_input.setText(BASE.rpc_url)
 
+        # If user set a custom RPC for THIS network in Settings dialog → use it.
+        self._load_rpc_from_settings()
+
         # Rebuild token combos for the new network
         self._rebuild_token_combos()
-        # PancakeSwap V4 is BSC-only — disable on ETH/Base
-        self._update_protocol_options()
-
-    def _set_protocol_safe(self, idx: int, fallback: int = 3):
-        """setCurrentIndex with fallback if target item is disabled.
-
-        Used when code programmatically switches to a protocol that may be
-        disabled on the current chain (e.g. PCS V4 on ETH).
-        """
-        model = self.protocol_combo.model()
-        item = model.item(idx) if model else None
-        if item is not None and not item.isEnabled():
-            idx = fallback
-        self.protocol_combo.setCurrentIndex(idx)
-
-    def _update_protocol_options(self):
-        """Disable PCS V4 in protocol dropdown for non-BSC chains.
-
-        PCS V4 (Infinity) is only deployed on BNB Chain. For ETH/Base,
-        the dropdown item is greyed out and clicking it switches to Uniswap V4.
-        """
-        network_idx = self.network_combo.currentIndex()
-        is_bsc = (network_idx == 0)
-        pcs_v4_idx = self.protocol_combo.findText("PancakeSwap V4")
-        if pcs_v4_idx < 0:
-            return
-        model = self.protocol_combo.model()
-        item = model.item(pcs_v4_idx)
-        if item is None:
-            return
-        # Toggle enabled state via Qt::ItemIsEnabled flag
-        from PyQt6.QtCore import Qt
-        flags = item.flags()
-        if is_bsc:
-            item.setFlags(flags | Qt.ItemFlag.ItemIsEnabled)
-        else:
-            item.setFlags(flags & ~Qt.ItemFlag.ItemIsEnabled)
-            # If currently selected → switch to Uniswap V4
-            if self.protocol_combo.currentIndex() == pcs_v4_idx:
-                uni_v4_idx = self.protocol_combo.findText("Uniswap V4")
-                if uni_v4_idx >= 0:
-                    self.protocol_combo.setCurrentIndex(uni_v4_idx)
 
     def _get_current_network(self):
         """Get current network config based on dropdown selection."""
@@ -2018,29 +1963,36 @@ class CreateTab(QWidget):
 
         self.balance_label.setText("Loading balances...")
 
-        # Clean up previous balance worker
-        if hasattr(self, '_balance_worker') and self._balance_worker is not None:
-            if self._balance_worker.isRunning():
-                self._balance_worker.quit()
-                self._balance_worker.wait(2000)
-            self._balance_worker.deleteLater()
+        # Clean up previous balance worker (H6-safe: keep ref alive if still running)
+        if getattr(self, '_balance_worker', None) is not None:
+            old = self._balance_worker
             self._balance_worker = None
+            self._safe_cleanup_worker(old)
 
         self._balance_worker = BalanceWorker(rpc_url, wallet_address, tokens, proxy)
         self._balance_worker.result.connect(self._on_balances_loaded)
         self._balance_worker.error.connect(lambda e: self.balance_label.setText(f"Error: {e}"))
-        self._balance_worker.finished.connect(lambda: self._cleanup_balance_worker())
+        self._balance_worker.finished.connect(
+            lambda w=self._balance_worker: self._cleanup_balance_worker(w)
+        )
         self._balance_worker.start()
 
     def _on_balances_loaded(self, text: str):
         """Handle balance worker result."""
         self.balance_label.setText(text)
 
-    def _cleanup_balance_worker(self):
-        """Clean up balance worker after completion."""
-        if hasattr(self, '_balance_worker') and self._balance_worker is not None:
-            self._balance_worker.deleteLater()
+    def _cleanup_balance_worker(self, worker):
+        """Clean up the specific balance worker after completion.
+
+        Bound to the worker via lambda default-arg so concurrent overwrites
+        don't accidentally deleteLater() the new worker.
+        """
+        if self._balance_worker is worker:
             self._balance_worker = None
+        try:
+            worker.deleteLater()
+        except RuntimeError:
+            pass
 
     def _get_fee_tier(self) -> int:
         """Get fee tier from combo."""
@@ -2593,12 +2545,11 @@ class CreateTab(QWidget):
         self._log(f"Auto-detected invert_price: {invert_price}")
         proxy = self._get_proxy_config()
 
-        # Clean up previous pool creation worker
-        if hasattr(self, '_pool_create_worker') and self._pool_create_worker is not None:
-            if self._pool_create_worker.isRunning():
-                self._pool_create_worker.quit()
-                self._pool_create_worker.wait(2000)
-            self._pool_create_worker.deleteLater()
+        # Clean up previous pool creation worker (H6-safe)
+        if getattr(self, '_pool_create_worker', None) is not None:
+            old = self._pool_create_worker
+            self._pool_create_worker = None
+            self._safe_cleanup_worker(old)
 
         self._pool_create_worker = CreatePoolOnlyWorker(
             rpc_url=rpc_url,
@@ -2618,7 +2569,9 @@ class CreateTab(QWidget):
         self._pool_create_worker.progress.connect(self._log)
         self._pool_create_worker.result.connect(self._on_pool_created)
         self._pool_create_worker.error.connect(self._on_pool_create_error)
-        self._pool_create_worker.finished.connect(lambda: self._cleanup_pool_create_worker())
+        self._pool_create_worker.finished.connect(
+            lambda w=self._pool_create_worker: self._cleanup_pool_create_worker(w)
+        )
         self._pool_create_worker.start()
 
     def _on_pool_created(self, tx_hash, pool_id, success):
@@ -2659,11 +2612,18 @@ class CreateTab(QWidget):
         self._log(f"ERROR: {error_msg}")
         QMessageBox.critical(self, "Error", f"Pool creation failed:\n{error_msg}")
 
-    def _cleanup_pool_create_worker(self):
-        """Clean up pool creation worker after completion."""
-        if hasattr(self, '_pool_create_worker') and self._pool_create_worker is not None:
-            self._pool_create_worker.deleteLater()
+    def _cleanup_pool_create_worker(self, worker):
+        """Clean up the specific pool creation worker after completion.
+
+        Bound to the worker via lambda default-arg so concurrent overwrites
+        don't accidentally deleteLater() the new worker.
+        """
+        if self._pool_create_worker is worker:
             self._pool_create_worker = None
+        try:
+            worker.deleteLater()
+        except RuntimeError:
+            pass
 
     def update_custom_tokens(self, tokens: list):
         """Update combo boxes with custom tokens from Advanced tab."""
@@ -2721,22 +2681,39 @@ class CreateTab(QWidget):
         slippage = tx_settings.value("tx/slippage", 0.5, type=float)
         self.slippage_spin.setValue(slippage)
         self._load_proxy_from_settings()
+        self._load_rpc_from_settings()
 
     def _load_proxy_from_settings(self):
-        """Load proxy config from QSettings into UI fields (if not overridden by user)."""
+        """Load proxy config from Settings dialog into hidden in-memory fields.
+
+        Settings dialog is the single source of truth — always sync (overwrite),
+        since the CreateTab proxy widgets are hidden and user can't edit them
+        directly anymore.
+        """
         s = QSettings("BNBLiquidityLadder", "Settings")
         saved_type = s.value("proxy/type", 0, type=int)
         saved_addr = s.value("proxy/address", "")
         saved_user = s.value("proxy/username", "")
         saved_pass = s.value("proxy/password", "")
 
-        # Only apply if UI proxy is currently empty (don't overwrite user's manual input)
-        current_addr = self.proxy_input.text().strip()
-        if not current_addr and saved_addr:
-            self.proxy_type_combo.setCurrentIndex(saved_type)
-            self.proxy_input.setText(saved_addr)
-            self.proxy_user_input.setText(saved_user)
-            self.proxy_pass_input.setText(saved_pass)
+        self.proxy_type_combo.setCurrentIndex(saved_type)
+        self.proxy_input.setText(saved_addr)
+        self.proxy_user_input.setText(saved_user)
+        self.proxy_pass_input.setText(saved_pass)
+
+    def _load_rpc_from_settings(self):
+        """Load RPC URL from Settings dialog → Network tab.
+
+        Settings dialog has a single rpc_url field. We apply it only when the
+        currently-selected network in CreateTab matches the network for which
+        the URL was saved (Settings has its own network_combo). Otherwise we
+        keep the chain default to avoid hitting BSC RPC for an Ethereum tx.
+        """
+        s = QSettings("BNBLiquidityLadder", "Settings")
+        saved_rpc = (s.value("network/rpc_url", "") or "").strip()
+        saved_net = s.value("network/default_network", 0, type=int)
+        if saved_rpc and saved_net == self.network_combo.currentIndex():
+            self.rpc_input.setText(saved_rpc)
 
     def _load_saved_wallet(self):
         """Load saved wallet from settings (with master password decryption)."""
@@ -2916,17 +2893,11 @@ class CreateTab(QWidget):
         proxy_config = self._get_proxy_config()
         proxy_url = proxy_config.get("https") if proxy_config else None
 
-        # Clean up previous worker
+        # Clean up previous worker (H6-safe)
         if self._search_pool_worker is not None:
             old = self._search_pool_worker
             self._search_pool_worker = None
-            try:
-                if old.isRunning():
-                    old.quit()
-                    old.wait(3000)
-                old.deleteLater()
-            except RuntimeError:
-                pass
+            self._safe_cleanup_worker(old)
 
         self.search_pool_btn.setEnabled(False)
         self.search_pool_btn.setText("...")
@@ -2975,17 +2946,11 @@ class CreateTab(QWidget):
         proxy_config = self._get_proxy_config()
         proxy_url = proxy_config.get("https") if proxy_config else None
 
-        # Cleanup previous worker
+        # Cleanup previous worker (H6-safe)
         if self._ref_price_worker is not None:
             old = self._ref_price_worker
             self._ref_price_worker = None
-            try:
-                if old.isRunning():
-                    old.quit()
-                    old.wait(3000)
-                old.deleteLater()
-            except RuntimeError:
-                pass
+            self._safe_cleanup_worker(old)
 
         w = ReferencePriceWorker(
             volatile_token, network.chain_id, dex_key, api_key,
@@ -3167,17 +3132,11 @@ class CreateTab(QWidget):
         existing_t0 = self.token0_input.text().strip()
         existing_t1 = self.token1_input.text().strip()
 
-        # Cleanup previous worker to prevent GC segfault on running QThread
-        if hasattr(self, '_load_pool_worker') and self._load_pool_worker is not None:
+        # Cleanup previous worker (H6-safe: keep ref alive if still running)
+        if getattr(self, '_load_pool_worker', None) is not None:
             old = self._load_pool_worker
             self._load_pool_worker = None
-            try:
-                if old.isRunning():
-                    old.quit()
-                    old.wait(3000)
-                old.deleteLater()
-            except RuntimeError:
-                pass  # C++ object already deleted by previous deleteLater
+            self._safe_cleanup_worker(old)
 
         w = LoadPoolWorker(
             rpc_url, pool_input, network.chain_id, proxy,
@@ -3278,11 +3237,14 @@ class CreateTab(QWidget):
                 # Set fee
                 self.custom_fee_spin.setValue(fee_percent)
 
-                # Set protocol combo
-                if v4_protocol == V4Protocol.UNISWAP:
-                    self.protocol_combo.setCurrentIndex(3)
-                else:
-                    self._set_protocol_safe(1, fallback=3)
+                # Set protocol combo. PCS V4 is no longer in the dropdown
+                # (CreateTab is Uniswap-V4-only), so always select Uniswap V4
+                # regardless of which protocol the loader detected the pool in.
+                # If the user actually loaded a PCS V4 pool ID, the create
+                # path won't match — but the warning label below already says
+                # the pool was found on PancakeSwap, so the user will see the
+                # mismatch.
+                self.protocol_combo.setCurrentIndex(2)
 
                 # Build info label
                 if subgraph:
@@ -3322,12 +3284,9 @@ class CreateTab(QWidget):
                 self.pool_info_label.setStyleSheet("color: #fdcb6e;")
                 self.loaded_v4_pool_id = None
 
-                # Switch to V4 mode
-                idx = self.protocol_combo.currentIndex()
-                if idx == 0:
-                    self._set_protocol_safe(1, fallback=3)
-                elif idx == 2:
-                    self.protocol_combo.setCurrentIndex(3)
+                # Switch to V4 mode (Uniswap V4 = idx 2 — PCS V4 removed)
+                if self.protocol_combo.currentIndex() != 2:
+                    self.protocol_combo.setCurrentIndex(2)
 
                 for err in data.get('errors', []):
                     self._log(f"  {err}")
@@ -3354,13 +3313,14 @@ class CreateTab(QWidget):
                 self._set_combo_symbol(self.token0_combo, parts[0])
                 self._set_combo_symbol(self.token1_combo, parts[1])
 
-            # Set fee combo
+            # Set fee combo. Indices after PCS V4 removal:
+            #   0 = PancakeSwap V3, 1 = Uniswap V3, 2 = Uniswap V4
             fee_map = {500: 0, 2500: 1, 3000: 2, 10000: 3}
             detected = self._detected_v3_dex
             if detected and hasattr(detected, 'name'):
-                v3_idx = 2 if "uniswap" in detected.name.lower() else 0
+                v3_idx = 1 if "uniswap" in detected.name.lower() else 0
             else:
-                v3_idx = 0 if network.chain_id in [56, 97] else 2
+                v3_idx = 0 if network.chain_id in [56, 97] else 1
 
             if fee in fee_map:
                 self.protocol_combo.setCurrentIndex(v3_idx)

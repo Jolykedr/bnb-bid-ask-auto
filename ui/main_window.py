@@ -117,13 +117,11 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
-        # Edit menu
-        edit_menu = menubar.addMenu("Edit")
-
-        settings_action = QAction("Settings...", self)
+        # Settings (top-level — no submenu)
+        settings_action = QAction("Settings", self)
         settings_action.setShortcut("Ctrl+,")
         settings_action.triggered.connect(self._open_settings)
-        edit_menu.addAction(settings_action)
+        menubar.addAction(settings_action)
 
         # View menu
         view_menu = menubar.addMenu("View")
@@ -207,52 +205,59 @@ class MainWindow(QMainWindow):
         event.accept()
 
     def _cleanup_workers(self):
-        """Stop all running workers before closing."""
+        """Stop all running workers before closing.
+
+        H6-safe pattern: only deleteLater() if the worker is already finished.
+        For still-running workers we ask them to quit, wait briefly, and if
+        they're STILL alive we defer deleteLater() to the worker's `finished`
+        signal — Qt won't abort with `Destroyed while thread is still running`.
+        """
+        def _safe_close(w, timeout_ms: int = 3000):
+            """Close one worker; never deleteLater() while it's still alive."""
+            if w is None:
+                return
+            try:
+                if w.isRunning():
+                    w.quit()
+                    w.wait(timeout_ms)
+                if w.isRunning():
+                    # Still alive — defer destruction until run() returns.
+                    w.finished.connect(w.deleteLater)
+                else:
+                    w.deleteLater()
+            except RuntimeError:
+                # C++ object already gone — nothing to do.
+                pass
+
         # Create tab worker
         if hasattr(self, 'create_tab') and self.create_tab.worker is not None:
-            if self.create_tab.worker.isRunning():
-                self.create_tab.worker.quit()
-                self.create_tab.worker.wait(3000)
-            self.create_tab.worker.deleteLater()
+            _safe_close(self.create_tab.worker)
             self.create_tab.worker = None
 
         # Manage tab workers
         if hasattr(self, 'manage_tab'):
             # Main worker (BatchClose, ClosePositions)
             if hasattr(self.manage_tab, 'worker') and self.manage_tab.worker is not None:
-                if self.manage_tab.worker.isRunning():
-                    self.manage_tab.worker.quit()
-                    self.manage_tab.worker.wait(3000)
-                self.manage_tab.worker.deleteLater()
+                _safe_close(self.manage_tab.worker)
                 self.manage_tab.worker = None
 
             # Load position workers (active + dying)
             for w_list in ('_active_workers', 'load_workers', '_dying_workers'):
                 workers = getattr(self.manage_tab, w_list, [])
                 for w in workers:
-                    if w.isRunning():
-                        w.quit()
-                        w.wait(2000)
-                    w.deleteLater()
+                    _safe_close(w, timeout_ms=2000)
                 workers.clear()
 
             # Scan worker
             if hasattr(self.manage_tab, 'scan_worker') and self.manage_tab.scan_worker is not None:
-                if self.manage_tab.scan_worker.isRunning():
-                    self.manage_tab.scan_worker.quit()
-                    self.manage_tab.scan_worker.wait(3000)
-                self.manage_tab.scan_worker.deleteLater()
+                _safe_close(self.manage_tab.scan_worker)
                 self.manage_tab.scan_worker = None
 
-        # Manage tab swap worker + balance fetch worker
-        if hasattr(self, 'manage_tab'):
+            # Swap worker + balance fetch worker
             for attr in ('_swap_worker', '_balance_fetch_worker'):
                 w = getattr(self.manage_tab, attr, None)
                 if w is not None:
-                    if w.isRunning():
-                        w.quit()
-                        w.wait(3000)
-                    w.deleteLater()
+                    _safe_close(w)
                     setattr(self.manage_tab, attr, None)
 
         # Create tab extra workers
@@ -261,17 +266,11 @@ class MainWindow(QMainWindow):
                          '_search_pool_worker', '_ref_price_worker'):
                 w = getattr(self.create_tab, attr, None)
                 if w is not None:
-                    if w.isRunning():
-                        w.quit()
-                        w.wait(3000)
-                    w.deleteLater()
+                    _safe_close(w)
                     setattr(self.create_tab, attr, None)
-            # Clean up dying workers
+            # Clean up dying workers (already in safe-cleanup state)
             for w in getattr(self.create_tab, '_dying_workers', []):
-                if w.isRunning():
-                    w.quit()
-                    w.wait(2000)
-                w.deleteLater()
+                _safe_close(w, timeout_ms=2000)
             if hasattr(self.create_tab, '_dying_workers'):
                 self.create_tab._dying_workers.clear()
 
