@@ -63,6 +63,18 @@ licensing/.keys/
 licensing/HOWTO.md
 private_key.pem
 *.pem
+license.key
+license.lic
+.license_cache
+
+# Claude Code config / memory
+.claude/
+
+# Coverage and test stdout dumps
+.coverage
+test_err.txt
+test_out.txt
+test_run.txt
 
 # Audit
 AUDIT.md
