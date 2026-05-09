@@ -3185,6 +3185,8 @@ class ManageTab(QWidget):
 
         self._log(f"Starting batch close of {len(v4_positions)} V4 positions...")
 
+        if self.worker is not None:
+            self._safe_cleanup_worker(self.worker)
         self.worker = BatchCloseWorker(
             self.provider, v4_positions,
             initial_investment=initial_investment,
@@ -3275,6 +3277,8 @@ class ManageTab(QWidget):
 
         with QMutexLocker(self._positions_mutex):
             positions_snapshot = dict(self.positions_data)
+        if self._collect_worker is not None:
+            self._safe_cleanup_worker(self._collect_worker)
         self._collect_worker = BatchCollectWorker(
             self.provider, positions_snapshot, collect_ids, chain_id
         )
@@ -3442,6 +3446,8 @@ class ManageTab(QWidget):
 
         with QMutexLocker(self._positions_mutex):
             positions_snapshot = dict(self.positions_data)
+        if self.worker is not None:
+            self._safe_cleanup_worker(self.worker)
         self.worker = ClosePositionsWorker(
             self.provider, token_ids, positions_snapshot,
             chain_id=chain_id,
@@ -3936,6 +3942,8 @@ class ManageTab(QWidget):
             initial_investment = self.initial_investment_spin.value()
             swap_mode = getattr(self, '_pending_swap_mode', 'auto')
 
+            if getattr(self, '_swap_worker', None) is not None:
+                self._safe_cleanup_worker(self._swap_worker)
             self._swap_worker = SwapWorker(
                 w3, chain_id, tokens,
                 private_key=self._pending_private_key,
