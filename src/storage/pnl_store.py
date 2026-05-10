@@ -32,6 +32,7 @@ class TradeRecord:
     tx_hash: str
     closed_at: float         # unix timestamp
     ladder_group_id: Optional[str] = None  # UUID grouping positions created together
+    swap_tx_hash: Optional[str] = None     # auto-sell swap TX hash, if applicable
 
 
 @dataclass
@@ -148,6 +149,13 @@ def _get_conn() -> sqlite3.Connection:
     except sqlite3.OperationalError:
         pass  # Column already exists
 
+    # Migration: add swap_tx_hash column to trades (for auto-sell PnL audit trail)
+    try:
+        conn.execute("ALTER TABLE trades ADD COLUMN swap_tx_hash TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
     conn.commit()
     return conn
 
@@ -169,12 +177,13 @@ def save_trade(record: TradeRecord) -> int:
                 """INSERT INTO trades
                    (pair, chain_id, protocol, n_positions,
                     invested_usd, received_usd, pnl_usd, pnl_percent,
-                    tx_hash, closed_at, ladder_group_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    tx_hash, closed_at, ladder_group_id, swap_tx_hash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (record.pair, record.chain_id, record.protocol,
                  record.n_positions, record.invested_usd, record.received_usd,
                  record.pnl_usd, record.pnl_percent,
-                 record.tx_hash, record.closed_at, record.ladder_group_id),
+                 record.tx_hash, record.closed_at, record.ladder_group_id,
+                 record.swap_tx_hash),
             )
             conn.commit()
             return cur.lastrowid
@@ -198,7 +207,7 @@ def get_all_trades() -> List[TradeRecord]:
         rows = conn.execute(
             "SELECT id, pair, chain_id, protocol, n_positions, "
             "invested_usd, received_usd, pnl_usd, pnl_percent, "
-            "tx_hash, closed_at, ladder_group_id "
+            "tx_hash, closed_at, ladder_group_id, swap_tx_hash "
             "FROM trades ORDER BY closed_at DESC"
         ).fetchall()
         return [TradeRecord(*r) for r in rows]
@@ -213,7 +222,7 @@ def get_recent_trades(limit: int = 5) -> List[TradeRecord]:
         rows = conn.execute(
             "SELECT id, pair, chain_id, protocol, n_positions, "
             "invested_usd, received_usd, pnl_usd, pnl_percent, "
-            "tx_hash, closed_at, ladder_group_id "
+            "tx_hash, closed_at, ladder_group_id, swap_tx_hash "
             "FROM trades ORDER BY closed_at DESC LIMIT ?",
             (limit,)
         ).fetchall()

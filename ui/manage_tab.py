@@ -39,7 +39,12 @@ from src.storage.pnl_store import (
     get_claimed_fees_usd_for_tokens, get_open_positions,
 )
 from src.math.apr import calc_position_apr, calc_aggregate_apr
-from src.receipt_parser import parse_close_receipt, calculate_usd_value
+from src.receipt_parser import (
+    parse_close_receipt,
+    parse_swap_receipt,
+    parse_swap_volatile_sent,
+    calculate_usd_value,
+)
 from ui.swap_preview_dialog import SwapPreviewDialog
 
 logger = logging.getLogger(__name__)
@@ -1849,8 +1854,11 @@ class ManageTab(QWidget):
                 return
             chain_id = getattr(self.provider, 'chain_id', 56)
 
-            # Recalculate invested_usd from on-chain data before saving
-            self._recalc_invested_usd()
+            # Note: invested_usd is preserved from user input (total typed in Create tab).
+            # We previously called _recalc_invested_usd() here to align stored invested
+            # with on-chain state, but this caused PnL to hide mint slippage from the user
+            # (e.g. typed $0.50 → on-chain $0.45 → PnL excluded the $0.05 slippage).
+            # Variant B: keep user-input invested as-is; PnL reflects full lifecycle cost.
 
             # Snapshot under mutex
             with QMutexLocker(self._positions_mutex):
@@ -3497,16 +3505,24 @@ class ManageTab(QWidget):
                 closed_token_ids = token_ids
             previously_claimed = get_claimed_fees_usd_for_tokens(closed_token_ids)
 
-            # PnL is ALWAYS derived from close TX receipts — even when a swap happens.
-            # Reason: the swap is intentionally on the full wallet balance (which can
-            # include previously-accumulated tokens unrelated to this close), so
-            # `received_from_swap` is not a reliable per-position figure.
-            # Receipts give us the EXACT amount that left the position(s) being closed,
-            # converted to USD at close-time price.
+            # PnL flow (mirrors web bnb-web/backend/api/pnl.py:1340-1405):
+            # - If swap_tx_hash present → web-flow: close stable + actual swap proceeds
+            #   (pro-rated for pre-existing balance, partial-swap aware).
+            # - Else → desktop-flow: close receipts only, volatile valued at close price.
             receipts = data.get('receipts', [])
-            received = self._calc_received_from_receipts(receipts, pos_dicts)
+            swap_tx_hashes = data.get('swap_tx_hashes', [])
+            swap_tx_hash = swap_tx_hashes[0] if swap_tx_hashes else None
 
-            # Fallback to liquidity math if receipt parsing failed (e.g. receipts missing)
+            received = 0.0
+            if swap_tx_hash:
+                breakdown = self._calc_received_with_swap(receipts, swap_tx_hash, pos_dicts)
+                received = breakdown.get("total", 0.0)
+
+            if received <= 0:
+                # Fallback / no-swap path: close receipts only at close-time price.
+                received = self._calc_received_from_receipts(receipts, pos_dicts)
+
+            # Fallback to liquidity math if both above failed (receipts missing)
             if received <= 0:
                 received = self._calc_received_from_math(pos_dicts, previously_claimed)
 
@@ -3549,6 +3565,7 @@ class ManageTab(QWidget):
                 tx_hash=tx_hash,
                 closed_at=time.time(),
                 ladder_group_id=ladder_gid,
+                swap_tx_hash=swap_tx_hash,
             )
             save_trade(record)
             self._log(f"Trade recorded: {pair} | PnL: ${pnl:+.2f} ({pnl_pct:+.1f}%)")
@@ -3640,6 +3657,127 @@ class ManageTab(QWidget):
         except Exception as e:
             logger.debug(f"Receipt parsing failed, will use math fallback: {e}")
             return 0.0
+
+    def _calc_received_with_swap(
+        self,
+        close_receipts: list,
+        swap_tx_hash: str,
+        pos_dicts: list,
+    ) -> dict:
+        """Calculate received USD using web-flow: close receipts + actual swap proceeds.
+
+        Mirrors `bnb-web/backend/api/pnl.py:_fetch_and_parse` (lines 1340-1405):
+        - Stable amount from close receipts (received as-is).
+        - Stable amount from swap receipt (actual proceeds).
+        - Pro-rata correction if swap consumed pre-existing wallet balance.
+        - Remaining (un-swapped) volatile counted at close-time price (partial swap fallback).
+
+        Returns dict with keys:
+            total: total USD attributable to this close (sum of components)
+            stable_from_close: stable received directly from position close
+            swap_usd: stable received from swap, pro-rated to close share
+            remaining_usd: leftover volatile valued at close price (partial swap)
+            close_share: fraction of swap proceeds attributable to this close (1.0 if no dust)
+        Returns empty dict on any failure → caller falls back to receipt-only flow.
+        """
+        if not close_receipts or not pos_dicts or not self.provider or not swap_tx_hash:
+            return {}
+
+        try:
+            wallet = self.provider.account.address
+            wallet_lower = wallet.lower()
+            w3 = self.provider.w3
+
+            first = pos_dicts[0]
+            t0 = first.get('token0', '')
+            t1 = first.get('token1', '')
+            dec0 = first.get('token0_decimals', 18)
+            dec1 = first.get('token1_decimals', 18)
+            t0_lower = t0.lower()
+            t1_lower = t1.lower()
+            if not t0 or not t1:
+                return 0.0
+
+            t0_is_stable = t0_lower in STABLECOINS
+            t1_is_stable = t1_lower in STABLECOINS
+            if not (t0_is_stable or t1_is_stable):
+                return {}  # volatile/volatile — not supported by web-flow
+
+            stable_addr = t0_lower if t0_is_stable else t1_lower
+            stable_dec = dec0 if t0_is_stable else dec1
+            volatile_addr = t1_lower if t0_is_stable else t0_lower
+            volatile_dec = dec1 if t0_is_stable else dec0
+
+            raw_price = first.get('current_price', 0)
+            if not raw_price or raw_price <= 0:
+                return {}
+            close_price = (1 / raw_price) if t0_is_stable else raw_price
+
+            # Aggregate close receipts: stable + volatile amounts
+            stable_from_close_raw = 0
+            volatile_from_close_raw = 0
+            for receipt_dict in close_receipts:
+                received = parse_close_receipt(receipt_dict, wallet, t0, t1)
+                stable_from_close_raw += received.get(stable_addr, 0)
+                volatile_from_close_raw += received.get(volatile_addr, 0)
+
+            stable_from_close = stable_from_close_raw / (10 ** stable_dec)
+
+            # Fetch swap receipt (synchronous; one-shot RPC call ~200-500ms)
+            try:
+                swap_receipt = w3.eth.get_transaction_receipt(swap_tx_hash)
+                swap_receipt_dict = dict(swap_receipt)
+            except Exception as e:
+                logger.warning(f"Failed to fetch swap receipt {swap_tx_hash}: {e}")
+                return {}
+
+            swap_stable_raw = parse_swap_receipt(swap_receipt_dict, wallet, stable_addr)
+            volatile_sent = parse_swap_volatile_sent(swap_receipt_dict, wallet, volatile_addr)
+            swap_usd_raw = swap_stable_raw / (10 ** stable_dec)
+            swap_usd = swap_usd_raw
+            close_share = 1.0
+
+            # Pro-rata: swap may consume pre-existing wallet balance, not just close proceeds.
+            # If volatile_sent > volatile_from_close → swap took pre-existing dust → only count
+            # the close's share of swap proceeds.
+            if volatile_sent > volatile_from_close_raw and volatile_sent > 0:
+                close_share = volatile_from_close_raw / volatile_sent
+                swap_usd = swap_usd_raw * close_share
+                logger.info(
+                    f"Swap included pre-existing balance: sent={volatile_sent} "
+                    f"from_close={volatile_from_close_raw} share={close_share:.4f} "
+                    f"swap_usd_adjusted={swap_usd:.4f}"
+                )
+
+            # Partial swap fallback: if swap consumed less volatile than close gave,
+            # value the remainder at close-time price.
+            remaining_volatile = max(0, volatile_from_close_raw - volatile_sent)
+            remaining_volatile_usd = (
+                (remaining_volatile / (10 ** volatile_dec)) * close_price
+                if close_price > 0 else 0
+            )
+            if remaining_volatile > 0:
+                logger.warning(
+                    f"Partial swap detected: from_close={volatile_from_close_raw} "
+                    f"sent={volatile_sent} remaining={remaining_volatile} "
+                    f"remaining_usd={remaining_volatile_usd:.2f}"
+                )
+
+            total_usd = stable_from_close + swap_usd + remaining_volatile_usd
+            self._log(f"Web-flow PnL: stable=${stable_from_close:.2f} swap=${swap_usd:.2f} "
+                      f"remaining=${remaining_volatile_usd:.2f} → ${total_usd:.2f}")
+            return {
+                "total": total_usd,
+                "stable_from_close": stable_from_close,
+                "swap_usd": swap_usd,
+                "swap_usd_raw": swap_usd_raw,
+                "remaining_usd": remaining_volatile_usd,
+                "close_share": close_share,
+            }
+
+        except Exception as e:
+            logger.debug(f"Web-flow PnL failed, will fall back: {e}")
+            return {}
 
     def _calc_received_from_math(self, pos_dicts: list, previously_claimed: float = 0.0) -> float:
         """Calculate received USD using liquidity math (approximate fallback).
@@ -3966,7 +4104,11 @@ class ManageTab(QWidget):
             self._log(f"Error starting swap: {e}")
 
     def _on_swap_finished(self, results: dict):
-        """Handle swap completion — show results."""
+        """Handle swap completion — show results.
+
+        Dialog mirrors the same PnL calculation written to the SQLite TradeRecord
+        so the user sees one consistent number instead of raw wallet swap output.
+        """
         try:
             if hasattr(self, '_swap_worker') and self._swap_worker is not None:
                 self._safe_cleanup_worker(self._swap_worker)
@@ -3979,61 +4121,107 @@ class ManageTab(QWidget):
             close_data = getattr(self, '_close_data', {})
             tx_hash = close_data.get('tx_hash', 'N/A')
 
-            total_usd = results.get('total_usd', 0)
+            wallet_swap_usd = results.get('total_usd', 0)  # raw full-wallet swap proceeds
             swaps = results.get('swaps', [])
             initial = results.get('initial_investment', 0)
+            swap_tx_hashes = [s.get('tx_hash') for s in swaps if s.get('tx_hash')]
+            swap_tx_hash = swap_tx_hashes[0] if swap_tx_hashes else None
 
-            # Include previously claimed fees in PnL (same as _record_closed_trade)
-            previously_claimed = 0.0
-            deferred = getattr(self, '_deferred_trade_data', None)
-            if deferred:
-                token_ids = deferred.get('token_ids', [])
-                pos_dicts = deferred.get('positions', [])
-                closed_tids = [p.get('token_id') for p in pos_dicts if p.get('token_id')] or token_ids
-                if closed_tids:
-                    previously_claimed = get_claimed_fees_usd_for_tokens(closed_tids)
+            # Pull deferred close data for receipt-based PnL
+            deferred = getattr(self, '_deferred_trade_data', None) or {}
+            close_receipts = deferred.get('receipts', [])
+            pos_dicts = deferred.get('positions', [])
+            token_ids = deferred.get('token_ids', [])
+            closed_tids = [p.get('token_id') for p in pos_dicts if p.get('token_id')] or token_ids
+            previously_claimed = get_claimed_fees_usd_for_tokens(closed_tids) if closed_tids else 0.0
 
-            total_with_fees = total_usd + previously_claimed
+            # Fall back to invested_usd stored in open_positions DB when spinbox is empty.
+            # Mirrors the lookup in _record_closed_trade so dialog and SQLite agree.
+            if initial <= 0 and closed_tids:
+                try:
+                    open_pos = get_open_positions()
+                    initial = sum(
+                        open_pos[tid].get('invested_usd', 0)
+                        for tid in closed_tids if tid in open_pos
+                    )
+                except Exception as e:
+                    logger.debug(f"open_positions lookup failed: {e}")
+
+            # Compute PnL with breakdown (same as _record_closed_trade will write to DB)
+            breakdown = {}
+            if swap_tx_hash and close_receipts and pos_dicts:
+                breakdown = self._calc_received_with_swap(close_receipts, swap_tx_hash, pos_dicts)
+
+            received = breakdown.get('total', 0.0) if breakdown else 0.0
+            if received <= 0 and close_receipts and pos_dicts:
+                received = self._calc_received_from_receipts(close_receipts, pos_dicts)
+            if received <= 0 and pos_dicts:
+                received = self._calc_received_from_math(pos_dicts, previously_claimed)
+
+            received += previously_claimed
+
+            # Receipt + math both failed → we don't know the close-attributed amount.
+            # If user invested something and the close TX itself succeeded, the typical
+            # cause is missing `current_price` in pos_dicts (immediate-close edge case).
+            # Show break-even rather than scary "$0.00 received" → user can sanity-check
+            # against the close TX on explorer if they want exact numbers.
+            received_unknown = received <= 0 and initial > 0
+            if received_unknown:
+                received = initial
+                logger.warning(
+                    "Could not compute received_usd from receipts/math; "
+                    "falling back to invested as break-even estimate."
+                )
+
             if initial > 0:
-                pnl = total_with_fees - initial
+                pnl = received - initial
                 pnl_percent = (pnl / initial) * 100
             else:
                 pnl = None
                 pnl_percent = None
 
+            # Build dialog message — focus on what the user cares about: invested, received, PnL.
+            # Internal mechanics (full-wallet swap output, pro-rata dust) go to logger only.
             result_msg = f"Positions closed & tokens sold!\n\nClose TX: {tx_hash}\n"
-            result_msg += f"\n{'='*40}\n"
-            result_msg += f"SWAP RESULTS\n"
-            result_msg += f"{'='*40}\n"
-            result_msg += f"\nTotal received: ${total_usd:.2f}\n"
-            if previously_claimed > 0:
-                result_msg += f"Previously claimed fees: ${previously_claimed:.2f}\n"
+            if swap_tx_hash:
+                result_msg += f"Swap TX:  {swap_tx_hash}\n"
+
+            # Surface failed swaps so user knows something went wrong
+            failed_swaps = [s for s in swaps if not s.get('success')]
+            if failed_swaps:
+                result_msg += "\nSwap errors:\n"
+                for s in failed_swaps:
+                    result_msg += f"  FAIL {s.get('token', '?')}: {s.get('error', 'Failed')}\n"
 
             if initial > 0 and pnl is not None:
                 pnl_sign = "+" if pnl >= 0 else ""
-                result_msg += f"\nPnL SUMMARY:\n"
-                result_msg += f"  Initial investment: ${initial:.2f}\n"
-                result_msg += f"  Final amount: ${total_with_fees:.2f}\n"
+                result_msg += f"\n{'='*40}\nPnL\n{'='*40}\n"
+                result_msg += f"\n  Invested: ${initial:.2f}\n"
+                result_msg += f"  Received: ${received:.2f}\n"
                 result_msg += f"  Profit/Loss: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_percent:.1f}%)\n"
+                if received_unknown:
+                    result_msg += "\n  (Received estimated as break-even — exact amount\n"
+                    result_msg += "   not derivable from receipts; verify on explorer.)\n"
                 self._log(f"PnL: {pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_percent:.1f}%)")
+            else:
+                # No invested figure available — just show what came back from this close
+                result_msg += f"\nReceived from this close: ${received:.2f}\n"
 
-            if swaps:
-                result_msg += f"\nSwaps ({len(swaps)}):\n"
-                for swap in swaps:
-                    if swap.get('success'):
-                        result_msg += f"  OK {swap.get('token', '?')}: ${swap.get('usd', 0):.2f}\n"
-                    else:
-                        result_msg += f"  FAIL {swap.get('token', '?')}: {swap.get('error', 'Failed')}\n"
-
-            self._log(f"Swap total: ${total_usd:.2f}")
+            # Diagnostic breakdown — log only, not displayed to user
+            if breakdown:
+                self._log(
+                    f"breakdown: stable_close=${breakdown.get('stable_from_close', 0):.2f} "
+                    f"swap=${breakdown.get('swap_usd', 0):.2f} "
+                    f"(raw=${breakdown.get('swap_usd_raw', 0):.2f}, "
+                    f"share={breakdown.get('close_share', 1.0)*100:.0f}%) "
+                    f"remaining=${breakdown.get('remaining_usd', 0):.2f} "
+                    f"prev_claimed=${previously_claimed:.2f}"
+                )
+            self._log(f"Wallet swap total: ${wallet_swap_usd:.2f} | Attributable: ${received:.2f}")
 
             # Record trade with swap results (deferred from close)
-            deferred = getattr(self, '_deferred_trade_data', None)
             if deferred:
-                deferred['received_from_swap'] = total_usd
-                deferred['swap_tx_hashes'] = [
-                    s.get('tx_hash') for s in swaps if s.get('tx_hash')
-                ]
+                deferred['swap_tx_hashes'] = swap_tx_hashes
                 self._record_closed_trade(deferred)
                 self._deferred_trade_data = None
 
